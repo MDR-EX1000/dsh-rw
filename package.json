@@ -57,5 +57,19 @@
     "schemastery": "^3.18.0",
     "typescript": "~5.7.2",
     "vitest": "^3.0.0"
+  },
+  "author": "foolma(Codex) <codex.foolma@stepfun.com>",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "remote",
+    "remote-ssh",
+    "ssh",
+    "sftp",
+    "workspace"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
