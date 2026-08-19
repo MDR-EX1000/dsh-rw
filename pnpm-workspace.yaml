@@ -1,0 +1,15 @@
+onlyBuiltDependencies:
+  - esbuild
+neverBuiltDependencies:
+  - cpu-features
+  - ssh2
+# 本机 pnpm 11 的供应链策略默认拦截发布不足 ~1 天的包；@deepseek-ai rc 系列
+# 发布频繁，会误伤本项目 devDeps（类型检查/构建用，运行时由 DSH harness 提供）。
+minimumReleaseAge: 0
+# pnpm 11 在脚本前重跑 install 并因历史 ignored-builds 状态误报 exit 1；
+# 所需构建均非必需（esbuild 二进制走 optional deps，cpu-features 为 ssh2 可选加速）。
+verifyDepsBeforeRun: false
+allowBuilds:
+  cpu-features: set this to true or false
+  esbuild: set this to true or false
+  ssh2: set this to true or false

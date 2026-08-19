@@ -1,0 +1,61 @@
+{
+  "name": "dsh-rw",
+  "version": "0.1.0",
+  "description": "Remote-SSH-style workspace for DeepSeek Harness (DSH): pick an SSH host and a remote directory as a native DSH workspace; the agent operates the remote filesystem directly via rw_* tools (SFTP/exec). No mirror, no sync — the remote is the source of truth.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node build-client.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "node --check lib/index.js && node --check lib/client.js",
+    "prepack": "pnpm build && pnpm test"
+  },
+  "dependencies": {
+    "ssh2": "^1.16.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-host-webserver": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@types/node": "^22.19.0",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@types/ssh2": "^1.15.5",
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "schemastery": "^3.18.0",
+    "typescript": "~5.7.2",
+    "vitest": "^3.0.0"
+  }
+}
