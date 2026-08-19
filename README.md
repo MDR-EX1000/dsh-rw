@@ -17,10 +17,15 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Install
 
-```bash
-dsh plugin --profile web add dsh-rw
+Prebuilt tarball from GitHub Release (no build step):
 
-# from a local checkout (development)
+```bash
+dsh plugin --profile web add https://github.com/MDR-EX1000/dsh-rw/releases/latest/download/dsh-rw-0.1.0.tgz
+```
+
+From a local checkout (development):
+
+```bash
 dsh plugin --profile web add /path/to/dsh-rw
 ```
 
