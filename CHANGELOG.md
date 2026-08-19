@@ -3,6 +3,13 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## Unreleased
+
+- CI: GitHub Actions workflow (typecheck → build → test) on every push/PR.
+- Docs: install via prebuilt GitHub Release tarball; add ACCEPTANCE.md (unit / live-host / UI checks).
+- Fix: replace pnpm `allowBuilds` placeholder strings with real booleans — placeholders broke
+  `pnpm install --frozen-lockfile` on fresh environments (`ERR_PNPM_IGNORED_BUILDS`).
+
 ## 0.1.0 — 2026-08-19
 
 Initial release.
