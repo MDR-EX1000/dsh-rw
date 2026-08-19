@@ -1,5 +1,7 @@
 # dsh-rw
 
+[![CI](https://github.com/MDR-EX1000/dsh-rw/actions/workflows/ci.yml/badge.svg)](https://github.com/MDR-EX1000/dsh-rw/actions/workflows/ci.yml)
+
 Remote-SSH-style workspaces for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
 Pick an SSH host and a remote directory — that directory becomes a native DSH workspace, and the agent works **directly on the remote filesystem** through `rw_*` tools (SFTP/exec over a persistent ssh2 pool). No mirror, no sync: the remote is the single source of truth.
