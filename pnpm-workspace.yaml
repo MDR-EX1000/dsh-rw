@@ -10,6 +10,6 @@ minimumReleaseAge: 0
 # 所需构建均非必需（esbuild 二进制走 optional deps，cpu-features 为 ssh2 可选加速）。
 verifyDepsBeforeRun: false
 allowBuilds:
-  cpu-features: set this to true or false
-  esbuild: set this to true or false
-  ssh2: set this to true or false
+  cpu-features: false
+  esbuild: true
+  ssh2: false
