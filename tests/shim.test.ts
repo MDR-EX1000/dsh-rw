@@ -17,7 +17,7 @@ import type { ExecResult } from '../src/ssh-pool.js'
 import type { HostEntry } from '../src/hosts.js'
 import { FAKE_MTIME, FakeSftp } from './fakes.js'
 import type { FakeStat } from './fakes.js'
-import { ENTRY_PROD, FakeHosts, FakePool } from './p4-fakes.js'
+import { ENTRY_DEV, ENTRY_PROD, FakeHosts, FakePool } from './p4-fakes.js'
 
 const SHIM_CONFIG: ShimConfig = {
   shim: true,
@@ -597,6 +597,66 @@ describe('shim bash', () => {
     expect(text(res)).toContain('done')
     expect(text(res)).toContain('NOT preserved between calls')
     expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app')
+  })
+})
+
+// Regression for the silent-local-fallback bug (see ISSUE-native-tool-silent-
+// local-fallback.md): native tools used to pass through to the local empty
+// placeholder whenever the rw_* session alias was null (after rw_disconnect)
+// or pointed at a different host than the agent-cwd placeholder. They must
+// instead target the remote the workspace (cwd) actually points at — the pool
+// redials lazily — and must never silently run on the local placeholder.
+describe('shim cwd-anchored target', () => {
+  it('Bug A: after disconnect (alias null, workspace kept) native tools still hit the remote, not the local placeholder', async () => {
+    const h = makeHarness()
+    const root = connect(h) // session: prod @ /srv/app; cwd lives in the prod placeholder
+    // rw_disconnect clears alias and keeps workspace (tools.ts:513).
+    h.session.set({ alias: null })
+    const shim = makeShim(makeDeps(h))
+
+    const res = await shim.onExecute(execOf('read', { file_path: 'README.md' }, root), makeNext().next)
+    expect(res.isError).toBe(false)
+    expect(res).not.toBe(LOCAL_RESULT)
+    expect(text(res)).toContain('line1') // remote content, not the local placeholder
+    expect(text(res)).toContain(`<path>${join(root, 'README.md')}</path>`)
+    // The pool re-established the remote (lazily) — never touched the local fs.
+    expect(h.pool.connectedAliases.has('prod')).toBe(true)
+  })
+
+  it('Bug B: when the rw_* host differs from the cwd placeholder, native tools target the cwd host, not the rw_* host and not local', async () => {
+    const h = makeHarness()
+    const root = connect(h) // cwd = prod placeholder; session: prod @ /srv/app
+    // A second workspace on disk; the user reconnected `dev` for rw_* work.
+    ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', h.placeholderBaseDir)
+    h.session.set({ alias: 'dev', workspace: '/srv/dev' })
+    h.pool.execQueue.push(execResult('ok\n'))
+
+    const shim = makeShim(makeDeps(h))
+    const res = await shim.onExecute(execOf('bash', { command: 'ls', description: 'list' }, root), makeNext().next)
+    expect(res.isError).toBe(false)
+    expect(text(res)).toBe('ok')
+    // Targeted the cwd's host (prod @ /srv/app), not dev, and never went local.
+    expect(h.pool.execCalls.length).toBe(1)
+    expect(h.pool.execCalls[0]!.alias).toBe('prod')
+    expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app')
+  })
+
+  it('fails loudly when the cwd is a placeholder whose host is no longer configured (no silent local fallback)', async () => {
+    const h = makeHarness()
+    connect(h) // establishes the prod placeholder and session
+    // A second workspace on disk whose host is NOT in the (overridden) table.
+    const devRoot = ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', h.placeholderBaseDir)
+    const shim = makeShim(makeDeps(h, { hosts: new FakeHosts([ENTRY_PROD]) }))
+    // Disconnected: alias null.
+    h.session.set({ alias: null })
+
+    const { next, passedThrough } = makeNext()
+    const res = await shim.onExecute(execOf('read', { file_path: 'README.md' }, devRoot), next)
+    expect(res.isError).toBe(true)
+    expect(text(res)).toContain('remote-backed')
+    expect(text(res)).toContain("'dev'")
+    expect(passedThrough()).toBe(false)
+    expect(h.pool.execCalls.length).toBe(0)
   })
 })
 

@@ -30,7 +30,7 @@ import type {
 } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError } from './errors.js'
 import { assertRealpathInside, normalizeRemote, resolveInWorkspace, shq } from './guard.js'
-import { resolvePlaceholderDir } from './placeholder.js'
+import { findPlaceholderByPath, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { HostEntry } from './hosts.js'
@@ -141,17 +141,8 @@ interface ActiveTarget {
   localRoots: string[]
 }
 
-/** The live (alias, workspace) pair bridged to its placeholder, or null when no remote session is active. */
-function activeTarget(deps: ShimDeps): ActiveTarget | null {
-  const alias = deps.session.alias
-  const workspace = deps.session.workspace
-  if (alias === null || workspace === null) return null
-  const entry = deps.hosts.find(alias)
-  if (!entry) return null
-  const localRoot = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
-  // No placeholder on disk for the session's (alias, workspace): the workspace
-  // was not picked through this plugin (or its meta is gone) — the shim sleeps.
-  if (localRoot === null) return null
+/** Build an ActiveTarget from a resolved host entry, remote root, and placeholder dir. */
+function buildTarget(entry: HostEntry, remotePath: string, localRoot: string): ActiveTarget {
   const localRoots = [resolve(localRoot)]
   try {
     const real = realpathSync(localRoot)
@@ -159,7 +150,73 @@ function activeTarget(deps: ShimDeps): ActiveTarget | null {
   } catch {
     // placeholder missing on disk: lexical containment still applies
   }
-  return { entry, remoteRoot: normalizeRemote(workspace), localRoot, localRoots }
+  return { entry, remoteRoot: normalizeRemote(remotePath), localRoot, localRoots }
+}
+
+/**
+ * The live target for native tools. The agent's session cwd is authoritative:
+ * when DSH registered a remote-backed placeholder as the workspace, the agent
+ * cwd lives inside that placeholder, so native tools must target ITS remote —
+ * not the mutable rw_* "current host" (null after rw_disconnect, or a different
+ * host the user reconnected for rw_* work). The rw_* session is a fast path
+ * when it matches the cwd; otherwise the cwd's placeholder is resolved by
+ * scanning meta files (the pool redials lazily on the next op, so native tools
+ * even survive a disconnect). Null when the cwd is a real local directory
+ * (legitimate local pass-through) or a placeholder whose host is gone
+ * (onExecute turns that into a clear error instead of a silent local fallback).
+ */
+function activeTarget(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecution): ActiveTarget | null {
+  const cwd = agentCwd(exec)
+
+  // Fast path: the rw_* session's (alias, workspace), in-memory. Used when it
+  // matches the agent cwd (the common case — the user picked this workspace
+  // and stayed), so the hot path does no placeholder scan.
+  const alias = deps.session.alias
+  const workspace = deps.session.workspace
+  if (alias !== null && workspace !== null) {
+    const entry = deps.hosts.find(alias)
+    if (entry !== undefined) {
+      const localRoot = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
+      if (localRoot !== null) {
+        const target = buildTarget(entry, workspace, localRoot)
+        if (cwd === undefined || insideLocal(target.localRoots, resolve(cwd))) return target
+      }
+    }
+  }
+
+  // Authoritative slow path: the agent cwd itself. The placeholder meta
+  // carries the host alias + remote path; the HostTable supplies credentials.
+  if (cwd !== undefined) {
+    const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
+    if (found !== null) {
+      const entry = deps.hosts.find(found.meta.alias)
+      if (entry !== undefined) return buildTarget(entry, found.meta.remotePath, found.dir)
+      // cwd is a dsh-rw placeholder whose host is no longer configured: never
+      // silently fall back to the local empty placeholder — onExecute reports
+      // it as a clear error.
+    }
+  }
+
+  return null
+}
+
+/**
+ * When activeTarget is null, decide between a legitimate local pass-through
+ * (the cwd is a real local directory) and a blocked state (the cwd is a
+ * dsh-rw placeholder whose host is no longer configured). The latter must
+ * never run native tools on the local empty placeholder.
+ */
+function placeholderBlockReason(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecution): string | null {
+  const cwd = agentCwd(exec)
+  if (cwd === undefined) return null
+  const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
+  if (found === null) return null
+  return (
+    `the workspace ${found.dir} is remote-backed (host alias '${found.meta.alias}', remote ` +
+    `${found.meta.remotePath}) but that host is no longer configured — re-add it (rw_hosts) ` +
+    `and rw_connect('${found.meta.alias}') to operate on the remote; native tools will not ` +
+    `use the local placeholder`
+  )
 }
 
 /** p (already resolve()d) sits inside one of the placeholder root forms. */
@@ -924,7 +981,7 @@ export function makeShim(deps: ShimDeps): Shim {
     next: () => Promise<ToolExecutionResult>,
   ): Promise<ToolExecutionResult> => {
     if (!deps.config.shim) return next()
-    const target = activeTarget(deps)
+    const target = activeTarget(deps, exec)
     if (process.env.DSH_RW_DEBUG) {
       console.log('[dsh-rw shim] dispatch', {
         name: exec.name,
@@ -934,7 +991,14 @@ export function makeShim(deps: ShimDeps): Shim {
         inside: target === null ? null : sessionInsidePlaceholder(target, exec),
       })
     }
-    if (target === null) return next()
+    if (target === null) {
+      // The agent cwd pointing at a dsh-rw placeholder means the user expects
+      // remote-backed native tools; never silently run them on the local empty
+      // placeholder. Surface a clear, actionable error instead.
+      const blocked = placeholderBlockReason(deps, exec)
+      if (blocked !== null) return fail(blocked, { name: 'RwError', code: 'NOT_CONNECTED' })
+      return next()
+    }
     const args = objectArgs(exec.arguments)
     if (args === null) return next()
     switch (exec.name) {
@@ -960,7 +1024,7 @@ export function makeShim(deps: ShimDeps): Shim {
   const onPreExecute = async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
     if (!deps.config.shim || !deps.config.shimBash || deps.config.shimBashApproval !== 'ask') return next()
     if (exec.name !== 'bash') return next()
-    const target = activeTarget(deps)
+    const target = activeTarget(deps, exec)
     if (target === null) return next()
     if (!sessionInsidePlaceholder(target, exec)) return next()
     const args = objectArgs(exec.arguments)

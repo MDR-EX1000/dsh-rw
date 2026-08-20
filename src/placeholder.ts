@@ -14,9 +14,9 @@
 // (resolvePlaceholderDir) — which keeps legacy hash-suffixed directories from
 // v0.1/v0.2 working unchanged: their meta still records the remotePath.
 import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import { baseName, normalizeRemote } from './guard.js'
 
 export const PLACEHOLDER_META_FILE = '.dsh-rw-meta.json'
@@ -157,4 +157,61 @@ export function readPlaceholderMeta(dir: string): PlaceholderMeta | null {
   } catch {
     return null
   }
+}
+
+/** True when `p` (already resolve()d) is `root` or inside it (path-platform-aware). */
+function inside(p: string, root: string): boolean {
+  return p === root || p.startsWith(`${root}${sep}`)
+}
+
+/**
+ * Find the placeholder whose directory contains `cwd`, by scanning every
+ * placeholder directory under the base dir and matching its meta. Containment
+ * is checked both lexically (resolve()) and via realpath (macOS /var ↔
+ * /private/var), mirroring the shim's insideLocal. Returns the placeholder dir
+ * and its meta, or null when the cwd is not inside any dsh-rw placeholder —
+ * i.e. the agent is working in a real local directory, where native tools
+ * should run locally. This is the reverse of resolvePlaceholderDir: names are
+ * not computable from (alias, remotePath), so lookup is by scan.
+ */
+export function findPlaceholderByPath(cwd: string, baseDir?: string): { dir: string; meta: PlaceholderMeta } | null {
+  const root = baseDir ?? defaultBaseDir()
+  let aliasDirNames: string[]
+  try {
+    aliasDirNames = readdirSync(root)
+  } catch {
+    return null
+  }
+  const candLex = resolve(cwd)
+  let candReal: string | null = null
+  try {
+    const real = realpathSync(cwd)
+    if (real !== candLex) candReal = real
+  } catch {
+    // cwd may not exist (e.g. a probe path) — lexical containment still applies
+  }
+  for (const aliasName of aliasDirNames) {
+    const aliasParent = join(root, aliasName)
+    let placeholderNames: string[]
+    try {
+      placeholderNames = readdirSync(aliasParent)
+    } catch {
+      continue
+    }
+    for (const name of placeholderNames) {
+      const dir = join(aliasParent, name)
+      const meta = readPlaceholderMeta(dir)
+      if (meta === null) continue
+      const dirRoots: string[] = [resolve(dir)]
+      try {
+        const real = realpathSync(dir)
+        if (!dirRoots.includes(real)) dirRoots.push(real)
+      } catch {
+        // placeholder missing on disk: lexical containment still applies
+      }
+      const hit = dirRoots.some((r) => inside(candLex, r) || (candReal !== null && inside(candReal, r)))
+      if (hit) return { dir, meta }
+    }
+  }
+  return null
 }
