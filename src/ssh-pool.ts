@@ -1,10 +1,17 @@
 // dsh-rw — persistent ssh2 connection pool with host key verification.
 //
 // One long-lived connection per host alias; concurrent connects are deduped
-// through an in-flight promise; a closed connection drops out of the pool and
-// the next use reconnects lazily. Host key policy is enforced via ssh2's
-// sync hostVerifier hook against a KnownHosts store ('off' disables the hook
-// entirely, matching ssh -o StrictHostKeyChecking=no).
+// through an in-flight promise; a closed (or errored) connection drops out of
+// the pool and the next use reconnects lazily. On top of that lazy reconnect,
+// an operation whose channel/subsystem open fails on a client that has
+// already dropped out of the pool (i.e. the connection died) is retried once
+// on a fresh connection instead of surfacing a transient error. Channel opens
+// are bounded by channelOpenTimeoutMs, so a silently dead connection
+// (half-open TCP: no error, no close, no answer) is killed and retried within
+// that window instead of hanging until keepalive detection. Host key policy
+// is enforced via ssh2's sync hostVerifier hook against a KnownHosts store
+// ('off' disables the hook entirely, matching ssh -o
+// StrictHostKeyChecking=no).
 import { readFileSync } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
 import ssh2 from 'ssh2'
@@ -50,6 +57,8 @@ export interface PoolOptions {
   hostKeyPolicy: 'accept-new' | 'strict' | 'off'
   knownHosts: KnownHosts
   connectTimeoutMs: number
+  /** Channel/subsystem open timeout (default 10s): bounds the wait on a silently dead connection. */
+  channelOpenTimeoutMs?: number
   commandTimeoutMs: number
   maxOutputChars: number
   /** Test hook; defaults to () => new ssh2.Client(). */
@@ -123,6 +132,36 @@ function wrapSftp(raw: SFTPWrapper): SftpLike {
   }
 }
 
+/**
+ * Internal marker for exec(): the channel never opened, so the command did
+ * not run remotely and the attempt is safe to retry on a fresh connection.
+ * `error` is the mapped error to surface when no retry happens.
+ */
+class ChannelOpenError extends Error {
+  readonly error: RwError
+
+  constructor(error: RwError) {
+    super(error.message)
+    this.name = 'ChannelOpenError'
+    this.error = error
+  }
+}
+
+/**
+ * Internal marker: the channel/subsystem open did not answer within
+ * channelOpenTimeoutMs. On a silently dead connection (half-open TCP —
+ * network gone without RST) the open neither succeeds nor fails promptly;
+ * without this bound the call would hang until keepalive detection (~45s).
+ * The open never completed, so nothing ran remotely and a retry on a fresh
+ * connection is safe.
+ */
+class OpenTimeoutError extends Error {
+  constructor() {
+    super('channel open timed out')
+    this.name = 'OpenTimeoutError'
+  }
+}
+
 export class SshPool {
   private readonly opts: PoolOptions
   private readonly factory: () => Client
@@ -137,18 +176,58 @@ export class SshPool {
   /**
    * Run a remote command. opts.cwd prefixes `cd <cwd> &&`. Command timeouts
    * do not reject — they resolve with timedOut: true (signal 'TIMEOUT').
-   * Connection/auth/host-key failures reject with RwError.
+   * Connection/auth/host-key failures reject with RwError. When the channel
+   * open fails on a connection that has already dropped out of the pool (it
+   * died), the operation is retried once on a fresh connection; stream
+   * failures after a successful open are never retried (the command may have
+   * partially run).
    */
   async exec(entry: HostEntry, command: string, opts?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult> {
-    const client = await this.ensureConnected(entry)
     const cmd = opts?.cwd ? `cd ${shellQuote(opts.cwd)} && ${command}` : command
     const timeoutMs = opts?.timeoutMs ?? this.opts.commandTimeoutMs
+    const openTimeoutMs = this.opts.channelOpenTimeoutMs ?? 10000
     const max = this.opts.maxOutputChars
 
+    for (let retried = false; ; retried = true) {
+      const client = await this.ensureConnected(entry)
+      try {
+        return await this.execOn(client, cmd, timeoutMs, openTimeoutMs, max)
+      } catch (err) {
+        // A silently dead connection is dropped on open timeout (we kill it
+        // ourselves below), so both failure kinds converge: not-yet-retried +
+        // known-dead connection → one redial + retry. Anything else surfaces
+        // exactly as before (business errors, post-open stream failures).
+        if (err instanceof OpenTimeoutError) {
+          if (retried) throw new RwError('CONN_TIMEOUT', `channel open timed out after ${openTimeoutMs}ms (connection to ${entry.alias} is unresponsive)`)
+          this.disconnect(entry.alias)
+          continue
+        }
+        if (!(err instanceof ChannelOpenError)) throw err
+        if (retried || !this.dropped(entry.alias, client)) throw err.error
+        this.disconnect(entry.alias)
+      }
+    }
+  }
+
+  /** Single exec attempt on an already-connected client. */
+  private execOn(client: Client, cmd: string, timeoutMs: number, openTimeoutMs: number, max: number): Promise<ExecResult> {
     return new Promise<ExecResult>((resolve, reject) => {
+      // Open-phase guard: if the exec callback does not fire within
+      // openTimeoutMs (silently dead connection), fail the attempt. The late
+      // callback — fired when the pool kills the client — is ignored via
+      // openSettled.
+      let openSettled = false
+      const openTimer = setTimeout(() => {
+        if (openSettled) return
+        openSettled = true
+        reject(new OpenTimeoutError())
+      }, openTimeoutMs)
       client.exec(cmd, (execErr, stream) => {
+        if (openSettled) return
+        openSettled = true
+        clearTimeout(openTimer)
         if (execErr) {
-          reject(mapConnectError(execErr))
+          reject(new ChannelOpenError(mapConnectError(execErr)))
           return
         }
         let stdout = ''
@@ -220,12 +299,78 @@ export class SshPool {
     })
   }
 
+  /**
+   * Acquire the SFTP subsystem. The open is bounded by channelOpenTimeoutMs
+   * and retried once when it fails or times out on a dead connection, and
+   * each returned op re-acquires the subsystem and retries once when its
+   * connection died after acquisition. Remote business errors (the client
+   * stays pooled) surface unchanged.
+   */
   async sftp(entry: HostEntry): Promise<SftpLike> {
-    const client = await this.ensureConnected(entry)
-    const raw = await new Promise<SFTPWrapper>((resolve, reject) => {
-      client.sftp((err, sftp) => (err ? reject(mapConnectError(err)) : resolve(sftp)))
-    })
-    return wrapSftp(raw)
+    const alias = entry.alias
+    const openTimeoutMs = this.opts.channelOpenTimeoutMs ?? 10000
+
+    /** Open the subsystem on a pooled connection, redialing once on a dropped one. */
+    const acquire = async (): Promise<{ client: Client; like: SftpLike }> => {
+      for (let retried = false; ; retried = true) {
+        const client = await this.ensureConnected(entry)
+        try {
+          const raw = await new Promise<SFTPWrapper>((resolve, reject) => {
+            // Same open-phase bound as execOn: a silently dead connection
+            // neither answers nor fails promptly without it.
+            let settled = false
+            const openTimer = setTimeout(() => {
+              if (settled) return
+              settled = true
+              reject(new OpenTimeoutError())
+            }, openTimeoutMs)
+            client.sftp((err, sftp) => {
+              if (settled) return
+              settled = true
+              clearTimeout(openTimer)
+              if (err) reject(mapConnectError(err))
+              else resolve(sftp)
+            })
+          })
+          return { client, like: wrapSftp(raw) }
+        } catch (err) {
+          if (err instanceof OpenTimeoutError) {
+            if (retried) throw new RwError('CONN_TIMEOUT', `sftp open timed out after ${openTimeoutMs}ms (connection to ${alias} is unresponsive)`)
+            this.disconnect(alias)
+            continue
+          }
+          if (retried || !this.dropped(alias, client)) throw err
+          this.disconnect(alias)
+        }
+      }
+    }
+
+    let current = await acquire()
+
+    /** Run one op, re-acquiring the subsystem once when its connection died. */
+    const withReconnect = async <T>(op: (sftp: SftpLike) => Promise<T>): Promise<T> => {
+      try {
+        return await op(current.like)
+      } catch (err) {
+        if (!this.dropped(alias, current.client)) throw err
+        this.disconnect(alias)
+        current = await acquire()
+        return await op(current.like) // a second failure surfaces as-is
+      }
+    }
+
+    return {
+      readdir: (p) => withReconnect((s) => s.readdir(p)),
+      stat: (p) => withReconnect((s) => s.stat(p)),
+      lstat: (p) => withReconnect((s) => s.lstat(p)),
+      realpath: (p) => withReconnect((s) => s.realpath(p)),
+      readFile: (p) => withReconnect((s) => s.readFile(p)),
+      writeFile: (p, data) => withReconnect((s) => s.writeFile(p, data)),
+      mkdir: (p) => withReconnect((s) => s.mkdir(p)),
+      rename: (src, dst) => withReconnect((s) => s.rename(src, dst)),
+      unlink: (p) => withReconnect((s) => s.unlink(p)),
+      rmdir: (p) => withReconnect((s) => s.rmdir(p)),
+    }
   }
 
   /** Round-trip probe: resolves with the latency in ms, rejects with RwError. */
@@ -246,6 +391,15 @@ export class SshPool {
         // already dead — nothing to do
       }
     }
+  }
+
+  /**
+   * Connection-level retry discriminator: the pool no longer holds this
+   * client, i.e. ssh2 signalled its death and it dropped out. Remote business
+   * errors keep the client pooled, so they never pass this check.
+   */
+  private dropped(alias: string, client: Client): boolean {
+    return this.pool.get(alias)?.client !== client
   }
 
   dispose(): void {
@@ -286,7 +440,12 @@ export class SshPool {
       })
       // Kept attached for the connection's lifetime so late errors cannot
       // become unhandled 'error' events; pre-ready it decides the handshake.
+      // Post-ready, an error means the connection is dying: drop it from the
+      // pool immediately (like 'close' does) so the retry discriminator never
+      // depends on 'error'/'close' arrival order.
       client.on('error', (err: Error) => {
+        if (this.pool.get(entry.alias)?.client === client) this.pool.delete(entry.alias)
+        this.readyAliases.delete(entry.alias)
         if (settled) return
         settled = true
         reject(hostKeyFailure ?? mapConnectError(err))

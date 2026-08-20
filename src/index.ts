@@ -38,6 +38,8 @@ export const Config = z.object({
   commandTimeoutMs: z.number().step(1).min(1000).default(30000),
   /** SSH connection establishment timeout. */
   connectTimeoutMs: z.number().step(1).min(1000).default(15000),
+  /** Channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried. */
+  channelOpenTimeoutMs: z.number().step(1).min(1000).default(10000),
   /** Hard ceiling on collected remote output per call. */
   maxOutputChars: z.number().step(1).min(1024).default(200000),
   /** Shim mode: intercept DSH's native tools and translate them to remote execution. */
@@ -53,6 +55,7 @@ export interface Config {
   knownHostsPath: string
   commandTimeoutMs: number
   connectTimeoutMs: number
+  channelOpenTimeoutMs: number
   maxOutputChars: number
   /** Optional so hand-built test configs still typecheck; apply() re-normalizes with the schema defaults. */
   shim?: boolean
@@ -143,6 +146,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       hostKeyPolicy: config.hostKeyPolicy,
       knownHosts: new KnownHosts(config.knownHostsPath || KnownHosts.defaultPath()),
       connectTimeoutMs: config.connectTimeoutMs,
+      channelOpenTimeoutMs: config.channelOpenTimeoutMs,
       commandTimeoutMs: config.commandTimeoutMs,
       maxOutputChars: config.maxOutputChars,
     })

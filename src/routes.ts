@@ -13,7 +13,7 @@ import { mapSftpError, RwError, toRwError } from './errors.js'
 import type { RwErrorCode } from './errors.js'
 import { normalizeRemote } from './guard.js'
 import type { HostEntry } from './hosts.js'
-import { placeholderDirFor } from './placeholder.js'
+import { resolvePlaceholderDir } from './placeholder.js'
 import { resolveWorkspaceDir } from './tools.js'
 import type { ToolsDeps } from './tools.js'
 
@@ -171,7 +171,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           current: {
             alias,
             workspace,
-            placeholderDir: alias !== null && workspace !== null ? placeholderDirFor(alias, workspace, deps.placeholderBaseDir) : null,
+            placeholderDir: alias !== null && workspace !== null ? resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir) : null,
             connected: alias !== null && pool.connected().includes(alias),
           },
         })
@@ -384,8 +384,10 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           writeJson(res, 400, { ok: false, error: 'alias and path are required', code: 'INVALID_INPUT' })
           return
         }
+        // Optional display name for a fresh placeholder (blank trims to absent).
+        const name = typeof body?.name === 'string' && body.name.trim() !== '' ? body.name.trim() : undefined
         try {
-          const { workspace, placeholderDir } = await resolveWorkspaceDir(deps, alias, path)
+          const { workspace, placeholderDir } = await resolveWorkspaceDir(deps, alias, path, name)
           session.set({ alias, workspace })
           writeJson(res, 200, { ok: true, workspace, placeholderDir })
         } catch (err) {

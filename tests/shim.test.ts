@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolDispatchExecution, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.js'
 import type { Config } from '../src/index.js'
-import { ensurePlaceholder, placeholderDirFor } from '../src/placeholder.js'
+import { ensurePlaceholder } from '../src/placeholder.js'
 import { Session } from '../src/session.js'
 import { makeShim } from '../src/shim.js'
 import type { ShimConfig, ShimDeps } from '../src/shim.js'
@@ -61,8 +61,7 @@ type Harness = ReturnType<typeof makeHarness>
 /** Activate the 'prod' @ /srv/app session and create its on-disk placeholder; returns the placeholder dir. */
 function connect(h: Harness): string {
   h.session.set({ alias: 'prod', workspace: '/srv/app' })
-  ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', h.placeholderBaseDir)
-  return placeholderDirFor('prod', '/srv/app', h.placeholderBaseDir)
+  return ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', h.placeholderBaseDir)
 }
 
 function makeDeps(h: Harness, overrides?: Partial<ShimDeps>): ShimDeps {
@@ -784,6 +783,7 @@ describe('shim wiring in apply', () => {
     knownHostsPath: '',
     commandTimeoutMs: 30000,
     connectTimeoutMs: 15000,
+    channelOpenTimeoutMs: 10000,
     maxOutputChars: 200000,
   }
 

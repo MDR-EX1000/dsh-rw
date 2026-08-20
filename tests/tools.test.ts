@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RwError } from '../src/errors.js'
-import { placeholderDirFor, readPlaceholderMeta } from '../src/placeholder.js'
+import { ensurePlaceholder, readPlaceholderMeta } from '../src/placeholder.js'
 import { makeTools } from '../src/tools.js'
 import { ENTRY_PROD, makeHarness, SECRET_PASSWORD } from './p4-fakes.js'
 import type { FakeHarness } from './p4-fakes.js'
@@ -90,11 +90,13 @@ describe('rw_info / rw_hosts', () => {
 
   it('rw_info reports host, workspace, placeholder dir when fully picked', async () => {
     harness.connect()
+    const placeholderDir = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
     const { text } = await tool('rw_info').execute({})
     expect(text).toContain('deploy@example.com:22 (alias: prod)')
     expect(text).toContain('Connected: yes')
     expect(text).toContain('Current workspace: /srv/app')
-    expect(text).toContain(placeholderDirFor('prod', '/srv/app', `${dir}/placeholders`))
+    expect(text).toContain(placeholderDir)
+    expect(text).toContain(join('placeholders', 'prod', 'app'))
     expect(text).not.toContain(SECRET_PASSWORD)
   })
 
@@ -149,7 +151,7 @@ describe('rw_pick_workspace', () => {
     const { text } = await tool('rw_pick_workspace').execute({ path: '/srv/link/' })
     expect(harness.session.workspace).toBe('/srv/app')
     expect(text).toContain('Remote workspace set to /srv/app on prod')
-    const placeholderDir = placeholderDirFor('prod', '/srv/app', `${dir}/placeholders`)
+    const placeholderDir = join(`${dir}/placeholders`, 'prod', 'app')
     expect(text).toContain(placeholderDir)
     const meta = readPlaceholderMeta(placeholderDir)
     expect(meta).toMatchObject({ plugin: 'dsh-rw', alias: 'prod', remotePath: '/srv/app' })

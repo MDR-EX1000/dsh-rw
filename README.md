@@ -10,12 +10,12 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Features
 
-- **Remote directory as a native workspace** — a centered picker modal fills the DSH "Add workspace" flow: 本机 (local) tab with the OS folder chooser, 远程 (remote) tab with a host dropdown, `/`-prefilled path input, and level-by-level autocomplete.
+- **Remote directory as a native workspace** — a centered picker modal fills the DSH "Add workspace" flow: a two-card chooser (本机 / 远程) leads to the local page (OS folder chooser) or the remote page (host dropdown, `/`-prefilled path input, level-by-level autocomplete, optional workspace name).
 - **Hosts come from `~/.ssh/config`** — zero configuration: your existing aliases show up automatically (re-read on file change, no restart). Password-auth hosts can be added in the picker (stored locally, file mode `0600`).
 - **Real workspace confinement** — every `rw_*` file path is confined to the picked workspace root: `../`, absolute paths outside the root, and symlink escapes (`SYMLINK_ESCAPE` via remote `realpath`) are rejected with structured errors.
 - **SSH host key verification** — verifies against `~/.ssh/known_hosts` by default (`accept-new`: first-seen keys are recorded), with `strict` and an explicit `off` policy. A changed host key is refused, never silently accepted.
 - **Structured errors** — connection refused / auth failed / timeout / no such path / permission denied / outside workspace / host key problems are distinct error codes, so the agent can react correctly.
-- **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts.
+- **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts. It takes a clean name — the remote basename or the name you give in the picker; a hash suffix appears only on a naming conflict (legacy hash-suffixed placeholders keep working).
 - **Shim mode (opt-in)** — with `shim: true`, DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. Off by default; with no active remote session (or shim off) every call passes through unchanged.
 
 ## Install
@@ -32,11 +32,11 @@ From a local checkout (development):
 dsh plugin --profile web add /path/to/dsh-rw
 ```
 
-Restart `dsh web` afterwards. The plugin activates on boot; the "Add workspace" flow gains the two-tab picker.
+Restart `dsh web` afterwards. The plugin activates on boot; the "Add workspace" flow gains the card-based picker.
 
 ## Quick start
 
-1. **Pick a workspace** — sidebar / conversation **Add workspace** → 远程 tab → choose a host (from `~/.ssh/config`, or **+ 添加主机** for password auth) → browse or type a remote path → 设为远程工作区.
+1. **Pick a workspace** — sidebar / conversation **Add workspace** → 远程 card → choose a host (from `~/.ssh/config`, or **+ 添加主机** on its own subpage for password auth) → browse or type a remote path (optionally give it a 工作区名称) → 设为远程工作区.
 2. **Work with the agent** — the system prompt announces the current `user@host:/path`; the agent uses the `rw_*` tools:
    - `rw_list_dir` / `rw_read_file` / `rw_write_file` / `rw_mkdir` / `rw_move` / `rw_delete` — file operations (workspace-confined)
    - `rw_exec` — run shell commands with the workspace root as cwd (build, test, grep, …)
@@ -71,6 +71,7 @@ Plugin config keys (defaults shown):
 | `knownHostsPath` | `~/.ssh/known_hosts` | cordis only | known_hosts file used for verification |
 | `commandTimeoutMs` | `30000` | cordis only | per remote command timeout |
 | `connectTimeoutMs` | `15000` | cordis only | SSH handshake timeout |
+| `channelOpenTimeoutMs` | `10000` | cordis only | channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried once on a fresh connection |
 | `maxOutputChars` | `200000` | cordis only | cap on collected stdout/stderr per call |
 | `shim` | `false` | cordis + settings | shim mode: intercept the native read/write/edit/str_replace_editor/glob/grep/bash tools and run them against the active remote workspace |
 | `shimBash` | `true` | cordis + settings | with shim on, also intercept `bash` (only when the agent session cwd is the placeholder workspace) |

@@ -4,10 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RwError } from '../src/errors.js'
-import { placeholderDirFor } from '../src/placeholder.js'
+import { ensurePlaceholder } from '../src/placeholder.js'
 import { makeRoutes } from '../src/routes.js'
 import type { Route, RoutesDeps } from '../src/routes.js'
-import { makeHarness, SECRET_PASSWORD } from './p4-fakes.js'
+import { makeHarness, ENTRY_PROD, SECRET_PASSWORD } from './p4-fakes.js'
 import type { FakeHarness } from './p4-fakes.js'
 
 interface FakeRes {
@@ -122,11 +122,12 @@ describe('status / hosts', () => {
     expect(Array.isArray(empty.json.hosts)).toBe(true)
 
     harness.connect()
+    const placeholderDir = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
     const picked = await call(routes, '/api/dsh-rw/status', 'GET')
     expect(picked.json.current).toEqual({
       alias: 'prod',
       workspace: '/srv/app',
-      placeholderDir: placeholderDirFor('prod', '/srv/app', `${dir}/placeholders`),
+      placeholderDir,
       connected: true,
     })
     expect(JSON.stringify(picked.json)).not.toContain(SECRET_PASSWORD)
@@ -274,11 +275,34 @@ describe('workspace / local-pick', () => {
     expect(json).toEqual({
       ok: true,
       workspace: '/srv/app',
-      placeholderDir: placeholderDirFor('prod', '/srv/app', `${dir}/placeholders`),
+      placeholderDir: join(`${dir}/placeholders`, 'prod', 'app'),
     })
     expect(harness.session.alias).toBe('prod')
     expect(harness.session.workspace).toBe('/srv/app')
     expect(existsSync(json.placeholderDir as string)).toBe(true)
+  })
+
+  it('POST workspace honors an optional display name (trimmed, sanitized; blank = default)', async () => {
+    const named = await call(routes, '/api/dsh-rw/workspace', 'POST', {
+      body: { alias: 'prod', path: '/srv/app', name: '  My App  ' },
+    })
+    expect(named.status).toBe(200)
+    expect(named.json.placeholderDir).toBe(join(`${dir}/placeholders`, 'prod', 'My_App'))
+
+    // Blank name falls back to the basename; the existing named placeholder is reused.
+    const blank = await call(routes, '/api/dsh-rw/workspace', 'POST', {
+      body: { alias: 'prod', path: '/srv/app', name: '   ' },
+    })
+    expect(blank.status).toBe(200)
+    expect(blank.json.placeholderDir).toBe(join(`${dir}/placeholders`, 'prod', 'My_App'))
+
+    // A name colliding with another workspace's placeholder gets the hash suffix.
+    harness.pool.fs.addDir('/srv/other')
+    const clash = await call(routes, '/api/dsh-rw/workspace', 'POST', {
+      body: { alias: 'prod', path: '/srv/other', name: 'My App' },
+    })
+    expect(clash.status).toBe(200)
+    expect(String(clash.json.placeholderDir)).toMatch(/My_App-[0-9a-f]{8}$/)
   })
 
   it('POST workspace rejects files, unknown aliases and bad bodies', async () => {

@@ -3,8 +3,31 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
-## Unreleased
+## 0.3.0 — 2026-08-21
 
+Picker UX rework, clean placeholder naming, and connection resilience.
+
+- Resilience: an exec or SFTP call whose channel/subsystem open fails on a connection that has
+  already dropped out of the pool (it died) now redials and retries the operation once
+  transparently, instead of surfacing a transient error to the agent; SFTP ops on a wrapper
+  whose connection dropped after acquisition re-acquire and retry once too. Remote business
+  errors, command timeouts, and post-open stream failures are never retried, and a second
+  failure surfaces the structured error as before.
+- Resilience: channel/subsystem opens are now bounded by the new `channelOpenTimeoutMs`
+  (default 10s). A silently dead connection (half-open TCP — network gone without a RST)
+  previously hung an operation until keepalive detection (~45s) or indefinitely; it is now
+  killed, dropped, and retried on a fresh connection within the timeout. Post-ready `error`
+  events also drop the pooled client immediately (not only on `close`), so the retry
+  discriminator no longer depends on `error`/`close` arrival order.
+- Picker UX rework (Codex-style): the modal opens on a two-card chooser (本机 / 远程, each with
+  a one-line explainer) instead of tabs; each flow is its own page with a 「← 返回」 back to the
+  cards, and 「+ 添加主机」 is now a dedicated subpage rather than an inline expanding form.
+- Placeholder naming: clean names by default — the remote basename, or the optional
+  「工作区名称」 from the picker — with the `-<sha1[:8]>` suffix added only when the candidate
+  directory is already occupied by another workspace. Lookup switches from computed paths to
+  scanning `.dsh-rw-meta.json` (`resolvePlaceholderDir`), so legacy hash-suffixed placeholders
+  from 0.1/0.2 keep resolving unchanged. `POST /api/dsh-rw/workspace` accepts an optional
+  `name`.
 - CI: GitHub Actions workflow (typecheck → build → test) on every push/PR.
 - Docs: install via prebuilt GitHub Release tarball; add ACCEPTANCE.md (unit / live-host / UI checks).
 - Fix: replace pnpm `allowBuilds` placeholder strings with real booleans — placeholders broke

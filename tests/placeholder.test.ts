@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { PlaceholderMeta } from '../src/placeholder.js'
-import { ensurePlaceholder, placeholderDirFor, readPlaceholderMeta } from '../src/placeholder.js'
+import { ensurePlaceholder, readPlaceholderMeta, resolvePlaceholderDir } from '../src/placeholder.js'
 
 const ENTRY = { host: 'example.com', port: 22, user: 'deploy' }
 
@@ -21,47 +21,110 @@ function modeOf(p: string): number {
   return statSync(p).mode & 0o777
 }
 
-describe('placeholderDirFor', () => {
-  it('builds <base>/<alias>/<base>-<8 hex chars> deterministically', () => {
-    const dir = placeholderDirFor('myhost', '/data/app', base)
-    expect(dir).toBe(placeholderDirFor('myhost', '/data/app', base))
-    expect(dir.startsWith(join(base, 'myhost') + '/')).toBe(true)
-    expect(dir.split('/').pop()).toMatch(/^app-[0-9a-f]{8}$/)
+/** Write a raw meta file into a pre-created directory (legacy/corrupt fixtures). */
+function seedMeta(dir: string, meta: Partial<PlaceholderMeta>): void {
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(
+    join(dir, '.dsh-rw-meta.json'),
+    `${JSON.stringify({
+      plugin: 'dsh-rw',
+      alias: 'h',
+      host: 'example.com',
+      port: 22,
+      user: 'deploy',
+      remotePath: '/data/app',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      note: 'placeholder only — not a copy of remote files',
+      ...meta,
+    })}\n`,
+  )
+}
+
+describe('ensurePlaceholder naming', () => {
+  it('uses the clean remote basename by default — no hash suffix', () => {
+    expect(ensurePlaceholder('h', ENTRY, '/data/app', base)).toBe(join(base, 'h', 'app'))
+    expect(ensurePlaceholder('h', ENTRY, '/srv/clean-best-practice', base)).toBe(join(base, 'h', 'clean-best-practice'))
   })
 
-  it('sanitizes illegal alias characters to _', () => {
-    const dir = placeholderDirFor('my host!@#x', '/data', base)
-    expect(dir).toContain(join(base, 'my_host___x'))
+  it('falls back to "workspace" for the root path', () => {
+    expect(ensurePlaceholder('h', ENTRY, '/', base)).toBe(join(base, 'h', 'workspace'))
   })
 
-  it('keeps dots, dashes and underscores in the alias', () => {
-    const dir = placeholderDirFor('a.b-c_d', '/data', base)
-    expect(dir).toContain(join(base, 'a.b-c_d'))
+  it('uses the display name (trimmed, sanitized) when given', () => {
+    expect(ensurePlaceholder('h', ENTRY, '/data/app', base, '  My App!  ')).toBe(join(base, 'h', 'My_App_'))
+    // blank display name falls back to the basename
+    expect(ensurePlaceholder('h2', ENTRY, '/data/app', base, '   ')).toBe(join(base, 'h2', 'app'))
   })
 
-  it('maps the same alias+path to the same dir, distinct paths to distinct dirs', () => {
-    expect(placeholderDirFor('h', '/data', base)).toBe(placeholderDirFor('h', '/data', base))
-    expect(placeholderDirFor('h', '/data', base)).not.toBe(placeholderDirFor('h', '/data2', base))
-    // same basename, different parents → hash disambiguates
-    expect(placeholderDirFor('h', '/a/app', base)).not.toBe(placeholderDirFor('h', '/b/app', base))
+  it('sanitizes illegal alias characters, keeps dots/dashes/underscores', () => {
+    expect(ensurePlaceholder('my host!@#x', ENTRY, '/data', base)).toBe(join(base, 'my_host___x', 'data'))
+    expect(ensurePlaceholder('a.b-c_d', ENTRY, '/data', base)).toBe(join(base, 'a.b-c_d', 'data'))
   })
 
-  it('normalizes the remote path before hashing (trailing slashes, dots)', () => {
-    expect(placeholderDirFor('h', '/data/', base)).toBe(placeholderDirFor('h', '/data', base))
-    expect(placeholderDirFor('h', '/data/./app', base)).toBe(placeholderDirFor('h', '/data/app', base))
+  it('appends the hash suffix only when the clean name is occupied by another workspace', () => {
+    const first = ensurePlaceholder('h', ENTRY, '/a/app', base)
+    expect(first).toBe(join(base, 'h', 'app'))
+    // Same basename, different remote path: the clean name is taken.
+    const second = ensurePlaceholder('h', ENTRY, '/b/app', base)
+    expect(second).toMatch(/^.*app-[0-9a-f]{8}$/)
+    expect(second).not.toBe(first)
+    // Both stay resolvable and idempotent.
+    expect(ensurePlaceholder('h', ENTRY, '/a/app', base)).toBe(first)
+    expect(ensurePlaceholder('h', ENTRY, '/b/app', base)).toBe(second)
   })
 
-  it('uses the root basename fallback for "/"', () => {
-    expect(placeholderDirFor('h', '/', base).split('/').pop()).toMatch(/^workspace-[0-9a-f]{8}$/)
+  it('appends the hash suffix when the clean name is an unnamed (meta-less) directory', () => {
+    mkdirSync(join(base, 'h', 'app'), { recursive: true })
+    const dir = ensurePlaceholder('h', ENTRY, '/data/app', base)
+    expect(dir).toMatch(/^.*app-[0-9a-f]{8}$/)
+    expect(readPlaceholderMeta(dir)).toMatchObject({ alias: 'h', remotePath: '/data/app' })
   })
 
-  it('defaults to ~/.dsh/remote-workspaces', () => {
-    const dir = placeholderDirFor('h', '/data')
-    expect(dir.startsWith(join(homedir(), '.dsh', 'remote-workspaces', 'h') + '/')).toBe(true)
+  it('treats a corrupt meta as occupation (cannot prove ownership) and moves to the hash variant', () => {
+    const dir = ensurePlaceholder('h', ENTRY, '/x', base)
+    expect(dir).toBe(join(base, 'h', 'x'))
+    writeFileSync(join(dir, '.dsh-rw-meta.json'), 'not json{')
+    const moved = ensurePlaceholder('h', ENTRY, '/x', base)
+    expect(moved).toMatch(/^.*x-[0-9a-f]{8}$/)
+    expect(readPlaceholderMeta(moved)).toMatchObject({ alias: 'h', remotePath: '/x' })
+  })
+
+  it('normalizes the remote path before naming (trailing slashes, dots)', () => {
+    expect(ensurePlaceholder('h', ENTRY, '/data/', base)).toBe(ensurePlaceholder('h', ENTRY, '/data', base))
+    expect(ensurePlaceholder('h', ENTRY, '/data/./app', base)).toBe(join(base, 'h', 'app'))
   })
 })
 
-describe('ensurePlaceholder', () => {
+describe('resolvePlaceholderDir', () => {
+  it('finds a clean-named placeholder by its meta', () => {
+    const dir = ensurePlaceholder('h', ENTRY, '/data/app', base)
+    expect(resolvePlaceholderDir('h', '/data/app', base)).toBe(dir)
+  })
+
+  it('finds legacy hash-suffixed directories (v0.1/v0.2 naming)', () => {
+    const legacy = join(base, 'h', 'app-9472932a')
+    seedMeta(legacy, { remotePath: '/data/app' })
+    expect(resolvePlaceholderDir('h', '/data/app', base)).toBe(legacy)
+  })
+
+  it('finds display-named placeholders', () => {
+    const dir = ensurePlaceholder('h', ENTRY, '/data/app', base, 'work stuff')
+    expect(dir).toBe(join(base, 'h', 'work_stuff'))
+    expect(resolvePlaceholderDir('h', '/data/app', base)).toBe(dir)
+  })
+
+  it('returns null for a wrong alias, wrong path, missing tree, or corrupt meta', () => {
+    ensurePlaceholder('h', ENTRY, '/data/app', base)
+    expect(resolvePlaceholderDir('other', '/data/app', base)).toBeNull()
+    expect(resolvePlaceholderDir('h', '/data/other', base)).toBeNull()
+    expect(resolvePlaceholderDir('ghost', '/data/app', base)).toBeNull()
+    const dir = ensurePlaceholder('h', ENTRY, '/x', base)
+    writeFileSync(join(dir, '.dsh-rw-meta.json'), '{{{')
+    expect(resolvePlaceholderDir('h', '/x', base)).toBeNull()
+  })
+})
+
+describe('ensurePlaceholder meta handling', () => {
   it('creates the directory and a complete meta file', () => {
     const dir = ensurePlaceholder('myhost', ENTRY, '/srv/app/', base)
     const meta = readPlaceholderMeta(dir)
@@ -95,7 +158,7 @@ describe('ensurePlaceholder', () => {
     expect(statSync(join(dir, '.dsh-rw-meta.json')).mtimeMs).toBe(beforeMtime)
   })
 
-  it('rewrites an inconsistent meta but preserves createdAt', () => {
+  it('rewrites an inconsistent meta in place but preserves createdAt', () => {
     const dir = ensurePlaceholder('h', ENTRY, '/x', base)
     const original = readPlaceholderMeta(dir)!
     const rewritten = ensurePlaceholder('h', { ...ENTRY, port: 2222 }, '/x', base)
@@ -105,28 +168,21 @@ describe('ensurePlaceholder', () => {
     expect(meta.createdAt).toBe(original.createdAt)
   })
 
-  it('recovers from a corrupt meta file by rewriting it', () => {
-    const dir = placeholderDirFor('h', '/x', base)
-    ensurePlaceholder('h', ENTRY, '/x', base)
-    writeFileSync(join(dir, '.dsh-rw-meta.json'), 'not json{')
-    expect(readPlaceholderMeta(dir)).toBeNull()
-    ensurePlaceholder('h', ENTRY, '/x', base)
-    expect(readPlaceholderMeta(dir)).toMatchObject({ alias: 'h', remotePath: '/x' })
-  })
-
   it('sets 0700 on the directory and 0600 on the meta file', () => {
     const dir = ensurePlaceholder('h', ENTRY, '/x', base)
     expect(modeOf(dir)).toBe(0o700)
     expect(modeOf(join(dir, '.dsh-rw-meta.json'))).toBe(0o600)
   })
 
-  it('hardens permissions on a re-created (inconsistent) placeholder', () => {
+  it('hardens permissions on the fresh placeholder when the old meta is unreadable', () => {
     const dir = ensurePlaceholder('h', ENTRY, '/x', base)
-    // simulate a tampered/inconsistent meta with loose permissions
+    // simulate a tampered meta with loose permissions: no longer provably ours,
+    // so the fresh placeholder moves to the hash variant (with proper modes)
     writeFileSync(join(dir, '.dsh-rw-meta.json'), '{"plugin":"other"}', { mode: 0o644 })
-    ensurePlaceholder('h', ENTRY, '/x', base)
-    expect(modeOf(join(dir, '.dsh-rw-meta.json'))).toBe(0o600)
-    expect(readPlaceholderMeta(dir)).toMatchObject({ alias: 'h' })
+    const moved = ensurePlaceholder('h', ENTRY, '/x', base)
+    expect(moved).not.toBe(dir)
+    expect(modeOf(join(moved, '.dsh-rw-meta.json'))).toBe(0o600)
+    expect(readPlaceholderMeta(moved)).toMatchObject({ alias: 'h' })
   })
 })
 

@@ -3,16 +3,19 @@
 // dsh-rw — client half: the unified workspace directory picker.
 //
 // One modal fills ui-workspace's two directory-flow holes (sidebar +
-// conversation hero), following dsh-remote's proven DirPicker interaction:
-//   • 本机 tab → 手动输入本机路径，或经 POST /api/dsh-rw/local-pick 调起系统
+// conversation hero). The entry is a two-card chooser (本机 / 远程, each with
+// a one-line explainer); picking a card drills into that flow's page, which
+// carries a 「← 返回」 back to the cards:
+//   • 本机 → 手动输入本机路径，或经 POST /api/dsh-rw/local-pick 调起系统
 //     文件夹选择器，结果直接 onPicked(localPath)。
-//   • 远程 tab → 选一台 SSH 主机（来自 ~/.ssh/config + 手动条目），输入路径时
+//   • 远程 → 选一台 SSH 主机（来自 ~/.ssh/config + 手动条目），输入路径时
 //     逐级自动补全（防抖 ~220ms，对父目录做 ls + 前缀过滤），或用「浏览…」弹层
-//     逐级下钻；确认后 POST /api/dsh-rw/workspace 拿到本地占位目录 →
-//     onPicked(placeholderDir)，交给 DSH 原生流程登记为 workspace。
-//     主机下拉旁内嵌「+ 添加主机」表单（原地展开/收起）：测试连接走
+//     逐级下钻；可选「工作区名称」命名本地占位目录（留空用路径 basename，
+//     仅重名冲突时服务端才追加哈希后缀）。确认后 POST /api/dsh-rw/workspace
+//     拿到本地占位目录 → onPicked(placeholderDir)，交给 DSH 原生流程登记为
+//     workspace。「+ 添加主机」跳到 modal 内独立子页（带返回）：测试连接走
 //     POST /test 完整字段形式（临时探测不入库），保存走 POST /hosts；手动
-//     条目带「手动」标注，选中后可在旁边删除。密码只提交不展示。
+//     条目带「手动」标注，选中后可在远程页删除。密码只提交不展示。
 //
 // Client entries must be classic scripts registered via window.__ModuleLoader__.load
 // ({ id, factory }); the factory receives a synchronous `require` — react and
@@ -152,8 +155,10 @@ const emptyAddForm = (): AddHostForm => ({ alias: '', host: '', port: '22', user
 const v = (name: string, fb: string): string => `var(${name}, ${fb})`
 const T = {
   bg: v('--dsw-alias-bg-layer-1', 'rgba(128,128,128,0.07)'),
+  bgHover: v('--dsw-alias-bg-layer-2', 'rgba(128,128,128,0.14)'),
   border: v('--dsw-alias-border-l2', 'rgba(128,128,128,0.35)'),
   borderStrong: v('--dsw-alias-border-l3', 'rgba(128,128,128,0.5)'),
+  accent: v('--dsw-alias-accent-primary', '#4c8dff'),
   danger: v('--dsw-static-red-500', '#e06c75'),
   ok: v('--dsw-static-green-500', '#4caf7d'),
   radius: 8,
@@ -163,8 +168,122 @@ const T = {
 const overlayBg = v('--dsw-alias-bg-overlay', '#1e1e1e')
 const panelBg = v('--dsw-alias-bg-layer-1', '#18181b')
 
-const inputS: CSSProperties = { flex: 1, padding: '6px 10px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, outline: 'none' }
-const buttonS: CSSProperties = { padding: '6px 12px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, cursor: 'pointer' }
+const inputS: CSSProperties = { flex: 1, padding: '7px 12px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, outline: 'none', fontSize: 13, transition: 'border-color .15s' }
+const buttonS: CSSProperties = { padding: '7px 14px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, cursor: 'pointer', fontSize: 13, transition: 'background .15s, border-color .15s' }
+
+/** Section caption above a field group (form pages). */
+const labelS: CSSProperties = { fontSize: 12, fontWeight: 600, color: T.muted, letterSpacing: 0.2 }
+
+/** Button with hover feedback; `primary` renders the accent call-to-action,
+ * `danger` keeps the muted-danger look for destructive actions. */
+function Btn(props: { primary?: boolean; danger?: boolean; title?: string; disabled?: boolean; style?: CSSProperties; onClick?: () => void; children: unknown }) {
+  const [hov, setHov] = useState(false)
+  const base: CSSProperties = props.primary
+    ? { ...buttonS, background: T.accent, border: '1px solid ' + T.accent, color: '#fff', fontWeight: 600 }
+    : props.danger
+      ? { ...buttonS, color: T.danger }
+      : buttonS
+  const hover: CSSProperties = hov && !props.disabled ? (props.primary ? { filter: 'brightness(1.12)' } : { background: T.bgHover, border: '1px solid ' + T.borderStrong }) : {}
+  return (
+    <button
+      title={props.title}
+      disabled={props.disabled}
+      onClick={props.onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{ ...base, ...hover, ...(props.disabled ? { opacity: 0.55, cursor: 'default' } : {}), ...(props.style || {}) }}
+    >
+      {props.children as never}
+    </button>
+  )
+}
+
+/** Text input with an accent focus ring (inline styles can't do :focus). */
+function TextInput(props: Record<string, unknown> & { value: string; onChange: (e: { target: { value: string } }) => void }) {
+  const [focus, setFocus] = useState(false)
+  const { style, onFocus, onBlur, ...rest } = props as { style?: CSSProperties; onFocus?: (e: unknown) => void; onBlur?: (e: unknown) => void } & Record<string, unknown>
+  return (
+    <input
+      {...(rest as any)} // eslint-disable-line @typescript-eslint/no-explicit-any -- passthrough input props
+      style={{ ...inputS, ...(focus ? { border: '1px solid ' + T.accent } : {}), ...(style || {}) }}
+      onFocus={(e: unknown) => {
+        setFocus(true)
+        if (onFocus) onFocus(e)
+      }}
+      onBlur={(e: unknown) => {
+        setFocus(false)
+        if (onBlur) onBlur(e)
+      }}
+    />
+  )
+}
+
+/** One autocomplete suggestion row with hover highlight. */
+function SuggestRow(props: { text: string; onPick: () => void }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <div
+      onMouseDown={props.onPick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{ padding: '6px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', borderRadius: 6, background: hov ? T.bgHover : 'transparent' }}
+    >
+      {props.text}
+    </div>
+  )
+}
+
+/** One row in the browse popup's directory listing, with hover highlight. */
+function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void }) {
+  const [hov, setHov] = useState(false)
+  const { item, drill } = props
+  return (
+    <div
+      title={(drill ? '进入 ' : '文件: ') + item.name}
+      onClick={drill ? props.onEnter : undefined}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{ padding: '7px 10px', cursor: drill ? 'pointer' : 'default', color: drill ? T.ok : T.label, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, borderRadius: 6, background: hov && drill ? T.bgHover : 'transparent' }}
+    >
+      <span>{item.type === 'dir' ? '📁' : item.type === 'symlink' ? '🔗' : '📄'}</span>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{item.name}</span>
+      {drill ? <span style={{ color: T.muted, fontSize: 11 }}>›</span> : null}
+    </div>
+  )
+}
+
+/** Entry-step card: lifts and highlights on hover, chevron hints drill-in. */
+function FlowCard(props: { icon: string; title: string; desc: string; onClick: () => void }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <div
+      onClick={props.onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        flex: 1,
+        border: '1px solid ' + (hov ? T.accent : T.border),
+        borderRadius: 12,
+        padding: '18px 16px',
+        cursor: 'pointer',
+        background: hov ? T.bgHover : T.bg,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        transform: hov ? 'translateY(-1px)' : 'none',
+        boxShadow: hov ? '0 6px 20px rgba(0,0,0,0.25)' : 'none',
+        transition: 'border-color .15s, background .15s, transform .15s, box-shadow .15s',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ fontSize: 24 }}>{props.icon}</div>
+        <div style={{ color: hov ? T.accent : T.muted, fontSize: 16, transition: 'color .15s' }}>→</div>
+      </div>
+      <div style={{ fontWeight: 600, fontSize: 14 }}>{props.title}</div>
+      <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>{props.desc}</div>
+    </div>
+  )
+}
 
 /** Clickable breadcrumb of the current remote path; clicking a segment jumps
  * back to that ancestor level (single line, ellipsized at the front). */
@@ -201,10 +320,13 @@ function breadcrumb(active: boolean, cur: string, jumpTo: (p: string) => void) {
 
 function DirPicker(props: DirPickerProps) {
   const { open, busy, onPicked, onCancel } = props
-  const [tab, setTab] = useState<'local' | 'remote'>('local')
+  // 视图状态机：cards（两张大卡片入口）→ local / remote 表单页；addHost 是
+  // 从 remote 页跳入的独立子页，四者互斥，除 cards 外都有「← 返回」。
+  const [view, setView] = useState<'cards' | 'local' | 'remote' | 'addHost'>('cards')
   const [hosts, setHosts] = useState<HostSummary[]>([])
   const [alias, setAlias] = useState('')
   const [path, setPath] = useState('')
+  const [wsName, setWsName] = useState('')
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   // 级联下钻状态：每一格是 { path, all } —— 该路径下的条目列表。
@@ -213,8 +335,7 @@ function DirPicker(props: DirPickerProps) {
   const [suggest, setSuggest] = useState<string[]>([])
   const [suggestOpen, setSuggestOpen] = useState(false)
   const suggestTimer = useRef<number | null>(null)
-  // 内嵌「添加主机」表单状态（远程页签内原地展开/收起，不跳页不开新 modal）。
-  const [addOpen, setAddOpen] = useState(false)
+  // 「添加主机」子页表单状态（view === 'addHost' 时独占整页）。
   const [form, setForm] = useState<AddHostForm>(emptyAddForm)
   const [formErr, setFormErr] = useState('')
   const [testing, setTesting] = useState(false)
@@ -222,9 +343,13 @@ function DirPicker(props: DirPickerProps) {
   const [testMsg, setTestMsg] = useState('')
   const [testOk, setTestOk] = useState(false)
 
-  // On open: fetch the host inventory (+ current alias for preselection).
+  // On open: always land on the card step, then fetch the host inventory
+  // (+ current alias for preselection).
   useEffect(() => {
     if (!open) return
+    setView('cards')
+    setWsName('')
+    setErr('')
     api<StatusResponse>('GET', '/api/dsh-rw/status')
       .then((r) => {
         const list = Array.isArray(r.hosts) ? r.hosts : []
@@ -364,8 +489,9 @@ function DirPicker(props: DirPickerProps) {
       .finally(() => setLoading(false))
   }
 
-  const switchTab = (t: 'local' | 'remote') => {
-    setTab(t)
+  // 进入本机/远程表单页（卡片步点击或子页返回时调用）。
+  const openFlow = (t: 'local' | 'remote') => {
+    setView(t)
     setErr('')
     if (t === 'remote') {
       if (alias) loadLevels(alias, '/', 0)
@@ -378,13 +504,15 @@ function DirPicker(props: DirPickerProps) {
   }
 
   // Commit the remote path as the workspace: the host resolves it (realpath),
-  // creates the local placeholder dir, and answers with its path.
+  // creates the local placeholder dir (named by 工作区名称 when given), and
+  // answers with its path.
   const commitPath = (p: string) => {
     const target = String(p || '').trim()
     if (!target || !alias || busy) return
     setPopOpen(false)
     setSuggestOpen(false)
-    api<WorkspaceResponse>('POST', '/api/dsh-rw/workspace', { alias, path: target })
+    const name = wsName.trim()
+    api<WorkspaceResponse>('POST', '/api/dsh-rw/workspace', { alias, path: target, ...(name ? { name } : {}) })
       .then((res) => {
         if (res && res.ok && res.placeholderDir) onPicked(String(res.placeholderDir))
         else setErr((res && res.error) || '设置远程工作区失败')
@@ -471,7 +599,7 @@ function DirPicker(props: DirPickerProps) {
       .finally(() => setTesting(false))
   }
 
-  // 保存手动主机：成功后清空表单（含密码）、收起、刷新列表并自动选中新主机。
+  // 保存手动主机：成功后清空表单（含密码）、回到远程页、刷新列表并自动选中新主机。
   const saveNewHost = () => {
     const msg = addFormError(true)
     if (msg) {
@@ -484,7 +612,7 @@ function DirPicker(props: DirPickerProps) {
     api<AddHostResponse>('POST', '/api/dsh-rw/hosts', { alias: newAlias, ...addFormPayload() })
       .then(() => {
         resetAddForm()
-        setAddOpen(false)
+        setView('remote')
         refreshHosts()
           .then(() => {
             setAlias(newAlias)
@@ -521,53 +649,72 @@ function DirPicker(props: DirPickerProps) {
 
   function renderAddForm() {
     const busyForm = testing || saving
+    // 认证方式分段选择器的一段。
+    const seg = (kind: 'key' | 'password', label: string) => {
+      const active = form.authKind === kind
+      return (
+        <button
+          onClick={() => updForm({ authKind: kind })}
+          style={{
+            ...buttonS,
+            flex: 1,
+            border: '1px solid ' + (active ? T.accent : T.border),
+            background: active ? T.bgHover : 'transparent',
+            color: active ? T.accent : T.label,
+            fontWeight: active ? 600 : 400,
+          }}
+        >
+          {label}
+        </button>
+      )
+    }
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid ' + T.border, borderRadius: T.radius, padding: 10 }}>
-        <div style={{ fontSize: 12, opacity: 0.8 }}>保存为手动主机（~/.dsh/dsh-rw.json）；密码与私钥口令仅用于提交，此处不回显。</div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <input value={form.alias} onChange={(e) => updForm({ alias: e.target.value })} placeholder="别名 *（字母数字 . _ -）" style={inputS} />
-          <input value={form.host} onChange={(e) => updForm({ host: e.target.value })} placeholder="主机 *（IP 或域名）" style={{ ...inputS, flex: 2 }} />
-        </div>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <input value={form.port} onChange={(e) => updForm({ port: e.target.value })} placeholder="端口（默认 22）" inputMode="numeric" style={inputS} />
-          <input value={form.user} onChange={(e) => updForm({ user: e.target.value })} placeholder="用户（默认 root）" style={inputS} />
-        </div>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12 }}>
-          <span style={{ opacity: 0.8 }}>认证方式:</span>
-          <button style={{ ...buttonS, fontWeight: form.authKind === 'key' ? 700 : 400 }} onClick={() => updForm({ authKind: 'key' })}>
-            私钥路径
-          </button>
-          <button style={{ ...buttonS, fontWeight: form.authKind === 'password' ? 700 : 400 }} onClick={() => updForm({ authKind: 'password' })}>
-            密码
-          </button>
-        </div>
-        {form.authKind === 'key' ? (
-          <div style={{ display: 'flex', gap: 6 }}>
-            <input value={form.keyPath} onChange={(e) => updForm({ keyPath: e.target.value })} placeholder="私钥路径 *（如 ~/.ssh/id_ed25519）" style={{ ...inputS, flex: 2 }} />
-            <input value={form.passphrase} onChange={(e) => updForm({ passphrase: e.target.value })} type="password" placeholder="私钥口令（可选）" style={inputS} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>保存为手动主机（~/.dsh/dsh-rw.json）；密码与私钥口令仅用于提交，此处不回显。</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={labelS}>基本信息</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <TextInput value={form.alias} onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })} placeholder="别名 *（字母数字 . _ -）" />
+            <TextInput value={form.host} onChange={(e: { target: { value: string } }) => updForm({ host: e.target.value })} placeholder="主机 *（IP 或域名）" style={{ flex: 2 }} />
           </div>
-        ) : (
-          <input value={form.password} onChange={(e) => updForm({ password: e.target.value })} type="password" placeholder="密码 *" style={inputS} />
-        )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <TextInput value={form.port} onChange={(e: { target: { value: string } }) => updForm({ port: e.target.value })} placeholder="端口（默认 22）" inputMode="numeric" />
+            <TextInput value={form.user} onChange={(e: { target: { value: string } }) => updForm({ user: e.target.value })} placeholder="用户（默认 root）" />
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={labelS}>认证方式</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {seg('key', '私钥路径')}
+            {seg('password', '密码')}
+          </div>
+          {form.authKind === 'key' ? (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <TextInput value={form.keyPath} onChange={(e: { target: { value: string } }) => updForm({ keyPath: e.target.value })} placeholder="私钥路径 *（如 ~/.ssh/id_ed25519）" style={{ flex: 2, fontFamily: 'monospace' }} />
+              <TextInput value={form.passphrase} onChange={(e: { target: { value: string } }) => updForm({ passphrase: e.target.value })} type="password" placeholder="私钥口令（可选）" />
+            </div>
+          ) : (
+            <TextInput value={form.password} onChange={(e: { target: { value: string } }) => updForm({ password: e.target.value })} type="password" placeholder="密码 *" />
+          )}
+        </div>
         {formErr ? <div style={{ color: T.danger, fontSize: 12 }}>{formErr}</div> : null}
         {testMsg ? <div style={{ color: testOk ? T.ok : T.danger, fontSize: 12 }}>{testMsg}</div> : null}
-        <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-          <button style={buttonS} onClick={testNewHost} disabled={busyForm}>
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
+          <Btn onClick={testNewHost} disabled={busyForm}>
             {testing ? '测试中…' : '测试连接'}
-          </button>
-          <button style={{ ...buttonS, fontWeight: 600 }} onClick={saveNewHost} disabled={busyForm}>
+          </Btn>
+          <Btn primary onClick={saveNewHost} disabled={busyForm}>
             {saving ? '保存中…' : '保存'}
-          </button>
-          <button
-            style={buttonS}
+          </Btn>
+          <Btn
             onClick={() => {
-              setAddOpen(false)
+              setView('remote')
               resetAddForm()
             }}
             disabled={busyForm}
           >
             取消
-          </button>
+          </Btn>
         </div>
       </div>
     )
@@ -589,46 +736,36 @@ function DirPicker(props: DirPickerProps) {
           style={{ background: overlayBg, border: '1px solid ' + T.borderStrong, borderRadius: 10, boxShadow: '0 10px 40px rgba(0,0,0,0.5)', width: 'min(560px, 94vw)', minWidth: 320, display: 'flex', flexDirection: 'column', maxHeight: 'min(440px, 82vh)', overflow: 'hidden' }}
           onClick={(e) => e.stopPropagation()}
         >
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '8px 12px', borderBottom: '1px solid ' + T.border }}>
-            <button style={{ ...buttonS, padding: '3px 10px' }} onClick={() => setLevels((p) => (p && p.length > 1 ? p.slice(0, p.length - 1) : p))} disabled={levels.length <= 1 || loading}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '8px 12px', borderBottom: '1px solid ' + T.border }}>
+            <Btn style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => setLevels((p) => (p && p.length > 1 ? p.slice(0, p.length - 1) : p))} disabled={levels.length <= 1 || loading}>
               回上一级 ▴
-            </button>
-            <div style={{ fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+            </Btn>
+            <div style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
               {breadcrumb(!!alias, last.path, jumpTo)}
             </div>
-            <button style={{ ...buttonS, padding: '3px 10px' }} onClick={() => setPopOpen(false)}>
+            <Btn style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => setPopOpen(false)}>
               关闭 ✕
-            </button>
+            </Btn>
           </div>
-          <div style={{ overflowY: 'auto', overflowX: 'hidden' }}>
+          <div style={{ overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
             {loading ? (
-              <div style={{ opacity: 0.7, padding: 12 }}>加载中…</div>
+              <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>加载中…</div>
             ) : entries.length ? (
               entries.slice(0, 400).map((it, i) => {
                 const drill = drillable(it)
-                return (
-                  <div
-                    key={it.name + '-' + i}
-                    title={(drill ? '进入 ' : '文件: ') + it.name}
-                    onClick={drill ? () => enterDir(it.name) : undefined}
-                    style={{ padding: '7px 12px', cursor: drill ? 'pointer' : 'default', color: drill ? T.ok : T.label, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, borderBottom: '1px solid ' + T.border }}
-                  >
-                    <span>{it.type === 'dir' ? '📁' : it.type === 'symlink' ? '🔗' : '📄'}</span>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{it.name}</span>
-                  </div>
-                )
+                return <DirRow key={it.name + '-' + i} item={it} drill={drill} onEnter={() => enterDir(it.name)} />
               })
             ) : (
-              <div style={{ opacity: 0.6, padding: 12 }}>（空目录）</div>
+              <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>（空目录）</div>
             )}
           </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', padding: '8px 12px', borderTop: '1px solid ' + T.border }}>
-            <span style={{ fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+            <span style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
               {'所选: ' + last.path}
             </span>
-            <button style={{ ...buttonS, fontWeight: 600 }} onClick={() => acceptBrowserPick(last.path)}>
+            <Btn primary onClick={() => acceptBrowserPick(last.path)}>
               选用此路径
-            </button>
+            </Btn>
           </div>
         </div>
       </div>
@@ -637,13 +774,19 @@ function DirPicker(props: DirPickerProps) {
 
   if (!open) return null
 
-  const tabBtn = (t: 'local' | 'remote', lbl: string) => (
-    <button onClick={() => switchTab(t)} style={{ ...buttonS, fontWeight: tab === t ? 700 : 400 }}>
-      {lbl}
-    </button>
+  const selectedHost = hosts.find((h) => h.alias === alias)
+
+  // 卡片步：两张大卡片（本机 / 远程），各带一句说明，点击进对应表单页。
+  const card = (t: 'local' | 'remote', icon: string, title: string, desc: string) => <FlowCard onClick={() => openFlow(t)} icon={icon} title={title} desc={desc} />
+
+  // 「← 返回」：addHost 子页回远程表单页，其余表单页回卡片步。
+  const backBtn = (
+    <Btn style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => (view === 'addHost' ? setView('remote') : setView('cards'))} disabled={busy}>
+      ← 返回
+    </Btn>
   )
 
-  const selectedHost = hosts.find((h) => h.alias === alias)
+  const viewTitle = view === 'cards' ? '选择工作目录' : view === 'local' ? '本机目录' : view === 'remote' ? '远程工作区' : '添加远程主机'
 
   // 全屏居中 modal（遮罩 + 面板）：在窄 sidebar 和 conversation 里渲染一致。
   return (
@@ -654,144 +797,165 @@ function DirPicker(props: DirPickerProps) {
       }}
     >
       <div
-        style={{ background: panelBg, border: '1px solid ' + T.borderStrong, borderRadius: 12, boxShadow: '0 12px 48px rgba(0,0,0,0.5)', width: 'min(600px, 94vw)', padding: 16, boxSizing: 'border-box' }}
+        style={{ background: panelBg, border: '1px solid ' + T.borderStrong, borderRadius: 14, boxShadow: '0 16px 56px rgba(0,0,0,0.55)', width: 'min(640px, 94vw)', padding: 20, boxSizing: 'border-box' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-          <div>选择工作目录</div>
-          <button
-            style={{ ...buttonS, padding: '2px 8px' }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+          {view !== 'cards' ? backBtn : null}
+          <div style={{ flex: 1, fontSize: 15, fontWeight: 600 }}>{viewTitle}</div>
+          <Btn
+            style={{ padding: '2px 9px', border: '1px solid transparent', background: 'transparent', color: T.muted }}
             onClick={() => {
               if (!busy) onCancel()
             }}
             disabled={busy}
           >
-            关闭 ✕
-          </button>
+            ✕
+          </Btn>
         </div>
-        <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-          {tabBtn('local', '本机')}
-          {tabBtn('remote', '远程')}
-        </div>
-        {tab === 'local' ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ fontSize: 12, opacity: 0.8 }}>系统选择器优先；不可用时直接输入本机目录。</div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="本机目录，如 /Users/you/project" style={inputS} />
-              <button style={buttonS} onClick={() => (path.trim() ? onPicked(path.trim()) : undefined)} disabled={!path.trim()}>
-                选用此本地路径
-              </button>
-            </div>
-            <button style={{ ...buttonS, alignSelf: 'flex-start' }} onClick={chooseLocal} disabled={loading}>
-              {loading ? '打开中…' : '打开系统文件夹选择器'}
-            </button>
-            {err ? <div style={{ color: T.danger, fontSize: 12 }}>{err}</div> : null}
+        {view === 'cards' ? (
+          <div style={{ display: 'flex', gap: 12 }}>
+            {card('local', '💻', '本机目录', '使用这台电脑上的文件夹，直接输入路径或打开系统文件夹选择器。')}
+            {card('remote', '🌐', '远程工作区', '通过 SSH 在远程主机上选一个目录，本地操作都会实时落到远程。')}
           </div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <label style={{ fontSize: 12, opacity: 0.8, whiteSpace: 'nowrap' }}>远程主机:</label>
-              <select
-                value={alias}
-                onChange={(e) => {
-                  const a = e.target.value
-                  setAlias(a)
-                  setLevels(null)
-                  setErr('')
-                  if (a) {
-                    loadLevels(a, '/', 0)
-                    if (!path.trim()) {
-                      setPath('/')
-                      loadSuggestions('/', a)
-                    }
-                  }
-                }}
-                style={{ ...inputS, maxWidth: '100%', minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-              >
-                <option value="">— 选择 —</option>
-                {hosts.map((h) => {
-                  const problem = hostProblem(h)
-                  return (
-                    <option key={h.alias} value={h.alias} disabled={problem !== null}>
-                      {h.alias} ({h.user}@{h.host}){h.source === 'manual' ? ' · 手动' : ''}
-                      {problem ? ` · ${problem}` : ''}
-                    </option>
-                  )
-                })}
-              </select>
-              <button
-                style={{ ...buttonS, whiteSpace: 'nowrap' }}
-                onClick={() => {
-                  setAddOpen(!addOpen)
-                  resetAddForm()
-                }}
-              >
-                {addOpen ? '收起 ▴' : '+ 添加主机'}
-              </button>
-              {selectedHost && selectedHost.source === 'manual' ? (
-                <button
-                  style={{ ...buttonS, padding: '3px 8px', fontSize: 12, color: T.danger, whiteSpace: 'nowrap' }}
-                  title={`删除手动主机 ${selectedHost.alias}`}
-                  onClick={() => removeManualHost(selectedHost)}
-                >
-                  删除
-                </button>
-              ) : null}
-            </div>
-            {addOpen ? renderAddForm() : null}
-            {hosts.length === 0 ? (
-              <div style={{ fontSize: 12, opacity: 0.8 }}>
-                未在 ~/.ssh/config 发现主机，也未手动添加。点击上方「+ 添加主机」登记一台，或在 ~/.ssh/config 配置 Host 条目后重新打开本窗口。
+        ) : null}
+        {view === 'local' ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>系统选择器优先；不可用时直接输入本机目录。</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={labelS}>本机路径</div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <TextInput value={path} onChange={(e) => setPath(e.target.value)} placeholder="本机目录，如 /Users/you/project" />
+                <Btn primary onClick={() => (path.trim() ? onPicked(path.trim()) : undefined)} disabled={!path.trim()}>
+                  选用
+                </Btn>
               </div>
-            ) : null}
-            {/* 路径输入框（带自动补全）+ 打开浏览弹层按钮 */}
-            <div style={{ position: 'relative', display: 'flex', gap: 6 }}>
-              <input
-                value={path}
-                onChange={(e) => onPathChange(e.target.value)}
-                onFocus={() => loadSuggestions(path)}
-                placeholder={alias ? '输入远程路径（自动补全）' : '先选择远程主机'}
-                disabled={!alias}
-                style={{ ...inputS, flex: 1, minWidth: 120 }}
-              />
-              <button
-                style={{ ...buttonS, whiteSpace: 'nowrap' }}
-                onClick={() => {
-                  if (alias) setPopOpen(true)
-                }}
-                disabled={!alias}
-              >
-                浏览…
-              </button>
-              {/* 自动补全下拉 */}
-              {suggestOpen && suggest.length ? (
-                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 50, background: overlayBg, border: '1px solid ' + T.borderStrong, borderRadius: 8, marginTop: 4, maxHeight: 200, overflowY: 'auto', boxShadow: '0 6px 24px rgba(0,0,0,0.25)' }}>
-                  {suggest.map((s, i) => (
-                    <div key={s + i} onMouseDown={() => selectSuggestion(s)} style={{ padding: '6px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {s}
-                    </div>
-                  ))}
-                </div>
-              ) : null}
             </div>
+            <Btn style={{ alignSelf: 'flex-start' }} onClick={chooseLocal} disabled={loading}>
+              {loading ? '打开中…' : '打开系统文件夹选择器'}
+            </Btn>
             {err ? <div style={{ color: T.danger, fontSize: 12 }}>{err}</div> : null}
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center' }}>
-              <span style={{ fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                {path ? '所选: ' + path : ''}
-              </span>
-              <button style={{ ...buttonS, fontWeight: 600 }} onClick={() => commitPath(path)} disabled={busy || !alias || !path.trim()}>
-                {busy ? '设置中…' : '设为远程工作区'}
-              </button>
-            </div>
-            {/* 悬浮浏览弹层：选中的路径回填到输入框（不直接提交） */}
-            {popOpen ? renderDirPopup() : null}
           </div>
-        )}
-        {tab === 'local' ? (
+        ) : null}
+        {view === 'remote' || view === 'addHost' ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {view === 'addHost' ? (
+              renderAddForm()
+            ) : (
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={labelS}>远程主机</div>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <select
+                      value={alias}
+                      onChange={(e) => {
+                        const a = e.target.value
+                        setAlias(a)
+                        setLevels(null)
+                        setErr('')
+                        if (a) {
+                          loadLevels(a, '/', 0)
+                          if (!path.trim()) {
+                            setPath('/')
+                            loadSuggestions('/', a)
+                          }
+                        }
+                      }}
+                      style={{ ...inputS, maxWidth: '100%', minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                    >
+                      <option value="">— 选择 —</option>
+                      {hosts.map((h) => {
+                        const problem = hostProblem(h)
+                        return (
+                          <option key={h.alias} value={h.alias} disabled={problem !== null}>
+                            {h.alias} ({h.user}@{h.host}){h.source === 'manual' ? ' · 手动' : ''}
+                            {problem ? ` · ${problem}` : ''}
+                          </option>
+                        )
+                      })}
+                    </select>
+                    <Btn
+                      style={{ whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        resetAddForm()
+                        setView('addHost')
+                      }}
+                    >
+                      + 添加主机
+                    </Btn>
+                    {selectedHost && selectedHost.source === 'manual' ? (
+                      <Btn danger style={{ padding: '5px 10px', fontSize: 12, whiteSpace: 'nowrap' }} title={`删除手动主机 ${selectedHost.alias}`} onClick={() => removeManualHost(selectedHost)}>
+                        删除
+                      </Btn>
+                    ) : null}
+                  </div>
+                  {selectedHost ? (
+                    <div style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace' }}>
+                      {selectedHost.user}@{selectedHost.host}:{selectedHost.port} · {selectedHost.authKind === 'key' ? '私钥' : '密码'}认证
+                    </div>
+                  ) : null}
+                </div>
+                {hosts.length === 0 ? (
+                  <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>
+                    未在 ~/.ssh/config 发现主机，也未手动添加。点击上方「+ 添加主机」登记一台，或在 ~/.ssh/config 配置 Host 条目后重新打开本窗口。
+                  </div>
+                ) : null}
+                {/* 路径输入框（带自动补全）+ 打开浏览弹层按钮 */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={labelS}>远程路径</div>
+                  <div style={{ position: 'relative', display: 'flex', gap: 8 }}>
+                    <TextInput
+                      value={path}
+                      onChange={(e: { target: { value: string } }) => onPathChange(e.target.value)}
+                      onFocus={() => loadSuggestions(path)}
+                      placeholder={alias ? '输入远程路径（自动补全）' : '先选择远程主机'}
+                      disabled={!alias}
+                      style={{ flex: 1, minWidth: 120, fontFamily: 'monospace' }}
+                    />
+                    <Btn
+                      style={{ whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        if (alias) setPopOpen(true)
+                      }}
+                      disabled={!alias}
+                    >
+                      浏览…
+                    </Btn>
+                    {/* 自动补全下拉 */}
+                    {suggestOpen && suggest.length ? (
+                      <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 50, background: overlayBg, border: '1px solid ' + T.borderStrong, borderRadius: 8, marginTop: 4, maxHeight: 220, overflowY: 'auto', boxShadow: '0 8px 28px rgba(0,0,0,0.35)', padding: 4 }}>
+                        {suggest.map((s, i) => (
+                          <SuggestRow key={s + i} text={s} onPick={() => selectSuggestion(s)} />
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                {/* 工作区名称：可选；留空用路径末级目录名，仅重名冲突时服务端追加哈希后缀 */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={labelS}>工作区名称（可选）</div>
+                  <TextInput value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="默认取路径末级目录名" />
+                </div>
+                {err ? <div style={{ color: T.danger, fontSize: 12 }}>{err}</div> : null}
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
+                  <span style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                    {path ? '所选: ' + path : ''}
+                  </span>
+                  <Btn primary onClick={() => commitPath(path)} disabled={busy || !alias || !path.trim()}>
+                    {busy ? '设置中…' : '设为远程工作区'}
+                  </Btn>
+                </div>
+                {/* 悬浮浏览弹层：选中的路径回填到输入框（不直接提交） */}
+                {popOpen ? renderDirPopup() : null}
+              </>
+            )}
+          </div>
+        ) : null}
+        {view === 'local' ? (
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <button style={{ background: 'transparent' }} onClick={onCancel}>
+            <Btn style={{ border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel}>
               取消
-            </button>
+            </Btn>
           </div>
         ) : null}
       </div>

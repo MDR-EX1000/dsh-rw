@@ -15,7 +15,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError, toRwError } from './errors.js'
 import { normalizeRemote } from './guard.js'
 import type { HostEntry, HostSummary } from './hosts.js'
-import { ensurePlaceholder, placeholderDirFor } from './placeholder.js'
+import { ensurePlaceholder, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { ExecResult, SftpLike } from './ssh-pool.js'
@@ -115,12 +115,14 @@ async function requireWorkspaceFs(deps: ToolsDeps): Promise<RemoteFs> {
  * Shared pick-workspace validation used by rw_pick_workspace and the
  * /api/dsh-rw/workspace route: resolve symlinks via realpath, require a
  * directory, create the local placeholder. Returns the real workspace path
- * and the placeholder directory. Does not touch the session.
+ * and the placeholder directory. Does not touch the session. `name` (picker
+ * only) names a fresh placeholder; the tool flow omits it (basename default).
  */
 export async function resolveWorkspaceDir(
   deps: ToolsDeps,
   alias: string,
   path: string,
+  name?: string,
 ): Promise<{ workspace: string; placeholderDir: string }> {
   const entry = deps.hosts.find(alias)
   if (!entry) throw unknownAliasError(deps, alias)
@@ -141,7 +143,7 @@ export async function resolveWorkspaceDir(
     throw mapSftpError(err, real)
   }
   if (!isDir) throw new RwError('NOT_A_DIRECTORY', `not a directory: ${real}`)
-  const placeholderDir = ensurePlaceholder(alias, entry, real, deps.placeholderBaseDir)
+  const placeholderDir = ensurePlaceholder(alias, entry, real, deps.placeholderBaseDir, name)
   return { workspace: real, placeholderDir }
 }
 
@@ -165,7 +167,12 @@ export function statusText(deps: ToolsDeps): string {
   lines.push(`Connected: ${connected ? 'yes' : 'no'}`)
   lines.push(`Current workspace: ${workspace ?? '(none — call rw_pick_workspace to set one)'}`)
   if (alias !== null && workspace !== null) {
-    lines.push(`Placeholder dir (register this as the DSH workspace): ${placeholderDirFor(alias, workspace, deps.placeholderBaseDir)}`)
+    const placeholderDir = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
+    lines.push(
+      placeholderDir !== null
+        ? `Placeholder dir (register this as the DSH workspace): ${placeholderDir}`
+        : 'Placeholder dir: (none found — call rw_pick_workspace to (re)create it)',
+    )
   }
   lines.push(
     `Host key policy: ${deps.config.hostKeyPolicy ?? 'accept-new'} (plugin config hostKeyPolicy; keys verified against known_hosts)`,

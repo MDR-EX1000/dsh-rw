@@ -30,7 +30,7 @@ import type {
 } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError } from './errors.js'
 import { assertRealpathInside, normalizeRemote, resolveInWorkspace, shq } from './guard.js'
-import { placeholderDirFor } from './placeholder.js'
+import { resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { HostEntry } from './hosts.js'
@@ -148,7 +148,10 @@ function activeTarget(deps: ShimDeps): ActiveTarget | null {
   if (alias === null || workspace === null) return null
   const entry = deps.hosts.find(alias)
   if (!entry) return null
-  const localRoot = placeholderDirFor(alias, workspace, deps.placeholderBaseDir)
+  const localRoot = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
+  // No placeholder on disk for the session's (alias, workspace): the workspace
+  // was not picked through this plugin (or its meta is gone) — the shim sleeps.
+  if (localRoot === null) return null
   const localRoots = [resolve(localRoot)]
   try {
     const real = realpathSync(localRoot)

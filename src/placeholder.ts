@@ -3,8 +3,18 @@
 // pair gets an empty placeholder holding only a meta file — never a copy of
 // remote files. The meta file carries no credentials, but is still written
 // 0600 inside a 0700 directory like every other dsh-rw state file.
+//
+// Naming: the placeholder takes a CLEAN name — the remote path's basename, or
+// the display name the user gave in the picker — sanitized to a safe directory
+// name. The sha1 suffix appears ONLY on collision: when the candidate
+// directory already exists and does not provably belong to this workspace
+// (another workspace's meta, or an unreadable one), the name becomes
+// `<name>-<sha1(normalized remotePath)[:8]>`. Because names are no longer
+// computable from (alias, remotePath), lookup works by scanning meta files
+// (resolvePlaceholderDir) — which keeps legacy hash-suffixed directories from
+// v0.1/v0.2 working unchanged: their meta still records the remotePath.
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { baseName, normalizeRemote } from './guard.js'
@@ -33,32 +43,66 @@ function defaultBaseDir(): string {
   return join(homedir(), '.dsh', 'remote-workspaces')
 }
 
+/** sha1(normalized remotePath)[:8] — the collision suffix (also the v0.1/v0.2 directory naming). */
+function pathHash(normalized: string): string {
+  return createHash('sha1').update(normalized, 'utf8').digest('hex').slice(0, 8)
+}
+
 /**
- * Deterministic placeholder path:
- * <baseDir>/<sanitize(alias)>/<base>-<sha1(normalized remotePath)[:8]>
- * so the same alias+path always maps to the same directory and distinct
- * paths (even with equal basenames) never collide.
+ * Locate the placeholder of (alias, remotePath) by scanning the alias's
+ * placeholder directories and matching their meta files (exact alias +
+ * normalized remotePath). Names are no longer computable — clean basenames,
+ * user display names, and legacy hash suffixes coexist — so this is the ONLY
+ * correct lookup. Null when nothing matches (workspace never picked, or the
+ * meta is lost/corrupt).
  */
-export function placeholderDirFor(alias: string, remotePath: string, baseDir?: string): string {
+export function resolvePlaceholderDir(alias: string, remotePath: string, baseDir?: string): string | null {
   const normalized = normalizeRemote(remotePath)
-  const hash = createHash('sha1').update(normalized, 'utf8').digest('hex').slice(0, 8)
-  return join(baseDir ?? defaultBaseDir(), sanitize(alias), `${baseName(normalized)}-${hash}`)
+  const parent = join(baseDir ?? defaultBaseDir(), sanitize(alias))
+  let names: string[]
+  try {
+    names = readdirSync(parent)
+  } catch {
+    return null
+  }
+  for (const name of names) {
+    const dir = join(parent, name)
+    const meta = readPlaceholderMeta(dir)
+    if (meta !== null && meta.alias === alias && meta.remotePath === normalized) return dir
+  }
+  return null
+}
+
+/**
+ * The directory name for a fresh placeholder: displayName (trimmed) or the
+ * remote basename, sanitized; the sha1 suffix appears only when the candidate
+ * is already occupied by something that is not provably this workspace.
+ */
+function freshPlaceholderDir(alias: string, normalized: string, baseDir: string | undefined, displayName?: string): string {
+  const parent = join(baseDir ?? defaultBaseDir(), sanitize(alias))
+  const clean = sanitize(displayName?.trim() || baseName(normalized))
+  const dir = join(parent, clean)
+  if (!existsSync(dir)) return dir
+  return join(parent, `${clean}-${pathHash(normalized)}`)
 }
 
 /**
  * Create the placeholder directory plus its meta file (0600, dir 0700).
- * Idempotent: when the existing meta is consistent nothing is rewritten; an
+ * Idempotent: an existing placeholder for the same (alias, remotePath) — found
+ * via resolvePlaceholderDir — is kept as-is when its meta is consistent; an
  * inconsistent meta is rewritten but keeps the original createdAt.
- * Returns the placeholder directory.
+ * displayName (picker-only) names a fresh placeholder; omitting it uses the
+ * remote basename. Returns the placeholder directory.
  */
 export function ensurePlaceholder(
   alias: string,
   entry: { host: string; port: number; user: string },
   remotePath: string,
   baseDir?: string,
+  displayName?: string,
 ): string {
-  const dir = placeholderDirFor(alias, remotePath, baseDir)
   const remote = normalizeRemote(remotePath)
+  const dir = resolvePlaceholderDir(alias, remote, baseDir) ?? freshPlaceholderDir(alias, remote, baseDir, displayName)
   const existing = readPlaceholderMeta(dir)
   const consistent =
     existing !== null &&

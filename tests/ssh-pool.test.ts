@@ -539,3 +539,213 @@ describe('sftp', () => {
     pool.dispose()
   })
 })
+
+describe('reconnect retry', () => {
+  // Unlike makePool (which always serves the last pushed fake), the retry
+  // tests need a deterministic dial order: fakes are served from a queue.
+  function makeQueuedPool(queue: FakeClient[], opts: Partial<PoolOptions> = {}): SshPool {
+    return new SshPool({
+      hostKeyPolicy: 'accept-new',
+      knownHosts,
+      connectTimeoutMs: 1000,
+      commandTimeoutMs: 1000,
+      maxOutputChars: 200000,
+      ...opts,
+      clientFactory: () => {
+        factoryCalls++
+        const f = queue.shift()
+        if (!f) throw new Error('no fake scripted')
+        return f as unknown as Client
+      },
+    })
+  }
+
+  /** The connection dies exactly as the channel is opened. */
+  class DeadExecClient extends FakeClient {
+    override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
+      this.emit('close')
+      queueMicrotask(() => cb(new Error('Not connected')))
+    }
+  }
+
+  /** The connection dies exactly as the SFTP subsystem is opened. */
+  class DeadSftpClient extends FakeClient {
+    override sftp(cb: (err: Error | undefined, sftp?: SFTPWrapper) => void): void {
+      this.emit('close')
+      queueMicrotask(() => cb(new Error('Not connected')))
+    }
+  }
+
+  const okSftpScript: FakeScript = {
+    onSftp: (cb) => {
+      const raw = {
+        readFile: (_p: string, cb2: (err: Error | undefined, data?: Buffer) => void) =>
+          cb2(undefined, Buffer.from('content')),
+      } as unknown as SFTPWrapper
+      cb(undefined, raw)
+    },
+  }
+
+  it('redials and retries exec once when the channel open fails on a dropped connection', async () => {
+    const dead = new DeadExecClient()
+    const good = new FakeClient()
+    const pool = makeQueuedPool([dead, good])
+    const r = await pool.exec(entry(), 'true')
+    expect(r.code).toBe(0)
+    expect(factoryCalls).toBe(2)
+    expect(good.commands).toEqual(['true'])
+    expect(pool.connected()).toEqual(['h'])
+    pool.dispose()
+  })
+
+  it('surfaces the exec error when the retry attempt also fails (at most one retry)', async () => {
+    const pool = makeQueuedPool([new DeadExecClient(), new DeadExecClient()])
+    await expectRw(pool.exec(entry(), 'true'), 'REMOTE_ERROR')
+    expect(factoryCalls).toBe(2) // no third dial
+    expect(pool.connected()).toEqual([])
+    pool.dispose()
+  })
+
+  it('does not retry a channel-open failure on a live connection', async () => {
+    class LiveExecFailClient extends FakeClient {
+      override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
+        queueMicrotask(() => cb(new Error('Timed out while opening channel')))
+      }
+    }
+    const pool = makeQueuedPool([new LiveExecFailClient()])
+    await expectRw(pool.exec(entry(), 'x'), 'CONN_TIMEOUT')
+    expect(factoryCalls).toBe(1)
+    expect(pool.connected()).toEqual(['h']) // the connection itself is fine
+    pool.dispose()
+  })
+
+  it('does not retry a stream failure after the channel opened, even when the connection dies', async () => {
+    class DyingStreamClient extends FakeClient {
+      override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
+        const stream = new FakeStream()
+        cb(undefined, stream as unknown as ClientChannel)
+        queueMicrotask(() => {
+          this.emit('close') // connection drops mid-command
+          stream.emit('error', new Error('channel broke'))
+        })
+      }
+    }
+    const pool = makeQueuedPool([new DyingStreamClient()])
+    await expectRw(pool.exec(entry(), 'x'), 'REMOTE_ERROR')
+    expect(factoryCalls).toBe(1) // the command may have partially run — never retried
+    pool.dispose()
+  })
+
+  it('redials and retries sftp once when the subsystem open fails on a dropped connection', async () => {
+    const pool = makeQueuedPool([new DeadSftpClient(), new FakeClient(okSftpScript)])
+    const sftp = await pool.sftp(entry())
+    expect((await sftp.readFile('/w/f')).toString()).toBe('content')
+    expect(factoryCalls).toBe(2)
+    pool.dispose()
+  })
+
+  it('surfaces the sftp open error when the retry attempt also fails (at most one retry)', async () => {
+    const pool = makeQueuedPool([new DeadSftpClient(), new DeadSftpClient()])
+    await expectRw(pool.sftp(entry()), 'REMOTE_ERROR')
+    expect(factoryCalls).toBe(2)
+    pool.dispose()
+  })
+
+  it('re-acquires and retries an sftp op once when the connection dropped after acquisition', async () => {
+    const stale = new FakeClient({
+      onSftp: (cb) => {
+        const raw = {
+          readFile: (_p: string, cb2: (err: Error | undefined, data?: Buffer) => void) =>
+            cb2(new Error('Not connected')),
+        } as unknown as SFTPWrapper
+        cb(undefined, raw)
+      },
+    })
+    const pool = makeQueuedPool([stale, new FakeClient(okSftpScript)])
+    const sftp = await pool.sftp(entry())
+    stale.end() // the connection drops after the wrapper was acquired
+    await new Promise((r) => setImmediate(r))
+    expect(pool.connected()).toEqual([])
+
+    const data = await sftp.readFile('/w/f')
+    expect(data.toString()).toBe('content')
+    expect(factoryCalls).toBe(2)
+    pool.dispose()
+  })
+
+  it('does not retry sftp business errors (the client stays pooled)', async () => {
+    const live = new FakeClient({
+      onSftp: (cb) => {
+        const raw = {
+          readFile: (_p: string, cb2: (err: Error | undefined, data?: Buffer) => void) =>
+            cb2(Object.assign(new Error('No such file'), { code: 2 })),
+        } as unknown as SFTPWrapper
+        cb(undefined, raw)
+      },
+    })
+    const pool = makeQueuedPool([live])
+    const sftp = await pool.sftp(entry())
+    await expect(sftp.readFile('/nope')).rejects.toThrowError('No such file')
+    expect(factoryCalls).toBe(1)
+    pool.dispose()
+  })
+
+  // ── silently dead connections (half-open TCP: no error, no close, no
+  // answer) — the channel/subsystem open is bounded by channelOpenTimeoutMs,
+  // then dropped and retried on a fresh connection.
+
+  /** The exec callback never fires — a silently dead connection. */
+  class SilentExecClient extends FakeClient {
+    override exec(_cmd: string, _cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
+      // half-open TCP: nothing ever comes back
+    }
+  }
+
+  /** The sftp callback never fires — a silently dead connection. */
+  class SilentSftpClient extends FakeClient {
+    override sftp(_cb: (err: Error | undefined, sftp?: SFTPWrapper) => void): void {
+      // half-open TCP: nothing ever comes back
+    }
+  }
+
+  it('bounds the exec channel-open wait and retries on a fresh connection when the open never answers', async () => {
+    const good = new FakeClient()
+    const pool = makeQueuedPool([new SilentExecClient(), good], { channelOpenTimeoutMs: 30 })
+    const r = await pool.exec(entry(), 'true')
+    expect(r.code).toBe(0)
+    expect(factoryCalls).toBe(2)
+    expect(good.commands).toEqual(['true'])
+    pool.dispose()
+  })
+
+  it('surfaces CONN_TIMEOUT when the exec retry attempt also times out (at most one retry)', async () => {
+    const pool = makeQueuedPool([new SilentExecClient(), new SilentExecClient()], { channelOpenTimeoutMs: 30 })
+    await expectRw(pool.exec(entry(), 'true'), 'CONN_TIMEOUT')
+    expect(factoryCalls).toBe(2) // no third dial
+    pool.dispose()
+  })
+
+  it('bounds the sftp open wait and retries on a fresh connection when the open never answers', async () => {
+    const pool = makeQueuedPool([new SilentSftpClient(), new FakeClient(okSftpScript)], { channelOpenTimeoutMs: 30 })
+    const sftp = await pool.sftp(entry())
+    expect((await sftp.readFile('/w/f')).toString()).toBe('content')
+    expect(factoryCalls).toBe(2)
+    pool.dispose()
+  })
+
+  it('drops the pooled client on a post-ready error (not only on close), so the subsequent open failure retries', async () => {
+    class ErrorThenDeadExecClient extends FakeClient {
+      override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
+        this.emit('error', new Error('socket blew up')) // 'close' may lag behind or never arrive
+        queueMicrotask(() => cb(new Error('Not connected')))
+      }
+    }
+    const good = new FakeClient()
+    const pool = makeQueuedPool([new ErrorThenDeadExecClient(), good])
+    const r = await pool.exec(entry(), 'true')
+    expect(r.code).toBe(0)
+    expect(factoryCalls).toBe(2)
+    expect(good.commands).toEqual(['true'])
+    pool.dispose()
+  })
+})

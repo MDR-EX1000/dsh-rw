@@ -13,6 +13,7 @@ const CONFIG: Config = {
   knownHostsPath: '',
   commandTimeoutMs: 30000,
   connectTimeoutMs: 15000,
+  channelOpenTimeoutMs: 10000,
   maxOutputChars: 200000,
 }
 
