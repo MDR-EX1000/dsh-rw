@@ -1,6 +1,6 @@
 {
   "name": "dsh-rw",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Remote-SSH-style workspace for DeepSeek Harness (DSH): pick an SSH host and a remote directory as a native DSH workspace; the agent operates the remote filesystem directly via rw_* tools (SFTP/exec). No mirror, no sync — the remote is the source of truth.",
   "license": "MIT",
   "repository": {
@@ -42,15 +42,18 @@
     "prepack": "pnpm build && pnpm test"
   },
   "dependencies": {
+    "schemastery": "^3.18.0",
     "ssh2": "^1.16.0"
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.7",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
     "schemastery": "^3.18.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-host-webserver": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-settings": "0.1.0-rc.7",
     "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
     "@types/node": "^22.19.0",

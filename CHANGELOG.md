@@ -10,6 +10,49 @@ versioning follows [SemVer](https://semver.org/).
 - Fix: replace pnpm `allowBuilds` placeholder strings with real booleans — placeholders broke
   `pnpm install --frozen-lockfile` on fresh environments (`ERR_PNPM_IGNORED_BUILDS`).
 
+## 0.2.0 — 2026-08-20
+
+Shim mode: DSH's native tools run against the remote workspace.
+
+- Opt-in shim mode (`shim: true`): cordis middleware on the `tools/execute` waterfall intercepts
+  the seven native tools — `read` / `write` / `edit` / `str_replace_editor` / `glob` / `grep` /
+  `bash` — and translates them to remote execution (SFTP/exec) whenever the call's paths resolve
+  inside the active placeholder workspace. Anything outside passes through to the local tool
+  untouched, and with shim off (the default) behavior is identical to 0.1.
+- Paths map both ways: argument paths map placeholder → remote (relative paths resolve against
+  the placeholder root), and every path in results and composed error messages maps back to
+  placeholder form, so the agent's worldview stays a local directory.
+- Edits (`edit`, `str_replace_editor` str_replace/insert) re-stat before writing back and fail
+  with `RW_EDIT_CONFLICT` when the remote file changed since the read.
+- `glob`/`grep` run remote `rg` when available (`find` / `grep -rnE` fallback); output is capped
+  by `maxOutputChars` like every remote call.
+- `bash` rewrites placeholder paths in the command, runs with the remote workspace root as cwd,
+  honors `exec.signal` (abort drops the connection, interrupting the remote process), and a
+  persistent `bash` (dsh-tool-bash-persistent registers the same tool name) degrades to a
+  one-shot remote exec with a note that shell state is not preserved.
+- Shimmed bash escalates through `tools/pre-execute` with `{ kind: 'ask' }` naming the remote
+  host alias (default `shimBashApproval: 'ask'`; `'native'` defers to the native policy) — but
+  stands down when the session's approval policy is `never` (e.g. the `danger-full-access`
+  preset): asking there auto-rejects without a dialog, so the command just runs, matching
+  that preset's contract. File tools never escalate — the workspace guard confines them.
+- Result `value` shapes conform to each native tool's output schema (the registry validates
+  them): bash returns the structured foreground object; read/write/edit/glob/grep return
+  their schema's objects. String values failed live with "value must match exactly one oneOf
+  branch" / "value must be an object" — caught in dogfooding, covered by per-tool value-shape
+  tests. `str_replace_editor`'s native schema is a plain string, unchanged.
+- Prompt steering: with shim on, the system-prompt section points the agent at the native
+  tools (translated transparently) instead of pushing `rw_*` — the 0.1 wording kept the shim
+  dormant because models dutifully preferred `rw_*`.
+- New config keys: `shim` (default `false`), `shimBash` (default `true`),
+  `shimBashApproval` (`'ask'` | `'native'`, default `'ask'`).
+- Settings integration: the three shim switches (and only they) also resolve from the
+  `dsh-rw:` section of `~/.dsh/settings.yaml` via `@deepseek-ai/dsh-settings` — schema defaults →
+  cordis entry config (base) → user layer. Changes committed through the settings service
+  apply live (the middlewares are registered unconditionally and read a shared config object
+  per dispatch); after editing the file by hand, restart `dsh web` to be sure it is picked
+  up. Without a settings service (or with an invalid stored section) the cordis entry config
+  stays authoritative. `schemastery` is now a runtime dependency.
+
 ## 0.1.0 — 2026-08-19
 
 Initial release.

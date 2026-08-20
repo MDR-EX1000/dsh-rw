@@ -19,6 +19,7 @@ export type RwErrorCode =
   | 'NOT_CONNECTED'
   | 'NO_WORKSPACE'
   | 'INVALID_INPUT'
+  | 'RW_EDIT_CONFLICT'
   | 'REMOTE_ERROR'
 
 export class RwError extends Error {

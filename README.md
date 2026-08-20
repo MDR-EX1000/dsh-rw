@@ -16,6 +16,7 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 - **SSH host key verification** — verifies against `~/.ssh/known_hosts` by default (`accept-new`: first-seen keys are recorded), with `strict` and an explicit `off` policy. A changed host key is refused, never silently accepted.
 - **Structured errors** — connection refused / auth failed / timeout / no such path / permission denied / outside workspace / host key problems are distinct error codes, so the agent can react correctly.
 - **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts.
+- **Shim mode (opt-in)** — with `shim: true`, DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. Off by default; with no active remote session (or shim off) every call passes through unchanged.
 
 ## Install
 
@@ -43,15 +44,37 @@ Restart `dsh web` afterwards. The plugin activates on boot; the "Add workspace" 
 
 ## Configuration
 
+dsh-rw reads two configuration layers:
+
+- **Cordis entry config** (the plugin entry in your cordis.yml / loader patch) — the base layer for
+  every key below. `hostKeyPolicy`, `knownHostsPath`, `commandTimeoutMs`, `connectTimeoutMs`, and
+  `maxOutputChars` are configured **only** here.
+- **`~/.dsh/settings.yaml`** — the `dsh-rw:` section overrides **only the three shim switches**.
+  Changes made through the settings service apply live; after editing the file by hand,
+  restart `dsh web` to be sure they are picked up. Resolution order: schema defaults →
+  cordis entry config (base) → this user layer.
+
+```yaml
+dsh-rw:
+  shim: true              # intercept native tools and run them on the remote workspace
+  shimBash: true          # also intercept bash (session cwd must be the placeholder)
+  shimBashApproval: ask   # ask = approval dialog naming the remote host (skipped on
+                          # never-ask presets like danger-full-access, which run directly);
+                          # native = defer to the native bash policy
+```
+
 Plugin config keys (defaults shown):
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `hostKeyPolicy` | `'accept-new'` | `'accept-new'` learns first-seen keys into known_hosts; `'strict'` refuses unknown; `'off'` disables verification (explicitly) |
-| `knownHostsPath` | `~/.ssh/known_hosts` | known_hosts file used for verification |
-| `commandTimeoutMs` | `30000` | per remote command timeout |
-| `connectTimeoutMs` | `15000` | SSH handshake timeout |
-| `maxOutputChars` | `200000` | cap on collected stdout/stderr per call |
+| Key | Default | Layer | Meaning |
+| --- | --- | --- | --- |
+| `hostKeyPolicy` | `'accept-new'` | cordis only | `'accept-new'` learns first-seen keys into known_hosts; `'strict'` refuses unknown; `'off'` disables verification (explicitly) |
+| `knownHostsPath` | `~/.ssh/known_hosts` | cordis only | known_hosts file used for verification |
+| `commandTimeoutMs` | `30000` | cordis only | per remote command timeout |
+| `connectTimeoutMs` | `15000` | cordis only | SSH handshake timeout |
+| `maxOutputChars` | `200000` | cordis only | cap on collected stdout/stderr per call |
+| `shim` | `false` | cordis + settings | shim mode: intercept the native read/write/edit/str_replace_editor/glob/grep/bash tools and run them against the active remote workspace |
+| `shimBash` | `true` | cordis + settings | with shim on, also intercept `bash` (only when the agent session cwd is the placeholder workspace) |
+| `shimBashApproval` | `'ask'` | cordis + settings | shimmed `bash` approval: `'ask'` escalates to the DSH approval dialog (reason names the remote host), but stands down on never-ask presets such as `danger-full-access` — asking there auto-rejects without a dialog, so the command just runs; `'native'` always defers to the native bash policy |
 
 ## Security model
 

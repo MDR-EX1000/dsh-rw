@@ -68,6 +68,14 @@ function makeCtx() {
       }
       return undefined // no directoryPicker in this context
     },
+    /** No settings service in this context: the inject callback never fires. */
+    inject(): unknown {
+      return undefined
+    },
+    /** Middleware registrations are captured nowhere; the disposer is a no-op. */
+    on(): () => void {
+      return () => {}
+    },
     effect(fn: () => (() => void) | void, label?: string) {
       effectLabels.push(label ?? '')
       const dispose = fn()
@@ -146,6 +154,21 @@ describe('apply', () => {
     const active = section!.text()
     expect(active).toContain('Current remote workspace: deploy@example.com:22:/srv/app')
     expect(active).toContain('confined to the workspace root')
+  })
+
+  it('the prompt section steers to native tools while shim is on', () => {
+    const { ctx, getSection } = makeCtx()
+    const overrides = makeOverrides()
+    apply(ctx as unknown as Context, { ...CONFIG, shim: true }, overrides)
+    overrides.session.set({ alias: 'prod', workspace: '/srv/app' })
+
+    const active = getSection()!.text()
+    expect(active).toContain('Current remote workspace: deploy@example.com:22:/srv/app')
+    expect(active).toContain('remote-backed')
+    expect(active).toContain('read/write/edit/str_replace_editor/glob/grep/bash')
+    expect(active).toContain('as if the workspace were local')
+    // rw_* stays mentioned as the explicit path, but is no longer the steering.
+    expect(active).toContain('rw_exec')
   })
 
   it('the /rw command renders the live status without credentials', () => {
