@@ -15,8 +15,10 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 - **Real workspace confinement** — every `rw_*` file path is confined to the picked workspace root: `../`, absolute paths outside the root, and symlink escapes (`SYMLINK_ESCAPE` via remote `realpath`) are rejected with structured errors.
 - **SSH host key verification** — verifies against `~/.ssh/known_hosts` by default (`accept-new`: first-seen keys are recorded), with `strict` and an explicit `off` policy. A changed host key is refused, never silently accepted.
 - **Structured errors** — connection refused / auth failed / timeout / no such path / permission denied / outside workspace / host key problems are distinct error codes, so the agent can react correctly.
+- **Self-healing connections** — the ssh2 pool keepalives (15s × 3) detect dropped connections, and channel/subsystem opens are bounded (`channelOpenTimeoutMs`, default 10s) so a silently dead connection (half-open TCP) can't hang an operation. An operation that lands on a dead connection is transparently retried once on a fresh redial — transient network blips never reach the agent as errors.
 - **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts. It takes a clean name — the remote basename or the name you give in the picker; a hash suffix appears only on a naming conflict (legacy hash-suffixed placeholders keep working).
-- **Shim mode (opt-in)** — with `shim: true`, DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. Off by default; with no active remote session (or shim off) every call passes through unchanged.
+- **Shim mode (opt-in)** — with `shim: true`, DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. Off by default. The shim anchors on the agent session's cwd placeholder — not the mutable `rw_*` session — so `rw_disconnect` or reconnecting `rw_*` to another host can't silently redirect native tools; calls rooted outside the placeholder always pass through to the local tool unchanged.
+- **Fail loud, never silently local** — if a placeholder's host was removed from the config, calls that would touch that placeholder fail with an actionable `NOT_CONNECTED` error instead of silently running against the empty local directory. The block is path-aware: only calls touching the broken placeholder fail; everything else still passes through.
 
 ## Install
 
@@ -101,7 +103,7 @@ Complementary, not a replacement. `dsh-ssh` is an ops toolbox (web terminal, por
 ```bash
 pnpm install
 pnpm build        # tsc (host) + esbuild wrapper (client)
-pnpm test         # vitest, 285 tests — all SSH/SFTP mocked
+pnpm test         # vitest, 348 tests — all SSH/SFTP mocked
 pnpm typecheck
 ```
 
@@ -110,6 +112,7 @@ Real-host acceptance (opt-in, creates and cleans a temp dir on the target):
 ```bash
 ssh <alias> 'mktemp -d /tmp/dsh-rw-acceptance.XXXXXX'   # then seed test data
 node scripts/acceptance.mjs <alias> /tmp/dsh-rw-acceptance.XXXXXX
+node scripts/live-shim.mjs <alias> <remote-dir>   # end-to-end shim acceptance (native tools → remote)
 ```
 
 ## License
