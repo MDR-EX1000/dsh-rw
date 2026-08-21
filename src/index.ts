@@ -42,8 +42,8 @@ export const Config = z.object({
   channelOpenTimeoutMs: z.number().step(1).min(1000).default(10000),
   /** Hard ceiling on collected remote output per call. */
   maxOutputChars: z.number().step(1).min(1024).default(200000),
-  /** Shim mode: intercept DSH's native tools and translate them to remote execution. */
-  shim: z.boolean().default(false),
+  /** Shim mode: intercept DSH's native tools and translate them to remote execution. Default true: the agent uses native tools against the remote workspace out of the box. Set false in cordis config or in ~/.dsh/settings.yaml (`dsh-rw: shim: false`) to fall back to rw_*-only. */
+  shim: z.boolean().default(true),
   /** With shim on, also intercept bash (session cwd must be the placeholder workspace). */
   shimBash: z.boolean().default(true),
   /** Shimmed bash approval: 'ask' escalates to the DSH approval dialog, 'native' defers to the native policy. */
@@ -71,7 +71,7 @@ export interface Config {
  * config key stays cordis-only.
  */
 const ShimSettingsSchema = z.object({
-  shim: z.boolean().default(false),
+  shim: z.boolean().default(true),
   shimBash: z.boolean().default(true),
   shimBashApproval: z.union(['ask', 'native']).default('ask'),
 })
@@ -176,7 +176,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
   // without re-registering anything. Initial values are the cordis entry
   // config — the base layer the settings overlay may later replace.
   const shimSettings: ShimConfig = {
-    shim: config.shim ?? false,
+    shim: config.shim ?? true,
     shimBash: config.shimBash ?? true,
     shimBashApproval: config.shimBashApproval ?? 'ask',
     commandTimeoutMs: config.commandTimeoutMs,
@@ -283,7 +283,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     try {
       const scope = sctx.settings.register(settingsNamespace('dsh-rw'), ShimSettingsSchema, {
         base: {
-          shim: config.shim ?? false,
+          shim: config.shim ?? true,
           shimBash: config.shimBash ?? true,
           shimBashApproval: config.shimBashApproval ?? 'ask',
         },

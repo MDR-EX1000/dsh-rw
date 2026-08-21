@@ -157,10 +157,10 @@ describe('apply', () => {
     expect(active).toContain('confined to the workspace root')
   })
 
-  it('the prompt section steers to native tools while shim is on', () => {
+  it('the prompt section steers to native tools while shim is on (the default)', () => {
     const { ctx, getSection } = makeCtx()
     const overrides = makeOverrides()
-    apply(ctx as unknown as Context, { ...CONFIG, shim: true }, overrides)
+    apply(ctx as unknown as Context, CONFIG, overrides)
     overrides.session.set({ alias: 'prod', workspace: '/srv/app' })
 
     const active = getSection()!.text()
@@ -170,6 +170,18 @@ describe('apply', () => {
     expect(active).toContain('as if the workspace were local')
     // rw_* stays mentioned as the explicit path, but is no longer the steering.
     expect(active).toContain('rw_exec')
+  })
+
+  it('the prompt section steers to rw_* while shim is off', () => {
+    const { ctx, getSection } = makeCtx()
+    const overrides = makeOverrides()
+    apply(ctx as unknown as Context, { ...CONFIG, shim: false }, overrides)
+    overrides.session.set({ alias: 'prod', workspace: '/srv/app' })
+
+    const active = getSection()!.text()
+    expect(active).toContain('Current remote workspace: deploy@example.com:22:/srv/app')
+    expect(active).toContain('Use the rw_* tools')
+    expect(active).not.toContain('remote-backed')
   })
 
   it('the /rw command renders the live status without credentials', () => {

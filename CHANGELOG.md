@@ -3,6 +3,30 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.4.0 — 2026-08-21
+
+Shim mode is now on by default.
+
+- **Breaking behavior change (opt-out, not opt-in):** the three shim switches now resolve with
+  `shim: true` as the schema default — both the cordis entry config
+  (`Config.shim: z.boolean().default(true)`) and the `dsh-rw:` settings layer
+  (`ShimSettingsSchema.shim: z.boolean().default(true)`), with the `config.shim ?? true`
+  fallbacks in `apply()` matching. Net effect for new installs: native `read` / `write` /
+  `edit` / `str_replace_editor` / `glob` / `grep` / `bash` are translated to the remote host
+  automatically once an `rw_*` workspace is active — no `~/.dsh/settings.yaml` entry needed.
+- **Opt-out paths (unchanged surface):** set `shim: false` either in the cordis entry
+  config or in `~/.dsh/settings.yaml` under `dsh-rw:` to fall back to the explicit
+  `rw_*` tool path; the three keys (`shim` / `shimBash` / `shimBashApproval`) still resolve
+  through the same schema-defaults → cordis → user layer pipeline, and hot-reload still
+  applies settings-layer updates without re-registering.
+- **README + prompt section:** the feature list bullet now reads "Shim mode (on by default)";
+  the config table documents `shim` default `true`. The system prompt already steered models
+  to native tools while shim was on, so existing `shim: true` users see no behavioral change.
+- **Tests:** the schema-default test now exercises `shim=true` (the read intercepts and the
+  pool acquires the placeholder's remote connection); the override and hot-reload tests pass
+  an explicit `shim: false` base so the toggle remains visible; `tests/index.test.ts` adds a
+  paired `shim: false` case asserting the prompt section steers to `rw_*`.
+
 ## 0.3.3 — 2026-08-21
 
 - Fix: guard optional `directoryPicker` access against Cordis inject violation — the

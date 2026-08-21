@@ -818,7 +818,7 @@ describe('shim wiring in apply', () => {
     }
 
     private resolved(): ShimSwitches {
-      return { shim: false, shimBash: true, shimBashApproval: 'ask', ...this.base, ...this.user }
+      return { shim: true, shimBash: true, shimBashApproval: 'ask', ...this.base, ...this.user }
     }
 
     register(ns: string, _schema: unknown, options?: { base?: Partial<ShimSwitches> }) {
@@ -962,23 +962,25 @@ describe('shim wiring in apply', () => {
     expect(listeners).toEqual([])
   })
 
-  it('settings service absent → cordis entry config is authoritative (shim=false passes through)', async () => {
+  it('settings service absent → cordis entry config is authoritative (default shim=true intercepts)', async () => {
     const { ctx, executeListener } = makeCtx()
     const h = makeHarness()
     const root = connect(h)
-    applyTo(ctx, h) // shim unset in the cordis config; no settings service ever attaches
+    applyTo(ctx, h) // shim unset in the cordis config; no settings service ever attaches — schema default true wins
 
     const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
-    expect(res).toBe(LOCAL_RESULT)
-    expect(h.pool.connectedAliases.size).toBe(0)
-    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('shim config resolved (cordis base): shim=false'))
+    expect(res).not.toBe(LOCAL_RESULT)
+    expect(text(res)).toContain(`<path>${join(root, 'README.md')}</path>`)
+    // The shim acquired the placeholder's remote connection to fulfil the read.
+    expect(h.pool.connectedAliases.size).toBeGreaterThan(0)
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('shim config resolved (cordis base): shim=true'))
   })
 
   it('settings user layer overrides the cordis base (base shim=false, user shim=true → intercepts)', async () => {
     const { ctx, attachSettings, executeListener } = makeCtx()
     const h = makeHarness()
     const root = connect(h)
-    applyTo(ctx, h) // cordis base: shim=false
+    applyTo(ctx, h, { ...BASE_CONFIG, shim: false }) // cordis base: shim=false
 
     const settings = new FakeSettings({ shim: true })
     attachSettings(settings)
@@ -998,7 +1000,7 @@ describe('shim wiring in apply', () => {
     const { ctx, listeners, attachSettings, executeListener } = makeCtx()
     const h = makeHarness()
     const root = connect(h)
-    applyTo(ctx, h)
+    applyTo(ctx, h, { ...BASE_CONFIG, shim: false }) // start from a known-off base so the toggle is visible
     const settings = new FakeSettings()
     attachSettings(settings)
 
