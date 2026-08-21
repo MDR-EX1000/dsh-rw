@@ -3,6 +3,17 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## Unreleased
+
+- Fix: guard optional `directoryPicker` access against Cordis inject violation — the
+  `ctx.get('directoryPicker') ?? ctx.directoryPicker` fallback in `adaptDirectoryPicker` used a
+  direct property access, which Cordis reflect rejects with
+  `cannot get property "directoryPicker" without inject` when the service is absent, aborting
+  plugin load and taking the whole web profile down. Only `ctx.get('directoryPicker')` (safe,
+  returns `undefined` when absent) is used now, matching the function's documented graceful
+  degradation; `directoryPicker` is intentionally not added to `inject` since the service is
+  optional and provided only by `dsh-host-directory-picker-*` when those are composed.
+
 ## 0.3.2 — 2026-08-21
 
 Picker UX aligned to Codex's "New remote project", plus remote-home (`~`) support.

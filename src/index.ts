@@ -118,7 +118,11 @@ interface DirectoryPickerLike {
  * native picker, resolves null on cancel.
  */
 function adaptDirectoryPicker(ctx: Context): (() => Promise<string | null>) | undefined {
-  const dp = (ctx.get('directoryPicker') ?? (ctx as unknown as { directoryPicker?: unknown }).directoryPicker) as
+  // Use ctx.get('directoryPicker') only: property access ctx.directoryPicker
+  // throws when the service is absent and 'directoryPicker' is not in inject.
+  // The service is optional (provided by @deepseek-ai/dsh-host-directory-picker-*);
+  // when absent we degrade gracefully to undefined.
+  const dp = ctx.get('directoryPicker') as
     | DirectoryPickerLike
     | null
     | undefined
