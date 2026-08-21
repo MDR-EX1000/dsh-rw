@@ -3,6 +3,28 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## Unreleased
+
+Picker UX aligned to Codex's "New remote project", plus remote-home (`~`) support.
+
+- Remote `~` support: `GET /api/dsh-rw/ls` and `rw_pick_workspace` / the workspace
+  route now accept `~` and `~/…`, expanded server-side against the session home
+  (SFTP `realpath('.')`) via the new `expandRemoteHome` guard helper.
+- Picker (remote page) rework after Codex's dialog: workspace-name input with an
+  attached icon cell on top; the host select shows alias-only options (unusable
+  hosts still disabled) with a globe glyph and a drawn chevron (`appearance:
+  none`); the path defaults to the remote home (`~/`, synced back to its real
+  path); the inline directory list replaces both the autocomplete dropdown and
+  the browse popup — rows drill in, an SVG up-button goes to the parent, and
+  typing filters the list live. All glyph icons (folder / globe / arrows /
+  close / file / link) are one line-SVG family, the primary action is a white
+  Codex-style button, and the back button is a round icon-only button.
+- Add-host subpage: label-left single-column rows (名称 / 主机 / 端口 / 用户 /
+  认证方式 / …) with a 清空 / 测试连接 / 保存 footer; the back button took over
+  取消's form-reset duty so secrets never linger in state.
+- Fix (picker): the local page has its own path state — the remote page's `~/`
+  expansion no longer leaks a remote home path into the local input.
+
 ## 0.3.1 — 2026-08-21
 
 - Fix (shim): native tools are now anchored to the agent session cwd's placeholder, not the

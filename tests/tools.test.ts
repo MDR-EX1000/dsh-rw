@@ -157,6 +157,14 @@ describe('rw_pick_workspace', () => {
     expect(meta).toMatchObject({ plugin: 'dsh-rw', alias: 'prod', remotePath: '/srv/app' })
   })
 
+  it('expands ~/… against the session home before resolving', async () => {
+    // FakeSftp canonicalizes realpath('.') to '/', so ~/srv/app → /srv/app.
+    harness.session.set({ alias: 'prod' })
+    const { text } = await tool('rw_pick_workspace').execute({ path: '~/srv/app' })
+    expect(harness.session.workspace).toBe('/srv/app')
+    expect(text).toContain('Remote workspace set to /srv/app on prod')
+  })
+
   it('rejects a non-directory and a relative path', async () => {
     harness.session.set({ alias: 'prod' })
     await expectToolError(tool('rw_pick_workspace').execute({ path: '/srv/app/README.md' }), 'NOT_A_DIRECTORY')

@@ -13,7 +13,7 @@
 // Messages must never contain passwords, key material, or passphrases.
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError, toRwError } from './errors.js'
-import { normalizeRemote } from './guard.js'
+import { normalizeRemote, expandRemoteHome } from './guard.js'
 import type { HostEntry, HostSummary } from './hosts.js'
 import { ensurePlaceholder, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
@@ -126,15 +126,16 @@ export async function resolveWorkspaceDir(
 ): Promise<{ workspace: string; placeholderDir: string }> {
   const entry = deps.hosts.find(alias)
   if (!entry) throw unknownAliasError(deps, alias)
-  if (!path.startsWith('/')) {
-    throw new RwError('INVALID_INPUT', `workspace path must be absolute: ${JSON.stringify(path)}`)
+  if (!path.startsWith('/') && path !== '~' && !path.startsWith('~/')) {
+    throw new RwError('INVALID_INPUT', `workspace path must be absolute (or ~/…): ${JSON.stringify(path)}`)
   }
   const sftp = await deps.pool.sftp(entry)
+  const expanded = await expandRemoteHome(sftp, path)
   let real: string
   try {
-    real = normalizeRemote(await sftp.realpath(path))
+    real = normalizeRemote(await sftp.realpath(expanded))
   } catch (err) {
-    throw mapSftpError(err, path)
+    throw mapSftpError(err, expanded)
   }
   let isDir: boolean
   try {

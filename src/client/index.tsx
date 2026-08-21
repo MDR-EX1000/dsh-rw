@@ -8,9 +8,11 @@
 // carries a 「← 返回」 back to the cards:
 //   • 本机 → 手动输入本机路径，或经 POST /api/dsh-rw/local-pick 调起系统
 //     文件夹选择器，结果直接 onPicked(localPath)。
-//   • 远程 → 选一台 SSH 主机（来自 ~/.ssh/config + 手动条目），输入路径时
-//     逐级自动补全（防抖 ~220ms，对父目录做 ls + 前缀过滤），或用「浏览…」弹层
-//     逐级下钻；可选「工作区名称」命名本地占位目录（留空用路径 basename，
+//   • 远程 → 主机用下拉选择（选项只显示别名；来自 ~/.ssh/config + 手动条目）；
+//     路径默认落在远端 home（~/，服务端经 realpath('.') 扩展），输入框下方是
+//     行内目录列表（Codex「New remote project」式）：列表实时跟随输入
+//     内容（对父目录做 ls + 前缀过滤，防抖 ~220ms），点行下钻、↑ 回上一级；
+//     可选「工作区名称」命名本地占位目录（留空用路径 basename，
 //     仅重名冲突时服务端才追加哈希后缀）。确认后 POST /api/dsh-rw/workspace
 //     拿到本地占位目录 → onPicked(placeholderDir)，交给 DSH 原生流程登记为
 //     workspace。「+ 添加主机」跳到 modal 内独立子页（带返回）：测试连接走
@@ -44,12 +46,6 @@ interface HostSummary {
 interface LsItem {
   name: string
   type: 'dir' | 'file' | 'symlink'
-}
-
-/** One level of the cascading browse stack: a directory path + its listing. */
-interface Level {
-  path: string
-  all: LsItem[]
 }
 
 interface StatusResponse {
@@ -161,29 +157,28 @@ const T = {
   accent: v('--dsw-alias-accent-primary', '#4c8dff'),
   danger: v('--dsw-static-red-500', '#e06c75'),
   ok: v('--dsw-static-green-500', '#4caf7d'),
-  radius: 8,
+  radius: 10,
   muted: v('--dsw-alias-label-tertiary', 'rgba(128,128,128,0.7)'),
   label: v('--dsw-alias-label-primary', '#e4e4e7'),
 }
-const overlayBg = v('--dsw-alias-bg-overlay', '#1e1e1e')
 const panelBg = v('--dsw-alias-bg-layer-1', '#18181b')
 
-const inputS: CSSProperties = { flex: 1, padding: '7px 12px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, outline: 'none', fontSize: 13, transition: 'border-color .15s' }
-const buttonS: CSSProperties = { padding: '7px 14px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, cursor: 'pointer', fontSize: 13, transition: 'background .15s, border-color .15s' }
+const inputS: CSSProperties = { flex: 1, padding: '9px 14px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, outline: 'none', fontSize: 14, transition: 'border-color .15s' }
+const buttonS: CSSProperties = { padding: '9px 16px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, cursor: 'pointer', fontSize: 14, transition: 'background .15s, border-color .15s' }
 
 /** Section caption above a field group (form pages). */
-const labelS: CSSProperties = { fontSize: 12, fontWeight: 600, color: T.muted, letterSpacing: 0.2 }
+const labelS: CSSProperties = { fontSize: 14, color: T.muted }
 
-/** Button with hover feedback; `primary` renders the accent call-to-action,
- * `danger` keeps the muted-danger look for destructive actions. */
+/** Button with hover feedback; `primary` renders the Codex-style white
+ * call-to-action (cf. "Add project"), `danger` the muted-danger look. */
 function Btn(props: { primary?: boolean; danger?: boolean; title?: string; disabled?: boolean; style?: CSSProperties; onClick?: () => void; children: unknown }) {
   const [hov, setHov] = useState(false)
   const base: CSSProperties = props.primary
-    ? { ...buttonS, background: T.accent, border: '1px solid ' + T.accent, color: '#fff', fontWeight: 600 }
+    ? { ...buttonS, background: '#f4f4f5', border: '1px solid #f4f4f5', color: '#18181b', fontWeight: 600 }
     : props.danger
       ? { ...buttonS, color: T.danger }
       : buttonS
-  const hover: CSSProperties = hov && !props.disabled ? (props.primary ? { filter: 'brightness(1.12)' } : { background: T.bgHover, border: '1px solid ' + T.borderStrong }) : {}
+  const hover: CSSProperties = hov && !props.disabled ? (props.primary ? { filter: 'brightness(0.92)' } : { background: T.bgHover, border: '1px solid ' + T.borderStrong }) : {}
   return (
     <button
       title={props.title}
@@ -218,22 +213,157 @@ function TextInput(props: Record<string, unknown> & { value: string; onChange: (
   )
 }
 
-/** One autocomplete suggestion row with hover highlight. */
-function SuggestRow(props: { text: string; onPick: () => void }) {
-  const [hov, setHov] = useState(false)
+// ── outline SVG icons (Codex-style flat line icons, stroke = currentColor) ──
+
+function SvgFolder(props: { size?: number }) {
+  const s = props.size ?? 15
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </svg>
+  )
+}
+
+function SvgGlobe(props: { size?: number }) {
+  const s = props.size ?? 15
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3c2.5 2.6 3.9 5.7 3.9 9s-1.4 6.4-3.9 9c-2.5-2.6-3.9-5.7-3.9-9s1.4-6.4 3.9-9z" />
+    </svg>
+  )
+}
+
+function SvgLink(props: { size?: number }) {
+  const s = props.size ?? 15
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+      <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+    </svg>
+  )
+}
+
+function SvgArrowUp(props: { size?: number }) {
+  const s = props.size ?? 16
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 19V5" />
+      <path d="M5 12l7-7 7 7" />
+    </svg>
+  )
+}
+
+function SvgChevronDown(props: { size?: number }) {
+  const s = props.size ?? 16
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  )
+}
+
+function SvgChevronRight(props: { size?: number }) {
+  const s = props.size ?? 16
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 6l6 6-6 6" />
+    </svg>
+  )
+}
+
+function SvgArrowLeft(props: { size?: number }) {
+  const s = props.size ?? 16
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M19 12H5" />
+      <path d="M12 19l-7-7 7-7" />
+    </svg>
+  )
+}
+
+function SvgArrowRight(props: { size?: number }) {
+  const s = props.size ?? 16
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12h14" />
+      <path d="M12 5l7 7-7 7" />
+    </svg>
+  )
+}
+
+function SvgMonitor(props: { size?: number }) {
+  const s = props.size ?? 16
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="12" rx="2" />
+      <path d="M8 20h8M12 16v4" />
+    </svg>
+  )
+}
+
+function SvgFile(props: { size?: number }) {
+  const s = props.size ?? 15
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+    </svg>
+  )
+}
+
+function SvgX(props: { size?: number }) {
+  const s = props.size ?? 14
+  return (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 6L6 18M6 6l12 12" />
+    </svg>
+  )
+}
+
+/** Composite input with an attached icon cell at the left (Codex-style):
+ * the border wraps icon + field as one control; focus rings the outer box. */
+function IconInput(props: { icon: unknown; value: string; placeholder?: string; onChange: (e: { target: { value: string } }) => void }) {
+  const [focus, setFocus] = useState(false)
   return (
     <div
-      onMouseDown={props.onPick}
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{ padding: '6px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', borderRadius: 6, background: hov ? T.bgHover : 'transparent' }}
+      style={{
+        display: 'flex',
+        alignItems: 'stretch',
+        border: '1px solid ' + (focus ? T.accent : T.border),
+        borderRadius: T.radius,
+        background: T.bg,
+        overflow: 'hidden',
+        transition: 'border-color .15s',
+      }}
     >
-      {props.text}
+      <div style={{ width: 44, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: T.muted, borderRight: '1px solid ' + T.border }}>
+        {props.icon as never}
+      </div>
+      <input
+        value={props.value}
+        placeholder={props.placeholder}
+        onChange={props.onChange}
+        onFocus={() => setFocus(true)}
+        onBlur={() => setFocus(false)}
+        style={{ flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent', color: T.label, padding: '9px 14px', fontSize: 14 }}
+      />
     </div>
   )
 }
 
-/** One row in the browse popup's directory listing, with hover highlight. */
+/** Label-left form row (add-host page): fixed label column + flexible field. */
+function FormRow(props: { label: string; children: unknown }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ width: 60, flexShrink: 0, fontSize: 13, color: T.label }}>{props.label}</div>
+      <div style={{ flex: 1, display: 'flex', gap: 8 }}>{props.children as never}</div>
+    </div>
+  )
+}
+
+/** One row in the inline directory listing, with hover highlight. */
 function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void }) {
   const [hov, setHov] = useState(false)
   const { item, drill } = props
@@ -243,17 +373,21 @@ function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void }) {
       onClick={drill ? props.onEnter : undefined}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
-      style={{ padding: '7px 10px', cursor: drill ? 'pointer' : 'default', color: drill ? T.ok : T.label, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, borderRadius: 6, background: hov && drill ? T.bgHover : 'transparent' }}
+      style={{ padding: '8px 12px', cursor: drill ? 'pointer' : 'default', color: T.label, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', gap: 10, alignItems: 'center', fontSize: 14, borderRadius: 6, background: hov && drill ? T.bgHover : 'transparent' }}
     >
-      <span>{item.type === 'dir' ? '📁' : item.type === 'symlink' ? '🔗' : '📄'}</span>
+      <span style={{ color: T.muted, display: 'flex', flexShrink: 0 }}>{item.type === 'dir' ? <SvgFolder /> : item.type === 'symlink' ? <SvgLink /> : <SvgFile />}</span>
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{item.name}</span>
-      {drill ? <span style={{ color: T.muted, fontSize: 11 }}>›</span> : null}
+      {drill ? (
+        <span style={{ color: T.muted, display: 'flex' }}>
+          <SvgChevronRight size={13} />
+        </span>
+      ) : null}
     </div>
   )
 }
 
 /** Entry-step card: lifts and highlights on hover, chevron hints drill-in. */
-function FlowCard(props: { icon: string; title: string; desc: string; onClick: () => void }) {
+function FlowCard(props: { icon: unknown; title: string; desc: string; onClick: () => void }) {
   const [hov, setHov] = useState(false)
   return (
     <div
@@ -276,44 +410,15 @@ function FlowCard(props: { icon: string; title: string; desc: string; onClick: (
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ fontSize: 24 }}>{props.icon}</div>
-        <div style={{ color: hov ? T.accent : T.muted, fontSize: 16, transition: 'color .15s' }}>→</div>
+        <div style={{ color: hov ? T.accent : T.label, display: 'flex', transition: 'color .15s' }}>{props.icon as never}</div>
+        <div style={{ color: hov ? T.accent : T.muted, display: 'flex', transition: 'color .15s' }}>
+          <SvgArrowRight size={17} />
+        </div>
       </div>
       <div style={{ fontWeight: 600, fontSize: 14 }}>{props.title}</div>
       <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>{props.desc}</div>
     </div>
   )
-}
-
-/** Clickable breadcrumb of the current remote path; clicking a segment jumps
- * back to that ancestor level (single line, ellipsized at the front). */
-function breadcrumb(active: boolean, cur: string, jumpTo: (p: string) => void) {
-  const norm = String(cur || '').replace(/\/+$/, '')
-  const segs = norm === '' || norm === '/' ? [] : norm.split('/')
-  const crumbs = [
-    <span key="root" style={{ cursor: active ? 'pointer' : 'default', color: active ? T.ok : T.muted }} onClick={active ? () => jumpTo('/') : undefined}>
-      /
-    </span>,
-  ]
-  let acc = ''
-  for (const s of segs) {
-    if (!s) continue
-    acc += '/' + s
-    const target = acc
-    crumbs.push(
-      <span key={'sep|' + target} style={{ color: T.muted }}>
-        /
-      </span>,
-      <span
-        key={target}
-        style={{ cursor: active ? 'pointer' : 'default', color: active ? T.label : T.muted, fontWeight: target === norm ? 700 : 400, whiteSpace: 'nowrap' }}
-        onClick={active ? () => jumpTo(target) : undefined}
-      >
-        {s}
-      </span>,
-    )
-  }
-  return <span>{crumbs}</span>
 }
 
 // ── the picker ──────────────────────────────────────────────────────────────
@@ -326,14 +431,16 @@ function DirPicker(props: DirPickerProps) {
   const [hosts, setHosts] = useState<HostSummary[]>([])
   const [alias, setAlias] = useState('')
   const [path, setPath] = useState('')
+  // 本机路径独立成 state：远程页会把 path 写成远端 home（~/ 扩展结果），
+  // 共用一个 state 会让远程路径残留进本机输入框。
+  const [localPath, setLocalPath] = useState('')
   const [wsName, setWsName] = useState('')
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
-  // 级联下钻状态：每一格是 { path, all } —— 该路径下的条目列表。
-  const [levels, setLevels] = useState<Level[] | null>(null)
-  const [popOpen, setPopOpen] = useState(false)
-  const [suggest, setSuggest] = useState<string[]>([])
-  const [suggestOpen, setSuggestOpen] = useState(false)
+  // 行内目录列表状态：dirBase 是列表内容所属的目录，dirItems 是该目录下
+  // 可下钻的条目（仅目录/符号链接；点行下钻，↑ 回上一级）。
+  const [dirItems, setDirItems] = useState<LsItem[]>([])
+  const [dirBase, setDirBase] = useState('')
   const suggestTimer = useRef<number | null>(null)
   // 「添加主机」子页表单状态（view === 'addHost' 时独占整页）。
   const [form, setForm] = useState<AddHostForm>(emptyAddForm)
@@ -367,36 +474,33 @@ function DirPicker(props: DirPickerProps) {
     [],
   )
 
-  // Load one browse level; toIndex >= 0 replaces that stack position (and
-  // truncates below it) so breadcrumb jumps rewrite instead of appending.
-  const loadLevels = (a: string, p: string, toIndex?: number) => {
+  // 行内目录列表的数据源：列出 dir 的下钻条目（仅目录/符号链接）。
+  // sync=true 时把服务端解析后的真实路径回填输入框（用于 ~/ 默认路径，
+  // 服务端经 realpath('.') 扩展为远端 home 的绝对路径）。
+  const loadDir = (a: string, dir: string, sync?: boolean) => {
     if (!a) return
     setLoading(true)
     setErr('')
-    api<LsResponse>('GET', `/api/dsh-rw/ls?alias=${encodeURIComponent(a)}&path=${encodeURIComponent(p || '/')}`)
+    api<LsResponse>('GET', `/api/dsh-rw/ls?alias=${encodeURIComponent(a)}&path=${encodeURIComponent(dir || '/')}`)
       .then((res) => {
-        const real = res.path || p || '/'
-        const node: Level = { path: real, all: Array.isArray(res.items) ? res.items : [] }
-        setLevels((prev) => {
-          const base = prev && prev.length ? prev.slice() : []
-          const idx = typeof toIndex === 'number' && toIndex >= 0 ? toIndex : base.length
-          if (idx >= base.length) return base.concat([node])
-          base[idx] = node
-          return base.slice(0, idx + 1)
-        })
+        const real = res.path || dir || '/'
+        setDirBase(real)
+        if (sync) setPath(real)
+        setDirItems((Array.isArray(res.items) ? res.items : []).filter(drillable).slice(0, 400))
       })
-      .catch((e) => setErr(errText(e)))
+      .catch((e) => {
+        setDirItems([])
+        setErr(errText(e))
+      })
       .finally(() => setLoading(false))
   }
 
-  // Autocomplete: list children of the partial path's parent directory whose
-  // names start with the last segment.
-  const loadSuggestions = (raw: string, aid?: string) => {
+  // 输入补全：对末段的父目录做 ls，按末段前缀过滤，结果同样进列表。
+  const completePath = (raw: string, aid?: string) => {
     const a = aid || alias
     const t = String(raw || '').trim()
     if (!a || !t) {
-      setSuggest([])
-      setSuggestOpen(false)
+      setDirItems([])
       return
     }
     const slash = t.lastIndexOf('/')
@@ -405,76 +509,41 @@ function DirPicker(props: DirPickerProps) {
     api<LsResponse>('GET', `/api/dsh-rw/ls?alias=${encodeURIComponent(a)}&path=${encodeURIComponent(parent)}`)
       .then((res) => {
         const list = Array.isArray(res.items) ? res.items : []
-        const matches = list
-          .filter((it) => it.name.toLowerCase().startsWith(lastSeg.toLowerCase()))
-          .slice(0, 40)
-          .map((it) => (parent === '/' ? '/' + it.name : parent + '/' + it.name))
-        setSuggest(matches)
-        setSuggestOpen(matches.length > 0)
+        setDirBase(res.path || parent)
+        setDirItems(
+          list
+            .filter((it) => drillable(it) && it.name.toLowerCase().startsWith(lastSeg.toLowerCase()))
+            .slice(0, 400),
+        )
       })
-      .catch(() => {
-        setSuggest([])
-        setSuggestOpen(false)
-      })
-  }
-
-  // After a suggestion is chosen, immediately reveal the next level: list the
-  // chosen directory's children as fresh completions (no keystroke needed).
-  const continueSuggest = (dir: string) => {
-    if (!alias || !dir) {
-      setSuggest([])
-      setSuggestOpen(false)
-      return
-    }
-    setSuggestOpen(false)
-    const base = String(dir).replace(/\/+$/, '') || '/'
-    api<LsResponse>('GET', `/api/dsh-rw/ls?alias=${encodeURIComponent(alias)}&path=${encodeURIComponent(base)}`)
-      .then((res) => {
-        const list = Array.isArray(res.items) ? res.items : []
-        const kids = list
-          .filter(drillable)
-          .slice(0, 40)
-          .map((it) => (base === '/' ? '/' + it.name : base + '/' + it.name))
-        setSuggest(kids)
-        setSuggestOpen(kids.length > 0)
-      })
-      .catch(() => {
-        setSuggest([])
-        setSuggestOpen(false)
-      })
+      .catch(() => setDirItems([]))
   }
 
   const onPathChange = (raw: string) => {
     setPath(raw)
     setErr('')
     if (suggestTimer.current !== null) window.clearTimeout(suggestTimer.current)
-    suggestTimer.current = window.setTimeout(() => loadSuggestions(raw), 220)
+    suggestTimer.current = window.setTimeout(() => completePath(raw), 220)
   }
 
-  const selectSuggestion = (s: string) => {
-    setPath(s)
-    setErr('')
-    setSuggestOpen(false)
-    continueSuggest(s)
-  }
-
-  // enterDir(name): drive into the named subdir of the current deepest level,
-  // appending that directory as the new deepest level.
-  const enterDir = (name: string) => {
-    if (busy || loading) return
-    const last = levels && levels.length ? levels[levels.length - 1] : undefined
-    const base = last ? last.path : ''
+  // 下钻：点列表里的一行 → 路径进入该目录并刷新列表。
+  const selectDir = (name: string) => {
+    const base = dirBase || '/'
     const next = base === '/' ? '/' + name : base + '/' + name
-    loadLevels(alias, next, levels ? levels.length : 0)
+    setPath(next)
+    setErr('')
+    loadDir(alias, next)
   }
 
-  // 面包屑回跳：截断级联栈到被点的那一级。
-  const jumpTo = (p: string) =>
-    setLevels((prev) => {
-      if (!prev) return prev
-      const cut = prev.findIndex((lv) => lv.path === p)
-      return cut >= 0 ? prev.slice(0, cut + 1) : prev
-    })
+  // ↑ 回上一级：取输入框路径的父目录并刷新列表。
+  const goUp = () => {
+    const norm = String(path || '').replace(/\/+$/, '')
+    const idx = norm.lastIndexOf('/')
+    const parent = idx <= 0 ? '/' : norm.slice(0, idx)
+    setPath(parent)
+    setErr('')
+    loadDir(alias, parent)
+  }
 
   const chooseLocal = () => {
     setLoading(true)
@@ -493,12 +562,14 @@ function DirPicker(props: DirPickerProps) {
   const openFlow = (t: 'local' | 'remote') => {
     setView(t)
     setErr('')
-    if (t === 'remote') {
-      if (alias) loadLevels(alias, '/', 0)
-      // 预填 '/'，让输入框立即获得根级补全列表。
-      if (!path.trim()) {
-        setPath('/')
-        loadSuggestions('/', alias)
+    if (t === 'remote' && alias) {
+      // 已输入过路径则保留（列表跟随其内容），否则默认落在远端 home（~/）。
+      const start = path.trim()
+      if (start) {
+        loadDir(alias, start)
+      } else {
+        setPath('~/')
+        loadDir(alias, '~/', true)
       }
     }
   }
@@ -509,8 +580,6 @@ function DirPicker(props: DirPickerProps) {
   const commitPath = (p: string) => {
     const target = String(p || '').trim()
     if (!target || !alias || busy) return
-    setPopOpen(false)
-    setSuggestOpen(false)
     const name = wsName.trim()
     api<WorkspaceResponse>('POST', '/api/dsh-rw/workspace', { alias, path: target, ...(name ? { name } : {}) })
       .then((res) => {
@@ -518,13 +587,6 @@ function DirPicker(props: DirPickerProps) {
         else setErr((res && res.error) || '设置远程工作区失败')
       })
       .catch((e) => setErr(errText(e)))
-  }
-
-  // 浏览弹层确认：把路径回填到输入框（不直接提交），留给用户检查/修改。
-  const acceptBrowserPick = (p: string) => {
-    setPath(String(p || ''))
-    setSuggestOpen(false)
-    setPopOpen(false)
   }
 
   // ── 添加主机表单 ────────────────────────────────────────────────────────
@@ -616,13 +678,9 @@ function DirPicker(props: DirPickerProps) {
         refreshHosts()
           .then(() => {
             setAlias(newAlias)
-            setLevels(null)
             setErr('')
-            loadLevels(newAlias, '/', 0)
-            if (!path.trim()) {
-              setPath('/')
-              loadSuggestions('/', newAlias)
-            }
+            setPath('~/')
+            loadDir(newAlias, '~/', true)
           })
           .catch((e) => setErr('主机已保存，但刷新列表失败：' + errText(e)))
       })
@@ -640,8 +698,11 @@ function DirPicker(props: DirPickerProps) {
         if (alias === h.alias) {
           const next = list[0] ? list[0].alias : ''
           setAlias(next)
-          setLevels(null)
-          if (next) loadLevels(next, '/', 0)
+          setDirItems([])
+          if (next) {
+            setPath('~/')
+            loadDir(next, '~/', true)
+          }
         }
       })
       .catch((e) => setErr('删除主机失败：' + errText(e)))
@@ -671,102 +732,48 @@ function DirPicker(props: DirPickerProps) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>保存为手动主机（~/.dsh/dsh-rw.json）；密码与私钥口令仅用于提交，此处不回显。</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div style={labelS}>基本信息</div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <TextInput value={form.alias} onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })} placeholder="别名 *（字母数字 . _ -）" />
-            <TextInput value={form.host} onChange={(e: { target: { value: string } }) => updForm({ host: e.target.value })} placeholder="主机 *（IP 或域名）" style={{ flex: 2 }} />
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <TextInput value={form.port} onChange={(e: { target: { value: string } }) => updForm({ port: e.target.value })} placeholder="端口（默认 22）" inputMode="numeric" />
-            <TextInput value={form.user} onChange={(e: { target: { value: string } }) => updForm({ user: e.target.value })} placeholder="用户（默认 root）" />
-          </div>
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div style={labelS}>认证方式</div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {seg('key', '私钥路径')}
-            {seg('password', '密码')}
-          </div>
-          {form.authKind === 'key' ? (
-            <div style={{ display: 'flex', gap: 8 }}>
-              <TextInput value={form.keyPath} onChange={(e: { target: { value: string } }) => updForm({ keyPath: e.target.value })} placeholder="私钥路径 *（如 ~/.ssh/id_ed25519）" style={{ flex: 2, fontFamily: 'monospace' }} />
-              <TextInput value={form.passphrase} onChange={(e: { target: { value: string } }) => updForm({ passphrase: e.target.value })} type="password" placeholder="私钥口令（可选）" />
-            </div>
-          ) : (
-            <TextInput value={form.password} onChange={(e: { target: { value: string } }) => updForm({ password: e.target.value })} type="password" placeholder="密码 *" />
-          )}
-        </div>
+        <FormRow label="名称">
+          <TextInput value={form.alias} onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })} placeholder="例如 编译机" />
+        </FormRow>
+        <FormRow label="主机">
+          <TextInput value={form.host} onChange={(e: { target: { value: string } }) => updForm({ host: e.target.value })} placeholder="IP 或 hostname" style={{ fontFamily: 'monospace' }} />
+        </FormRow>
+        <FormRow label="端口">
+          <TextInput value={form.port} onChange={(e: { target: { value: string } }) => updForm({ port: e.target.value })} placeholder="22" inputMode="numeric" />
+        </FormRow>
+        <FormRow label="用户">
+          <TextInput value={form.user} onChange={(e: { target: { value: string } }) => updForm({ user: e.target.value })} placeholder="root" />
+        </FormRow>
+        <FormRow label="认证方式">
+          {seg('key', '私钥路径')}
+          {seg('password', '密码')}
+        </FormRow>
+        {form.authKind === 'key' ? (
+          <>
+            <FormRow label="私钥路径">
+              <TextInput value={form.keyPath} onChange={(e: { target: { value: string } }) => updForm({ keyPath: e.target.value })} placeholder="~/.ssh/id_ed25519" style={{ fontFamily: 'monospace' }} />
+            </FormRow>
+            <FormRow label="私钥口令">
+              <TextInput value={form.passphrase} onChange={(e: { target: { value: string } }) => updForm({ passphrase: e.target.value })} type="password" placeholder="可选" />
+            </FormRow>
+          </>
+        ) : (
+          <FormRow label="密码">
+            <TextInput value={form.password} onChange={(e: { target: { value: string } }) => updForm({ password: e.target.value })} type="password" placeholder="不回显、仅保存" />
+          </FormRow>
+        )}
         {formErr ? <div style={{ color: T.danger, fontSize: 12 }}>{formErr}</div> : null}
         {testMsg ? <div style={{ color: testOk ? T.ok : T.danger, fontSize: 12 }}>{testMsg}</div> : null}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
+          <Btn onClick={resetAddForm} disabled={busyForm}>
+            清空
+          </Btn>
           <Btn onClick={testNewHost} disabled={busyForm}>
             {testing ? '测试中…' : '测试连接'}
           </Btn>
           <Btn primary onClick={saveNewHost} disabled={busyForm}>
             {saving ? '保存中…' : '保存'}
           </Btn>
-          <Btn
-            onClick={() => {
-              setView('remote')
-              resetAddForm()
-            }}
-            disabled={busyForm}
-          >
-            取消
-          </Btn>
-        </div>
-      </div>
-    )
-  }
-
-  function renderDirPopup() {
-    if (!levels || !levels.length) {
-      return <div style={{ opacity: 0.6, fontSize: 12 }}>{loading ? '加载中…' : '正在读取根目录…'}</div>
-    }
-    const last = levels[levels.length - 1]!
-    const entries = last.all
-    // 悬浮弹层：钉在视口上，不撑开对话框布局；目录列表在面板内部滚动。
-    return (
-      <div
-        style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 12 }}
-        onClick={() => setPopOpen(false)}
-      >
-        <div
-          style={{ background: overlayBg, border: '1px solid ' + T.borderStrong, borderRadius: 10, boxShadow: '0 10px 40px rgba(0,0,0,0.5)', width: 'min(560px, 94vw)', minWidth: 320, display: 'flex', flexDirection: 'column', maxHeight: 'min(440px, 82vh)', overflow: 'hidden' }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '8px 12px', borderBottom: '1px solid ' + T.border }}>
-            <Btn style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => setLevels((p) => (p && p.length > 1 ? p.slice(0, p.length - 1) : p))} disabled={levels.length <= 1 || loading}>
-              回上一级 ▴
-            </Btn>
-            <div style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-              {breadcrumb(!!alias, last.path, jumpTo)}
-            </div>
-            <Btn style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => setPopOpen(false)}>
-              关闭 ✕
-            </Btn>
-          </div>
-          <div style={{ overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
-            {loading ? (
-              <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>加载中…</div>
-            ) : entries.length ? (
-              entries.slice(0, 400).map((it, i) => {
-                const drill = drillable(it)
-                return <DirRow key={it.name + '-' + i} item={it} drill={drill} onEnter={() => enterDir(it.name)} />
-              })
-            ) : (
-              <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>（空目录）</div>
-            )}
-          </div>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', padding: '8px 12px', borderTop: '1px solid ' + T.border }}>
-            <span style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-              {'所选: ' + last.path}
-            </span>
-            <Btn primary onClick={() => acceptBrowserPick(last.path)}>
-              选用此路径
-            </Btn>
-          </div>
         </div>
       </div>
     )
@@ -777,12 +784,25 @@ function DirPicker(props: DirPickerProps) {
   const selectedHost = hosts.find((h) => h.alias === alias)
 
   // 卡片步：两张大卡片（本机 / 远程），各带一句说明，点击进对应表单页。
-  const card = (t: 'local' | 'remote', icon: string, title: string, desc: string) => <FlowCard onClick={() => openFlow(t)} icon={icon} title={title} desc={desc} />
+  const card = (t: 'local' | 'remote', icon: unknown, title: string, desc: string) => <FlowCard onClick={() => openFlow(t)} icon={icon} title={title} desc={desc} />
 
-  // 「← 返回」：addHost 子页回远程表单页，其余表单页回卡片步。
+  // 圆形返回钮（无文字）：addHost 子页回远程表单页（接管旧「取消」职责，
+  // 清空表单——密码与私钥口令不留存于 state），其余表单页回卡片步。
   const backBtn = (
-    <Btn style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => (view === 'addHost' ? setView('remote') : setView('cards'))} disabled={busy}>
-      ← 返回
+    <Btn
+      title="返回"
+      style={{ width: 32, height: 32, padding: 0, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+      onClick={() => {
+        if (view === 'addHost') {
+          resetAddForm()
+          setView('remote')
+        } else {
+          setView('cards')
+        }
+      }}
+      disabled={busy}
+    >
+      <SvgArrowLeft size={16} />
     </Btn>
   )
 
@@ -797,36 +817,36 @@ function DirPicker(props: DirPickerProps) {
       }}
     >
       <div
-        style={{ background: panelBg, border: '1px solid ' + T.borderStrong, borderRadius: 14, boxShadow: '0 16px 56px rgba(0,0,0,0.55)', width: 'min(640px, 94vw)', padding: 20, boxSizing: 'border-box' }}
+        style={{ background: panelBg, border: '1px solid ' + T.borderStrong, borderRadius: 14, boxShadow: '0 16px 56px rgba(0,0,0,0.55)', width: 'min(640px, 94vw)', padding: 22, boxSizing: 'border-box' }}
         onClick={(e) => e.stopPropagation()}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
           {view !== 'cards' ? backBtn : null}
-          <div style={{ flex: 1, fontSize: 15, fontWeight: 600 }}>{viewTitle}</div>
+          <div style={{ flex: 1, fontSize: 17, fontWeight: 600 }}>{viewTitle}</div>
           <Btn
-            style={{ padding: '2px 9px', border: '1px solid transparent', background: 'transparent', color: T.muted }}
+            style={{ padding: '4px 6px', border: '1px solid transparent', background: 'transparent', color: T.muted, display: 'flex', alignItems: 'center' }}
             onClick={() => {
               if (!busy) onCancel()
             }}
             disabled={busy}
           >
-            ✕
+            <SvgX />
           </Btn>
         </div>
         {view === 'cards' ? (
           <div style={{ display: 'flex', gap: 12 }}>
-            {card('local', '💻', '本机目录', '使用这台电脑上的文件夹，直接输入路径或打开系统文件夹选择器。')}
-            {card('remote', '🌐', '远程工作区', '通过 SSH 在远程主机上选一个目录，本地操作都会实时落到远程。')}
+            {card('local', <SvgMonitor size={22} />, '本机目录', '使用这台电脑上的文件夹，直接输入路径或打开系统文件夹选择器。')}
+            {card('remote', <SvgGlobe size={22} />, '远程工作区', '通过 SSH 在远程主机上选一个目录，本地操作都会实时落到远程。')}
           </div>
         ) : null}
         {view === 'local' ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>系统选择器优先；不可用时直接输入本机目录。</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={labelS}>本机路径</div>
               <div style={{ display: 'flex', gap: 8 }}>
-                <TextInput value={path} onChange={(e) => setPath(e.target.value)} placeholder="本机目录，如 /Users/you/project" />
-                <Btn primary onClick={() => (path.trim() ? onPicked(path.trim()) : undefined)} disabled={!path.trim()}>
+                <TextInput value={localPath} onChange={(e) => setLocalPath(e.target.value)} placeholder="本机目录，如 /Users/you/project" />
+                <Btn primary onClick={() => (localPath.trim() ? onPicked(localPath.trim()) : undefined)} disabled={!localPath.trim()}>
                   选用
                 </Btn>
               </div>
@@ -838,44 +858,19 @@ function DirPicker(props: DirPickerProps) {
           </div>
         ) : null}
         {view === 'remote' || view === 'addHost' ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
             {view === 'addHost' ? (
               renderAddForm()
             ) : (
               <>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <div style={labelS}>远程主机</div>
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <select
-                      value={alias}
-                      onChange={(e) => {
-                        const a = e.target.value
-                        setAlias(a)
-                        setLevels(null)
-                        setErr('')
-                        if (a) {
-                          loadLevels(a, '/', 0)
-                          if (!path.trim()) {
-                            setPath('/')
-                            loadSuggestions('/', a)
-                          }
-                        }
-                      }}
-                      style={{ ...inputS, maxWidth: '100%', minWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                    >
-                      <option value="">— 选择 —</option>
-                      {hosts.map((h) => {
-                        const problem = hostProblem(h)
-                        return (
-                          <option key={h.alias} value={h.alias} disabled={problem !== null}>
-                            {h.alias} ({h.user}@{h.host}){h.source === 'manual' ? ' · 手动' : ''}
-                            {problem ? ` · ${problem}` : ''}
-                          </option>
-                        )
-                      })}
-                    </select>
+                {/* 工作区名称（可选）：Codex 式图标格输入框，置顶；留空用路径末级目录名 */}
+                <IconInput icon={<SvgFolder />} value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="工作区名称（可选）" />
+                {/* 远程主机：caption 行内放「+ 添加主机 / 删除」，下拉选项只显示别名 */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ ...labelS, flex: 1 }}>远程主机</div>
                     <Btn
-                      style={{ whiteSpace: 'nowrap' }}
+                      style={{ padding: '2px 9px', border: '1px solid transparent', background: 'transparent', color: T.accent, fontSize: 12, whiteSpace: 'nowrap' }}
                       onClick={() => {
                         resetAddForm()
                         setView('addHost')
@@ -884,69 +879,84 @@ function DirPicker(props: DirPickerProps) {
                       + 添加主机
                     </Btn>
                     {selectedHost && selectedHost.source === 'manual' ? (
-                      <Btn danger style={{ padding: '5px 10px', fontSize: 12, whiteSpace: 'nowrap' }} title={`删除手动主机 ${selectedHost.alias}`} onClick={() => removeManualHost(selectedHost)}>
+                      <Btn danger style={{ padding: '2px 9px', fontSize: 12, whiteSpace: 'nowrap' }} title={`删除手动主机 ${selectedHost.alias}`} onClick={() => removeManualHost(selectedHost)}>
                         删除
                       </Btn>
                     ) : null}
                   </div>
-                  {selectedHost ? (
-                    <div style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace' }}>
-                      {selectedHost.user}@{selectedHost.host}:{selectedHost.port} · {selectedHost.authKind === 'key' ? '私钥' : '密码'}认证
-                    </div>
-                  ) : null}
+                  <div style={{ position: 'relative' }}>
+                    <span style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', color: T.accent, display: 'flex', pointerEvents: 'none', zIndex: 1 }}>
+                      <SvgGlobe />
+                    </span>
+                    <select
+                      value={alias}
+                      onChange={(e) => {
+                        const a = e.target.value
+                        setAlias(a)
+                        setErr('')
+                        if (a) {
+                          setPath('~/')
+                          loadDir(a, '~/', true)
+                        } else {
+                          setDirItems([])
+                        }
+                      }}
+                      style={{ ...inputS, width: '100%', boxSizing: 'border-box', paddingLeft: 40, paddingRight: 36, appearance: 'none', WebkitAppearance: 'none' }}
+                    >
+                      <option value="">— 选择 —</option>
+                      {hosts.map((h) => (
+                        <option key={h.alias} value={h.alias} disabled={hostProblem(h) !== null}>
+                          {h.alias}
+                        </option>
+                      ))}
+                    </select>
+                    <span style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', color: T.muted, display: 'flex', pointerEvents: 'none' }}>
+                      <SvgChevronDown />
+                    </span>
+                  </div>
                 </div>
                 {hosts.length === 0 ? (
                   <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>
                     未在 ~/.ssh/config 发现主机，也未手动添加。点击上方「+ 添加主机」登记一台，或在 ~/.ssh/config 配置 Host 条目后重新打开本窗口。
                   </div>
                 ) : null}
-                {/* 路径输入框（带自动补全）+ 打开浏览弹层按钮 */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {/* 远程路径：↑ 上一级 + 输入框，下方行内目录列表实时跟随 */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div style={labelS}>远程路径</div>
-                  <div style={{ position: 'relative', display: 'flex', gap: 8 }}>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
+                    <Btn style={{ padding: '0 12px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="上一级" onClick={goUp} disabled={!alias}>
+                      <SvgArrowUp />
+                    </Btn>
                     <TextInput
                       value={path}
                       onChange={(e: { target: { value: string } }) => onPathChange(e.target.value)}
-                      onFocus={() => loadSuggestions(path)}
-                      placeholder={alias ? '输入远程路径（自动补全）' : '先选择远程主机'}
+                      onFocus={() => completePath(path)}
+                      placeholder={alias ? '输入远程路径（下方列表实时跟随）' : '先选择远程主机'}
                       disabled={!alias}
-                      style={{ flex: 1, minWidth: 120, fontFamily: 'monospace' }}
+                      style={{ flex: 1, minWidth: 120 }}
                     />
-                    <Btn
-                      style={{ whiteSpace: 'nowrap' }}
-                      onClick={() => {
-                        if (alias) setPopOpen(true)
-                      }}
-                      disabled={!alias}
-                    >
-                      浏览…
-                    </Btn>
-                    {/* 自动补全下拉 */}
-                    {suggestOpen && suggest.length ? (
-                      <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 50, background: overlayBg, border: '1px solid ' + T.borderStrong, borderRadius: 8, marginTop: 4, maxHeight: 220, overflowY: 'auto', boxShadow: '0 8px 28px rgba(0,0,0,0.35)', padding: 4 }}>
-                        {suggest.map((s, i) => (
-                          <SuggestRow key={s + i} text={s} onPick={() => selectSuggestion(s)} />
-                        ))}
-                      </div>
-                    ) : null}
                   </div>
-                </div>
-                {/* 工作区名称：可选；留空用路径末级目录名，仅重名冲突时服务端追加哈希后缀 */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <div style={labelS}>工作区名称（可选）</div>
-                  <TextInput value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="默认取路径末级目录名" />
+                  <div style={{ border: '1px solid ' + T.border, borderRadius: 10, background: T.bg, maxHeight: 240, overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
+                    {!alias ? (
+                      <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>先选择远程主机</div>
+                    ) : loading ? (
+                      <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>加载中…</div>
+                    ) : dirItems.length ? (
+                      dirItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectDir(it.name)} />)
+                    ) : (
+                      <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>（无匹配目录）</div>
+                    )}
+                  </div>
                 </div>
                 {err ? <div style={{ color: T.danger, fontSize: 12 }}>{err}</div> : null}
                 <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
-                  <span style={{ fontSize: 11, color: T.muted, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                    {path ? '所选: ' + path : ''}
-                  </span>
+                  <Btn style={{ border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel} disabled={busy}>
+                    取消
+                  </Btn>
                   <Btn primary onClick={() => commitPath(path)} disabled={busy || !alias || !path.trim()}>
                     {busy ? '设置中…' : '设为远程工作区'}
                   </Btn>
                 </div>
-                {/* 悬浮浏览弹层：选中的路径回填到输入框（不直接提交） */}
-                {popOpen ? renderDirPopup() : null}
               </>
             )}
           </div>

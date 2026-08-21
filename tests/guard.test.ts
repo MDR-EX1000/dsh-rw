@@ -6,11 +6,13 @@ import {
   assertWritableInside,
   baseName,
   dirName,
+  expandRemoteHome,
   normalizeRemote,
   resolveInWorkspace,
   shq,
 } from '../src/guard.js'
 import { FakeSftp } from './fakes.js'
+import type { SftpLike } from '../src/ssh-pool.js'
 
 function thrownCode(fn: () => unknown): RwErrorCode {
   try {
@@ -84,6 +86,37 @@ describe('dirName', () => {
     ['/a/b/c', '/a/b'],
   ])('%s → %s', (input, expected) => {
     expect(dirName(input)).toBe(expected)
+  })
+})
+
+describe('expandRemoteHome', () => {
+  /** Minimal SftpLike stub whose session home (realpath '.') is `home`. */
+  const withHome = (home: string): SftpLike =>
+    ({
+      realpath: async (p: string) => (p === '.' ? home : p),
+    }) as unknown as SftpLike
+
+  it('expands ~ and ~/… against realpath(".")', async () => {
+    const sftp = withHome('/home/u')
+    await expect(expandRemoteHome(sftp, '~')).resolves.toBe('/home/u')
+    await expect(expandRemoteHome(sftp, '~/proj')).resolves.toBe('/home/u/proj')
+    await expect(expandRemoteHome(sftp, '~/a//b/../c')).resolves.toBe('/home/u/a/c')
+  })
+
+  it('passes absolute and relative paths through untouched', async () => {
+    const sftp = withHome('/home/u')
+    await expect(expandRemoteHome(sftp, '/srv/app')).resolves.toBe('/srv/app')
+    await expect(expandRemoteHome(sftp, 'srv')).resolves.toBe('srv')
+    await expect(expandRemoteHome(sftp, '/~user/x')).resolves.toBe('/~user/x')
+  })
+
+  it('maps a realpath(".") failure via mapSftpError', async () => {
+    const sftp = {
+      realpath: async () => {
+        throw Object.assign(new Error('nope'), { code: 2 })
+      },
+    } as unknown as SftpLike
+    expect(await rejectedCode(expandRemoteHome(sftp, '~'))).toBe('NO_SUCH_PATH')
   })
 })
 

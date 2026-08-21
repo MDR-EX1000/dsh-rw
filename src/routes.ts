@@ -11,7 +11,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { mapSftpError, RwError, toRwError } from './errors.js'
 import type { RwErrorCode } from './errors.js'
-import { normalizeRemote } from './guard.js'
+import { normalizeRemote, expandRemoteHome } from './guard.js'
 import type { HostEntry } from './hosts.js'
 import { resolvePlaceholderDir } from './placeholder.js'
 import { resolveWorkspaceDir } from './tools.js'
@@ -329,26 +329,28 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           writeJson(res, 400, { error: `unknown host alias: ${JSON.stringify(alias)}`, code: 'INVALID_INPUT' })
           return
         }
-        if (!path.startsWith('/')) {
-          writeJson(res, 400, { error: `path must be absolute: ${JSON.stringify(path)}`, code: 'INVALID_INPUT' })
+        if (!path.startsWith('/') && path !== '~' && !path.startsWith('~/')) {
+          writeJson(res, 400, { error: `path must be absolute (or ~/…): ${JSON.stringify(path)}`, code: 'INVALID_INPUT' })
           return
         }
         // Picker browsing is deliberately NOT workspace-confined: no workspace
         // exists yet at this stage. It still requires a connectable alias.
         try {
           const sftp = await pool.sftp(entry)
+          // SFTP does no tilde expansion; resolve ~ against the session home.
+          const dir = await expandRemoteHome(sftp, path)
           let isDir: boolean
           try {
-            isDir = (await sftp.stat(path)).isDirectory()
+            isDir = (await sftp.stat(dir)).isDirectory()
           } catch (err) {
-            throw mapSftpError(err, path)
+            throw mapSftpError(err, dir)
           }
-          if (!isDir) throw new RwError('NOT_A_DIRECTORY', `not a directory: ${path}`)
+          if (!isDir) throw new RwError('NOT_A_DIRECTORY', `not a directory: ${dir}`)
           let items: Awaited<ReturnType<typeof sftp.readdir>>
           try {
-            items = await sftp.readdir(path)
+            items = await sftp.readdir(dir)
           } catch (err) {
-            throw mapSftpError(err, path)
+            throw mapSftpError(err, dir)
           }
           const entries = items
             .filter((it) => it.filename !== '.' && it.filename !== '..')
@@ -364,7 +366,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
               const rank = (t: string): number => (t === 'dir' ? 0 : t === 'file' ? 1 : 2)
               return rank(a.type) - rank(b.type) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
             })
-          writeJson(res, 200, { path: normalizeRemote(path), items: entries })
+          writeJson(res, 200, { path: normalizeRemote(dir), items: entries })
         } catch (err) {
           writeError(res, err)
         }

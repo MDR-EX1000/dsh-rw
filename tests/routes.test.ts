@@ -250,6 +250,17 @@ describe('test / ls', () => {
     expect(json.items).toEqual([{ name: 'app', type: 'dir' }])
   })
 
+  it('GET ls expands ~ against the session home (realpath ".")', async () => {
+    // FakeSftp canonicalizes realpath('.') to '/', so ~ → '/' and ~/srv → /srv.
+    const home = await call(routes, '/api/dsh-rw/ls', 'GET', { url: '/api/dsh-rw/ls?alias=prod&path=~' })
+    expect(home.status).toBe(200)
+    expect(home.json.path).toBe('/')
+    const sub = await call(routes, '/api/dsh-rw/ls', 'GET', { url: '/api/dsh-rw/ls?alias=prod&path=~/srv' })
+    expect(sub.status).toBe(200)
+    expect(sub.json.path).toBe('/srv')
+    expect(sub.json.items).toEqual([{ name: 'app', type: 'dir' }])
+  })
+
   it('GET ls maps errors to status + { error, code }', async () => {
     const noAlias = await call(routes, '/api/dsh-rw/ls', 'GET', { url: '/api/dsh-rw/ls?path=/' })
     expect(noAlias.status).toBe(400)

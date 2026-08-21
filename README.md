@@ -10,7 +10,7 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Features
 
-- **Remote directory as a native workspace** — a centered picker modal fills the DSH "Add workspace" flow: a two-card chooser (本机 / 远程) leads to the local page (OS folder chooser) or the remote page (host dropdown, `/`-prefilled path input, level-by-level autocomplete, optional workspace name).
+- **Remote directory as a native workspace** — a centered picker modal fills the DSH "Add workspace" flow: a two-card chooser (本机 / 远程) leads to the local page (OS folder chooser) or a Codex-style remote page (alias-only host dropdown, `~/`-prefilled remote-home path, inline directory browser with live type-to-filter, optional workspace name).
 - **Hosts come from `~/.ssh/config`** — zero configuration: your existing aliases show up automatically (re-read on file change, no restart). Password-auth hosts can be added in the picker (stored locally, file mode `0600`).
 - **Real workspace confinement** — every `rw_*` file path is confined to the picked workspace root: `../`, absolute paths outside the root, and symlink escapes (`SYMLINK_ESCAPE` via remote `realpath`) are rejected with structured errors.
 - **SSH host key verification** — verifies against `~/.ssh/known_hosts` by default (`accept-new`: first-seen keys are recorded), with `strict` and an explicit `off` policy. A changed host key is refused, never silently accepted.
@@ -38,7 +38,7 @@ Restart `dsh web` afterwards. The plugin activates on boot; the "Add workspace" 
 
 ## Quick start
 
-1. **Pick a workspace** — sidebar / conversation **Add workspace** → 远程 card → choose a host (from `~/.ssh/config`, or **+ 添加主机** on its own subpage for password auth) → browse or type a remote path (optionally give it a 工作区名称) → 设为远程工作区.
+1. **Pick a workspace** — sidebar / conversation **Add workspace** → 远程 card → choose a host (from `~/.ssh/config`, or **+ 添加主机** on its own subpage for password auth) → browse or type a remote path (starts at the remote home `~/`; optionally give it a 工作区名称) → 设为远程工作区.
 2. **Work with the agent** — the system prompt announces the current `user@host:/path`; the agent uses the `rw_*` tools:
    - `rw_list_dir` / `rw_read_file` / `rw_write_file` / `rw_mkdir` / `rw_move` / `rw_delete` — file operations (workspace-confined)
    - `rw_exec` — run shell commands with the workspace root as cwd (build, test, grep, …)
@@ -103,7 +103,7 @@ Complementary, not a replacement. `dsh-ssh` is an ops toolbox (web terminal, por
 ```bash
 pnpm install
 pnpm build        # tsc (host) + esbuild wrapper (client)
-pnpm test         # vitest, 348 tests — all SSH/SFTP mocked
+pnpm test         # vitest, 353 tests — all SSH/SFTP mocked
 pnpm typecheck
 ```
 

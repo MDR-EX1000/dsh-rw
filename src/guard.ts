@@ -37,6 +37,23 @@ export function dirName(p: string): string {
   return i <= 0 ? '/' : n.slice(0, i)
 }
 
+/**
+ * Expand a leading `~` (the remote user's home) to an absolute path. SFTP is
+ * not a shell and does no tilde expansion, so it must be done explicitly:
+ * the home directory is realpath('.') — the canonical start directory of an
+ * SFTP session. `~` and `~/…` expand; anything else passes through unchanged.
+ */
+export async function expandRemoteHome(sftp: SftpLike, p: string): Promise<string> {
+  if (p !== '~' && !p.startsWith('~/')) return p
+  let home: string
+  try {
+    home = normalizeRemote(await sftp.realpath('.'))
+  } catch (err) {
+    throw mapSftpError(err, '.')
+  }
+  return p === '~' ? home : normalizeRemote(home + p.slice(1))
+}
+
 /** Single-quote shell escaping: a'b → 'a'\''b' */
 export function shq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`
