@@ -1,6 +1,6 @@
 {
   "name": "dsh-rw",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Remote-SSH-style workspace for DeepSeek Harness (DSH): pick an SSH host and a remote directory as a native DSH workspace; the agent operates the remote filesystem directly via rw_* tools (SFTP/exec). No mirror, no sync — the remote is the source of truth.",
   "license": "MIT",
   "repository": {

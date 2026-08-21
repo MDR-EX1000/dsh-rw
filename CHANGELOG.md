@@ -3,7 +3,7 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
-## Unreleased
+## 0.3.3 — 2026-08-21
 
 - Fix: guard optional `directoryPicker` access against Cordis inject violation — the
   `ctx.get('directoryPicker') ?? ctx.directoryPicker` fallback in `adaptDirectoryPicker` used a
