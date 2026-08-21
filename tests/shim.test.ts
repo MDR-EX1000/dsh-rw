@@ -1,7 +1,7 @@
 // Shim-mode tests: the middlewares are driven directly with fake exec/next
 // pairs (same mock discipline as tests/index.test.ts), plus one apply() wiring
 // test with a hand-built ctx that captures ctx.on registrations.
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -656,6 +656,90 @@ describe('shim cwd-anchored target', () => {
     expect(text(res)).toContain('remote-backed')
     expect(text(res)).toContain("'dev'")
     expect(passedThrough()).toBe(false)
+    expect(h.pool.execCalls.length).toBe(0)
+  })
+
+  // The block is path-aware: in the broken-placeholder state only calls that
+  // would touch the placeholder fail; calls rooted elsewhere pass through to
+  // the local tool, same as when the remote is healthy.
+  describe('path-aware blocking', () => {
+    /** Broken-placeholder state: prod connected earlier, dev placeholder on disk, dev's host not configured, session disconnected. */
+    function brokenState() {
+      const h = makeHarness()
+      connect(h)
+      const devRoot = ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', h.placeholderBaseDir)
+      const shim = makeShim(makeDeps(h, { hosts: new FakeHosts([ENTRY_PROD]) }))
+      h.session.set({ alias: null })
+      return { h, devRoot, shim }
+    }
+
+    it('blocks bash (it runs with the session cwd)', async () => {
+      const { devRoot, shim } = brokenState()
+      const { next, passedThrough } = makeNext()
+      const res = await shim.onExecute(execOf('bash', { command: 'ls', description: 'x' }, devRoot), next)
+      expect(res.isError).toBe(true)
+      expect(text(res)).toContain('remote-backed')
+      expect(passedThrough()).toBe(false)
+    })
+
+    it('blocks cwd-bound glob (no path arg)', async () => {
+      const { devRoot, shim } = brokenState()
+      const { next, passedThrough } = makeNext()
+      const res = await shim.onExecute(execOf('glob', { pattern: '*.ts' }, devRoot), next)
+      expect(res.isError).toBe(true)
+      expect(text(res)).toContain('remote-backed')
+      expect(passedThrough()).toBe(false)
+    })
+
+    it('passes through file calls rooted outside the broken placeholder', async () => {
+      const { devRoot, shim } = brokenState()
+      const { next, passedThrough } = makeNext()
+      const res = await shim.onExecute(execOf('read', { file_path: join(dir, 'elsewhere.txt') }, devRoot), next)
+      expect(res.isError).toBe(false)
+      expect(passedThrough()).toBe(true)
+    })
+
+    it('passes through grep rooted outside the broken placeholder', async () => {
+      const { devRoot, shim } = brokenState()
+      const { next, passedThrough } = makeNext()
+      const res = await shim.onExecute(execOf('grep', { pattern: 'x', path: dir }, devRoot), next)
+      expect(res.isError).toBe(false)
+      expect(passedThrough()).toBe(true)
+    })
+  })
+
+  it('targets the remote when the cwd is a nested subdirectory of the placeholder', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    h.pool.execQueue.push(execResult('ok\n'))
+    const shim = makeShim(makeDeps(h))
+    const nested = join(root, 'src') // need not exist on disk — lexical containment applies
+    const res = await shim.onExecute(execOf('bash', { command: 'ls', description: 'x' }, nested), makeNext().next)
+    expect(res.isError).toBe(false)
+    expect(h.pool.execCalls.length).toBe(1)
+    expect(h.pool.execCalls[0]!.alias).toBe('prod')
+    expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app')
+  })
+
+  it('falls back to the rw_* session target when the agent cwd is unknown', async () => {
+    const h = makeHarness()
+    connect(h)
+    const shim = makeShim(makeDeps(h))
+    const res = await shim.onExecute(execOf('read', { file_path: 'README.md' }), makeNext().next) // no agent cwd
+    expect(res.isError).toBe(false)
+    expect(text(res)).toContain('line1')
+  })
+
+  it('treats a placeholder-shaped directory without a meta file as local (pass-through)', async () => {
+    const h = makeHarness()
+    connect(h)
+    const ghost = join(h.placeholderBaseDir, 'prod', 'meta-less-dir')
+    mkdirSync(ghost, { recursive: true })
+    const shim = makeShim(makeDeps(h))
+    const { next, passedThrough } = makeNext()
+    const res = await shim.onExecute(execOf('read', { file_path: join(ghost, 'x.txt') }, ghost), next)
+    expect(res.isError).toBe(false)
+    expect(passedThrough()).toBe(true)
     expect(h.pool.execCalls.length).toBe(0)
   })
 })

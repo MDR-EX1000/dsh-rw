@@ -3,6 +3,17 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.3.1 — 2026-08-21
+
+- Fix (shim): native tools are now anchored to the agent session cwd's placeholder, not the
+  mutable rw_* session — after `rw_disconnect`, or when `rw_*` was reconnected to a different
+  host, native read/write/edit/glob/grep/bash used to silently run on the local empty
+  placeholder; they now target the remote the workspace actually points at (the pool redials
+  lazily), and a placeholder whose host was removed from the config fails loudly with an
+  actionable `NOT_CONNECTED` error instead of falling back silently. The block is path-aware:
+  only calls that would touch the broken placeholder fail — calls rooted elsewhere still pass
+  through to the local tool. Adds `scripts/live-shim.mjs` (live end-to-end shim acceptance).
+
 ## 0.3.0 — 2026-08-21
 
 Picker UX rework, clean placeholder naming, and connection resilience.

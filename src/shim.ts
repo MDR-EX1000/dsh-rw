@@ -31,6 +31,7 @@ import type {
 import { mapSftpError, RwError } from './errors.js'
 import { assertRealpathInside, normalizeRemote, resolveInWorkspace, shq } from './guard.js'
 import { findPlaceholderByPath, resolvePlaceholderDir } from './placeholder.js'
+import type { PlaceholderMeta } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { HostEntry } from './hosts.js'
@@ -141,16 +142,21 @@ interface ActiveTarget {
   localRoots: string[]
 }
 
-/** Build an ActiveTarget from a resolved host entry, remote root, and placeholder dir. */
-function buildTarget(entry: HostEntry, remotePath: string, localRoot: string): ActiveTarget {
-  const localRoots = [resolve(localRoot)]
+/** The placeholder's local root forms (lexical + realpath), as insideLocal expects them. */
+function localRootsOf(localRoot: string): string[] {
+  const roots = [resolve(localRoot)]
   try {
     const real = realpathSync(localRoot)
-    if (!localRoots.includes(real)) localRoots.push(real)
+    if (!roots.includes(real)) roots.push(real)
   } catch {
     // placeholder missing on disk: lexical containment still applies
   }
-  return { entry, remoteRoot: normalizeRemote(remotePath), localRoot, localRoots }
+  return roots
+}
+
+/** Build an ActiveTarget from a resolved host entry, remote root, and placeholder dir. */
+function buildTarget(entry: HostEntry, remotePath: string, localRoot: string): ActiveTarget {
+  return { entry, remoteRoot: normalizeRemote(remotePath), localRoot, localRoots: localRootsOf(localRoot) }
 }
 
 /**
@@ -201,22 +207,62 @@ function activeTarget(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecutio
 }
 
 /**
- * When activeTarget is null, decide between a legitimate local pass-through
- * (the cwd is a real local directory) and a blocked state (the cwd is a
- * dsh-rw placeholder whose host is no longer configured). The latter must
- * never run native tools on the local empty placeholder.
+ * The blocked state: the agent cwd sits inside a dsh-rw placeholder whose
+ * host is no longer configured. Returns the placeholder + meta, or null when
+ * the cwd is not placeholder-backed (legitimate local pass-through) or its
+ * host is configured (activeTarget then handles it).
  */
-function placeholderBlockReason(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecution): string | null {
+function brokenPlaceholder(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecution): { dir: string; meta: PlaceholderMeta } | null {
   const cwd = agentCwd(exec)
   if (cwd === undefined) return null
   const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
   if (found === null) return null
+  if (deps.hosts.find(found.meta.alias) !== undefined) return null
+  return found
+}
+
+/** The clear, actionable error for a call that touches a broken placeholder. */
+function blockedMessage(found: { dir: string; meta: PlaceholderMeta }): string {
   return (
     `the workspace ${found.dir} is remote-backed (host alias '${found.meta.alias}', remote ` +
     `${found.meta.remotePath}) but that host is no longer configured — re-add it (rw_hosts) ` +
     `and rw_connect('${found.meta.alias}') to operate on the remote; native tools will not ` +
     `use the local placeholder`
   )
+}
+
+/**
+ * Whether a native-tool call would actually touch the placeholder at `root`:
+ * bash always (it runs with the session cwd); glob/grep without a path arg
+ * too (they default to the session cwd); file tools only when their path
+ * argument resolves inside. Calls that stay elsewhere pass through to the
+ * local tool even in the blocked state — same rule the shim applies when the
+ * remote is healthy.
+ */
+function callTouchesPlaceholder(name: string, args: Record<string, unknown> | null, roots: string[], root: string): boolean {
+  if (name === 'bash') return true
+  const inside = (raw: string): boolean => insideLocal(roots, isAbsolute(raw) ? resolve(raw) : resolve(root, raw))
+  switch (name) {
+    case 'read':
+    case 'write':
+    case 'edit': {
+      const raw = args?.file_path
+      // Missing/invalid path → pass through; native validation reports it.
+      return typeof raw === 'string' && raw !== '' && inside(raw)
+    }
+    case 'str_replace_editor': {
+      const raw = args?.path
+      return typeof raw === 'string' && raw !== '' && inside(raw)
+    }
+    case 'glob':
+    case 'grep': {
+      const raw = args?.path
+      if (typeof raw !== 'string' || raw === '') return true // cwd-bound
+      return inside(raw)
+    }
+    default:
+      return false // not a shimmed tool: do not interfere
+  }
 }
 
 /** p (already resolve()d) sits inside one of the placeholder root forms. */
@@ -992,11 +1038,16 @@ export function makeShim(deps: ShimDeps): Shim {
       })
     }
     if (target === null) {
-      // The agent cwd pointing at a dsh-rw placeholder means the user expects
-      // remote-backed native tools; never silently run them on the local empty
-      // placeholder. Surface a clear, actionable error instead.
-      const blocked = placeholderBlockReason(deps, exec)
-      if (blocked !== null) return fail(blocked, { name: 'RwError', code: 'NOT_CONNECTED' })
+      // The agent cwd pointing at a dsh-rw placeholder whose host is gone
+      // means the user expects remote-backed native tools; never silently run
+      // them on the local empty placeholder. But the block is path-aware:
+      // only calls that would actually TOUCH the broken placeholder fail —
+      // calls whose paths live elsewhere still pass through to the local
+      // tool, exactly as they do when the remote is healthy.
+      const broken = brokenPlaceholder(deps, exec)
+      if (broken !== null && callTouchesPlaceholder(exec.name, objectArgs(exec.arguments), localRootsOf(broken.dir), broken.dir)) {
+        return fail(blockedMessage(broken), { name: 'RwError', code: 'NOT_CONNECTED' })
+      }
       return next()
     }
     const args = objectArgs(exec.arguments)
