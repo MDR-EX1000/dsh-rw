@@ -3,7 +3,7 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
-## Unreleased
+## 0.3.2 — 2026-08-21
 
 Picker UX aligned to Codex's "New remote project", plus remote-home (`~`) support.
 
