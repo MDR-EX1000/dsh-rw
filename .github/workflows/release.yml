@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm lint
+      - run: pnpm test
+
+      - name: Create and verify release tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          packed=$(pnpm pack --pack-destination dist | tail -n 1)
+          test -f "$packed"
+          tarball=dist/dsh-rw.tgz
+          mv "$packed" "$tarball"
+          node -e '
+            const fs = require("node:fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            for (const key of ["preinstall", "install", "postinstall", "prepack"]) {
+              if (p.scripts?.[key]) throw new Error(`forbidden lifecycle script: ${key}`);
+            }
+          '
+          tar -tzf "$tarball" | grep -q '^package/lib/index.js$'
+          tar -tzf "$tarball" | grep -q '^package/lib/client.js$'
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/dsh-rw.tgz

@@ -3,6 +3,15 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.4.1 — 2026-08-24
+
+Packaging fix for dsh-market and other package managers that block install-time build scripts.
+
+- Remove the `prepack` lifecycle script from the published package.
+- Build, test, and pack explicitly in the release workflow before uploading `dsh-rw.tgz`.
+- Keep the compiled `lib/` output in the release tarball so GitHub/release installs work without
+  a local TypeScript or esbuild toolchain.
+
 ## 0.4.0 — 2026-08-21
 
 Shim mode is now on by default.

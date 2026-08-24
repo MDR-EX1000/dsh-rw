@@ -9,8 +9,9 @@ pnpm test        # vitest run, 13 files / 285 tests
 pnpm typecheck   # tsc --noEmit
 ```
 
-Also enforced by GitHub Actions on every push/PR (`.github/workflows/ci.yml`), and by
-`prepack` on every `npm pack/publish`.
+Also enforced by GitHub Actions on every push/PR (`.github/workflows/ci.yml`). The release
+workflow runs the build and test steps explicitly before creating the release tarball, so
+installing the published package never needs to execute a lifecycle build script.
 
 ## 2. Live acceptance against real hosts — PASS
 
