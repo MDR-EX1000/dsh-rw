@@ -36,6 +36,10 @@ The `latest` URL always points at the newest release — no need to update the l
 Release packages include the compiled `lib/` output and do not run a build lifecycle script during
 installation, so this path also works with dsh-market's default pnpm build-script policy.
 
+The GitHub source repository also tracks the compiled `lib/` output. Installing
+`github:MDR-EX1000/dsh-rw` therefore does not require a local TypeScript toolchain or permission to
+run build scripts.
+
 From a local checkout (development):
 
 ```bash
