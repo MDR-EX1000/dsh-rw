@@ -44,8 +44,9 @@ jobs:
               if (p.scripts?.[key]) throw new Error(`forbidden lifecycle script: ${key}`);
             }
           '
-          tar -tzf "$tarball" | grep -q '^package/lib/index.js$'
-          tar -tzf "$tarball" | grep -q '^package/lib/client.js$'
+          tar -tzf "$tarball" > dist/contents.txt
+          grep -q '^package/lib/index.js$' dist/contents.txt
+          grep -q '^package/lib/client.js$' dist/contents.txt
 
       - uses: softprops/action-gh-release@v2
         with:
