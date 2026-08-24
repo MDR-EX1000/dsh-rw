@@ -35,6 +35,8 @@ dsh plugin --profile web add https://github.com/MDR-EX1000/dsh-rw/releases/lates
 The `latest` URL always points at the newest release — no need to update the link per version.
 Release packages include the compiled `lib/` output and do not run a build lifecycle script during
 installation, so this path also works with dsh-market's default pnpm build-script policy.
+The release asset intentionally keeps the stable filename `dsh-rw.tgz` across versions, so the
+`releases/latest/download` URL continues to work after upgrades.
 
 The GitHub source repository also tracks the compiled `lib/` output. Installing
 `github:MDR-EX1000/dsh-rw` therefore does not require a local TypeScript toolchain or permission to
