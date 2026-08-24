@@ -38,6 +38,9 @@ Writes only inside the given `/tmp/dsh-rw-acceptance.*` dir. See ACCEPTANCE.md f
 ## Release
 
 1. `pnpm build && pnpm test` (also runs as `prepack`).
-2. `npm pack` → attach the tarball to a GitHub Release (this is the market install artifact).
-3. `git tag vX.Y.Z && git push --tags`; `gh release create vX.Y.Z dsh-rw-X.Y.Z.tgz`.
+2. `npm pack` → rename the generated versioned tarball to `dsh-rw.tgz`, then attach that
+   stable-named file to a GitHub Release (this is the market install artifact). The stable
+   filename is what the catalog entry points at, so later releases replace the download
+   without requiring another URL change.
+3. `git tag vX.Y.Z && git push --tags`; `gh release create vX.Y.Z dsh-rw.tgz`.
 4. Optional: `npm publish --access public` (registry account requires 2FA for writes).
