@@ -42,6 +42,28 @@ The GitHub source repository also tracks the compiled `lib/` output. Installing
 `github:MDR-EX1000/dsh-rw` therefore does not require a local TypeScript toolchain or permission to
 run build scripts.
 
+### Source-install maintenance notes
+
+If the dsh-market catalog omits the `tarball` field, dsh-market falls back to
+`github:MDR-EX1000/dsh-rw`. This changes the download source from the latest Release package to the
+repository's current default-branch commit; it does not run this plugin's `build` script during
+installation. The runtime entry point is the committed `lib/index.js`, so keep generated `lib/`
+files in Git and rebuild them whenever `src/` changes:
+
+```bash
+pnpm build
+git add lib
+```
+
+The plugin itself currently has no `prepare`, `prepack`, or `postinstall` build hook. Its `ssh2`
+dependency may still request pnpm permission for optional native modules (`ssh2` and
+`cpu-features`); profiles using pnpm's build-script allowlist must allow those dependencies. This
+is dependency setup, not a rebuild of `dsh-rw`.
+
+Use a Release tarball when you need the exact tested Release contents. Use the GitHub source target
+when following the default branch is intentional; review that `lib/` matches `src/` before pushing
+changes that users may install directly from GitHub.
+
 From a local checkout (development):
 
 ```bash
