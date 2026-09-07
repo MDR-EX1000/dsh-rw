@@ -12,7 +12,7 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 
 interface LoaderEntry {
   id: string
-  factory: (require: (id: string) => unknown) => { name?: unknown; apply?: unknown }
+  factory: (require: (id: string) => unknown) => { name?: unknown; inject?: unknown; apply?: unknown }
 }
 
 interface Registration {
@@ -45,7 +45,7 @@ beforeAll(() => {
 })
 
 /** Execute the bundle factory with stub externals (react & co. are inert). */
-function loadModule(): { name?: unknown; apply?: unknown } {
+function loadModule(): { name?: unknown; inject?: unknown; apply?: unknown } {
   if (!entry) throw new Error('bundle did not call window.__ModuleLoader__.load')
   const requireStub = (id: string): unknown => {
     if (id === 'react' || id === 'react-dom' || id === 'react-dom/client' || id === 'react/jsx-runtime') return {}
@@ -57,7 +57,10 @@ function loadModule(): { name?: unknown; apply?: unknown } {
 const isIterable = (x: unknown): x is Iterable<unknown> => typeof x === 'object' && x !== null && Symbol.iterator in x
 
 /** Fake ctx whose slots service captures every register() call. */
-function makeCtx(registrations: Registration[]): { get: (key: string) => unknown } {
+function makeCtx(
+  registrations: Registration[],
+  localeRegistrations: Array<{ namespace: string; dicts: Record<string, Record<string, string>> }> = [],
+): { get: (key: string) => unknown; effect: (callback: () => unknown) => void } {
   const slots = {
     inject(_slot: string, factory: () => unknown): void {
       const result = factory()
@@ -68,7 +71,27 @@ function makeCtx(registrations: Registration[]): { get: (key: string) => unknown
       registrations.push({ ...meta, component })
     },
   }
-  return { get: (key: string) => (key === 'slots' ? slots : undefined) }
+  const locale = {
+    register(namespace: string, dicts: Record<string, Record<string, string>>) {
+      localeRegistrations.push({ namespace, dicts })
+      return () => {}
+    },
+    bind(namespace: string) {
+      return (key: string) => `${namespace}.${key}`
+    },
+    subscribe() {
+      return () => {}
+    },
+    getSnapshot() {
+      return { active: 'en', revision: 1 }
+    },
+  }
+  return {
+    get: (key: string) => key === 'slots' ? slots : key === 'locale' ? locale : undefined,
+    effect(callback: () => unknown) {
+      callback()
+    },
+  }
 }
 
 describe('client bundle', () => {
@@ -81,6 +104,7 @@ describe('client bundle', () => {
   it('factory returns { name: "dsh-rw", apply: function }', () => {
     const mod = loadModule()
     expect(mod.name).toBe('dsh-rw')
+    expect(mod.inject).toEqual(['slots', 'locale'])
     expect(typeof mod.apply).toBe('function')
   })
 
@@ -99,10 +123,24 @@ describe('client bundle', () => {
     }
   })
 
+  it('registers balanced zh/en dictionaries with the global DSH locale service', () => {
+    const mod = loadModule()
+    const registrations: Registration[] = []
+    const localeRegistrations: Array<{ namespace: string; dicts: Record<string, Record<string, string>> }> = []
+    ;(mod.apply as (ctx: unknown) => void)(makeCtx(registrations, localeRegistrations))
+    expect(localeRegistrations).toHaveLength(1)
+    expect(localeRegistrations[0]!.namespace).toBe('dsh-rw')
+    expect(Object.keys(localeRegistrations[0]!.dicts.zh!).sort()).toEqual(
+      Object.keys(localeRegistrations[0]!.dicts.en!).sort(),
+    )
+    expect(localeRegistrations[0]!.dicts.en!.chooseWorkDirectory).toBe('Choose a work directory')
+  })
+
   it('apply no-ops when the ctx has no slots service', () => {
     const mod = loadModule()
     const apply = mod.apply as (ctx: unknown) => void
     expect(() => apply({ get: () => undefined })).not.toThrow()
+    expect(() => apply({ get: (key: string) => key === 'slots' ? makeCtx([]).get('slots') : undefined })).not.toThrow()
     expect(() => apply({})).not.toThrow()
     expect(() => apply(null)).not.toThrow()
     expect(() => apply(undefined)).not.toThrow()

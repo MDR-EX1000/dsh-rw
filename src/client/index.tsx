@@ -3,8 +3,8 @@
 // dsh-rw — client half: the unified workspace directory picker.
 //
 // One modal fills ui-workspace's two directory-flow holes (sidebar +
-// conversation hero). The entry is a two-card chooser (本机 / 远程, each with
-// a one-line explainer); picking a card drills into that flow's page, which
+// conversation hero). The entry is a compact two-card chooser (本机 / 远程);
+// picking a card drills into that flow's page, which
 // carries a 「← 返回」 back to the cards:
 //   • 本机 → 手动输入本机路径，或经 POST /api/dsh-rw/local-pick 调起系统
 //     文件夹选择器，结果直接 onPicked(localPath)。
@@ -24,7 +24,8 @@
 // react/jsx-runtime are provided by the DSH runtime (esbuild externals), never
 // bundled. All traffic goes to the loopback-only /api/dsh-rw/* routes; host
 // payloads come from HostTable.summarize and never contain secrets.
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
+import { en, zh, type Translate } from './locales.js'
 
 export const name = 'dsh-rw'
 
@@ -94,6 +95,19 @@ export interface DirPickerProps {
   onCancel: () => void
 }
 
+/** Structural face of the DSH client locale service used by this bundle. */
+interface LocaleLike {
+  register(namespace: string, dicts: { zh: Record<string, string>; en: Record<string, string> }): () => void
+  bind(namespace: string): Translate
+  subscribe(callback: () => void): () => void
+  getSnapshot(): { active: string; revision: number }
+}
+
+interface LocalizedDirPickerProps extends DirPickerProps {
+  locale: LocaleLike
+  t: Translate
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 /** JSON fetch wrapper: non-2xx → throw Error(body.error ?? `HTTP <status>`). */
@@ -124,9 +138,9 @@ function drillable(it: LsItem): boolean {
 }
 
 /** Why a host cannot be picked right now (null when it is usable). */
-function hostProblem(h: HostSummary): string | null {
-  if (h.authKind === 'key') return h.keyReady ? null : '私钥缺失'
-  return h.passwordSet ? null : '未设密码'
+function hostProblem(h: HostSummary, t: Translate): string | null {
+  if (h.authKind === 'key') return h.keyReady ? null : t('privateKeyMissing')
+  return h.passwordSet ? null : t('passwordNotSet')
 }
 
 /** Alias charset, mirroring the host-side HostTable.addManual ALIAS_RE. */
@@ -163,8 +177,8 @@ const T = {
 }
 const panelBg = v('--dsw-alias-bg-layer-1', '#18181b')
 
-const inputS: CSSProperties = { flex: 1, padding: '9px 14px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, outline: 'none', fontSize: 14, transition: 'border-color .15s' }
-const buttonS: CSSProperties = { padding: '9px 16px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, cursor: 'pointer', fontSize: 14, transition: 'background .15s, border-color .15s' }
+const inputS: CSSProperties = { flex: 1, minWidth: 0, width: '100%', boxSizing: 'border-box', padding: '9px 14px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, outline: 'none', fontFamily: 'inherit', fontSize: 14, transition: 'border-color .15s' }
+const buttonS: CSSProperties = { padding: '9px 16px', borderRadius: T.radius, border: '1px solid ' + T.border, background: T.bg, color: T.label, cursor: 'pointer', fontFamily: 'inherit', fontSize: 14, whiteSpace: 'nowrap', transition: 'background .15s, border-color .15s' }
 
 /** Section caption above a field group (form pages). */
 const labelS: CSSProperties = { fontSize: 14, color: T.muted }
@@ -356,20 +370,32 @@ function IconInput(props: { icon: unknown; value: string; placeholder?: string; 
 /** Label-left form row (add-host page): fixed label column + flexible field. */
 function FormRow(props: { label: string; children: unknown }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-      <div style={{ width: 60, flexShrink: 0, fontSize: 13, color: T.label }}>{props.label}</div>
-      <div style={{ flex: 1, display: 'flex', gap: 8 }}>{props.children as never}</div>
+    <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ fontSize: 12, lineHeight: 1.2, color: T.muted, whiteSpace: 'nowrap' }}>{props.label}</div>
+      <div style={{ minWidth: 0, display: 'flex', gap: 8 }}>{props.children as never}</div>
+    </div>
+  )
+}
+
+/** Compact one-line copy. Long dynamic errors remain available in the title. */
+function SingleLine(props: { text: string; color?: string; style?: CSSProperties }) {
+  return (
+    <div
+      title={props.text}
+      style={{ color: props.color ?? T.muted, fontSize: 12, lineHeight: 1.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', ...props.style }}
+    >
+      {props.text}
     </div>
   )
 }
 
 /** One row in the inline directory listing, with hover highlight. */
-function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void }) {
+function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void; t: Translate }) {
   const [hov, setHov] = useState(false)
   const { item, drill } = props
   return (
     <div
-      title={(drill ? '进入 ' : '文件: ') + item.name}
+      title={props.t(drill ? 'enterDirectory' : 'fileItem', { name: item.name })}
       onClick={drill ? props.onEnter : undefined}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
@@ -387,7 +413,7 @@ function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void }) {
 }
 
 /** Entry-step card: lifts and highlights on hover, chevron hints drill-in. */
-function FlowCard(props: { icon: unknown; title: string; desc: string; onClick: () => void }) {
+function FlowCard(props: { icon: unknown; title: string; onClick: () => void }) {
   const [hov, setHov] = useState(false)
   return (
     <div
@@ -402,29 +428,36 @@ function FlowCard(props: { icon: unknown; title: string; desc: string; onClick: 
         cursor: 'pointer',
         background: hov ? T.bgHover : T.bg,
         display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
+        alignItems: 'center',
+        gap: 12,
         transform: hov ? 'translateY(-1px)' : 'none',
         boxShadow: hov ? '0 6px 20px rgba(0,0,0,0.25)' : 'none',
         transition: 'border-color .15s, background .15s, transform .15s, box-shadow .15s',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ color: hov ? T.accent : T.label, display: 'flex', transition: 'color .15s' }}>{props.icon as never}</div>
-        <div style={{ color: hov ? T.accent : T.muted, display: 'flex', transition: 'color .15s' }}>
-          <SvgArrowRight size={17} />
-        </div>
+      <div style={{ color: hov ? T.accent : T.label, display: 'flex', flexShrink: 0, transition: 'color .15s' }}>{props.icon as never}</div>
+      <div style={{ flex: 1, minWidth: 0, fontWeight: 650, fontSize: 13, letterSpacing: '0.035em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {props.title}
       </div>
-      <div style={{ fontWeight: 600, fontSize: 14 }}>{props.title}</div>
-      <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>{props.desc}</div>
+      <div style={{ color: hov ? T.accent : T.muted, display: 'flex', flexShrink: 0, transition: 'color .15s' }}>
+        <SvgArrowRight size={17} />
+      </div>
     </div>
   )
 }
 
 // ── the picker ──────────────────────────────────────────────────────────────
 
-function DirPicker(props: DirPickerProps) {
-  const { open, busy, onPicked, onCancel } = props
+function DirPicker(props: LocalizedDirPickerProps) {
+  const { open, busy, onPicked, onCancel, locale, t } = props
+  // DSH persists the active language in the Host-backed global settings.
+  // Subscribe to the locale revision so an open picker switches immediately
+  // when the user changes Language, including late dictionary registration.
+  const localeRevision = useSyncExternalStore(
+    useCallback((callback: () => void) => locale.subscribe(callback), [locale]),
+    useCallback(() => locale.getSnapshot().revision, [locale]),
+  )
+  void localeRevision
   // 视图状态机：cards（两张大卡片入口）→ local / remote 表单页；addHost 是
   // 从 remote 页跳入的独立子页，四者互斥，除 cards 外都有「← 返回」。
   const [view, setView] = useState<'cards' | 'local' | 'remote' | 'addHost'>('cards')
@@ -464,8 +497,8 @@ function DirPicker(props: DirPickerProps) {
         const cur = r.current && typeof r.current.alias === 'string' ? r.current.alias : ''
         setAlias(cur || (list[0] ? list[0].alias : ''))
       })
-      .catch((e) => setErr('获取主机列表失败：' + errText(e)))
-  }, [open])
+      .catch((e) => setErr(t('loadHostsFailed', { error: errText(e) })))
+  }, [open, t])
 
   useEffect(
     () => () => {
@@ -551,10 +584,10 @@ function DirPicker(props: DirPickerProps) {
     api<LocalPickResponse>('POST', '/api/dsh-rw/local-pick')
       .then((r) => {
         if (r && r.path) onPicked(String(r.path))
-        else if (r && r.cancelled) setErr('已取消选择')
-        else setErr((r && r.error) || '无法打开系统文件夹选择器，可直接在输入框填本机路径')
+        else if (r && r.cancelled) setErr(t('selectionCancelled'))
+        else setErr((r && r.error) || t('localPickerUnavailable'))
       })
-      .catch((e) => setErr(errText(e) + ' — 可直接在输入框填本机路径'))
+      .catch((e) => setErr(t('localPickerFallback', { error: errText(e) })))
       .finally(() => setLoading(false))
   }
 
@@ -584,7 +617,7 @@ function DirPicker(props: DirPickerProps) {
     api<WorkspaceResponse>('POST', '/api/dsh-rw/workspace', { alias, path: target, ...(name ? { name } : {}) })
       .then((res) => {
         if (res && res.ok && res.placeholderDir) onPicked(String(res.placeholderDir))
-        else setErr((res && res.error) || '设置远程工作区失败')
+        else setErr((res && res.error) || t('setRemoteWorkspaceFailed'))
       })
       .catch((e) => setErr(errText(e)))
   }
@@ -608,11 +641,11 @@ function DirPicker(props: DirPickerProps) {
 
   // 保存前置校验（与 host 端 addManual 一致）；测试连接不需要别名。
   const addFormError = (forSave: boolean): string => {
-    if (forSave && !ALIAS_RE.test(form.alias.trim())) return '别名必填，仅限字母、数字、. _ -，且以字母或数字开头'
-    if (!form.host.trim()) return '请填写主机地址'
-    if (!form.user.trim()) return '请填写用户名'
-    if (form.authKind === 'key' && !form.keyPath.trim()) return '请填写私钥路径'
-    if (form.authKind === 'password' && !form.password) return '请输入密码'
+    if (forSave && !ALIAS_RE.test(form.alias.trim())) return t('aliasInvalid')
+    if (!form.host.trim()) return t('hostRequired')
+    if (!form.user.trim()) return t('userRequired')
+    if (form.authKind === 'key' && !form.keyPath.trim()) return t('keyPathRequired')
+    if (form.authKind === 'password' && !form.password) return t('passwordRequired')
     return ''
   }
 
@@ -648,10 +681,13 @@ function DirPicker(props: DirPickerProps) {
       .then((r) => {
         if (r && r.ok) {
           setTestOk(true)
-          setTestMsg(`✓ 连接成功（${r.latencyMs} ms）`)
+          setTestMsg(t('connectionSuccess', { latency: r.latencyMs ?? 0 }))
         } else {
           setTestOk(false)
-          setTestMsg(`✗ ${(r && r.error) || '连接失败'}${r && r.code ? ` [${r.code}]` : ''}`)
+          setTestMsg(t('connectionFailure', {
+            error: (r && r.error) || t('connectionFailed'),
+            code: r && r.code ? ` [${r.code}]` : '',
+          }))
         }
       })
       .catch((e) => {
@@ -682,7 +718,7 @@ function DirPicker(props: DirPickerProps) {
             setPath('~/')
             loadDir(newAlias, '~/', true)
           })
-          .catch((e) => setErr('主机已保存，但刷新列表失败：' + errText(e)))
+          .catch((e) => setErr(t('hostSavedRefreshFailed', { error: errText(e) })))
       })
       .catch((e) => setFormErr(errText(e)))
       .finally(() => setSaving(false))
@@ -690,7 +726,7 @@ function DirPicker(props: DirPickerProps) {
 
   // 删除手动主机（ssh-config 条目在 hosts 端就会被拒，这里不显示按钮）。
   const removeManualHost = (h: HostSummary) => {
-    if (!window.confirm(`确定删除手动主机「${h.alias}」吗？仅删除本地登记，不影响远程主机。`)) return
+    if (!window.confirm(t('removeHostConfirm', { alias: h.alias }))) return
     setErr('')
     api<{ ok?: boolean }>('DELETE', '/api/dsh-rw/hosts', { alias: h.alias })
       .then(() => refreshHosts())
@@ -705,7 +741,7 @@ function DirPicker(props: DirPickerProps) {
           }
         }
       })
-      .catch((e) => setErr('删除主机失败：' + errText(e)))
+      .catch((e) => setErr(t('removeHostFailed', { error: errText(e) })))
   }
 
   function renderAddForm() {
@@ -730,49 +766,53 @@ function DirPicker(props: DirPickerProps) {
       )
     }
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>保存为手动主机（~/.dsh/dsh-rw.json）；密码与私钥口令仅用于提交，此处不回显。</div>
-        <FormRow label="名称">
-          <TextInput value={form.alias} onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })} placeholder="例如 编译机" />
-        </FormRow>
-        <FormRow label="主机">
-          <TextInput value={form.host} onChange={(e: { target: { value: string } }) => updForm({ host: e.target.value })} placeholder="IP 或 hostname" style={{ fontFamily: 'monospace' }} />
-        </FormRow>
-        <FormRow label="端口">
-          <TextInput value={form.port} onChange={(e: { target: { value: string } }) => updForm({ port: e.target.value })} placeholder="22" inputMode="numeric" />
-        </FormRow>
-        <FormRow label="用户">
-          <TextInput value={form.user} onChange={(e: { target: { value: string } }) => updForm({ user: e.target.value })} placeholder="root" />
-        </FormRow>
-        <FormRow label="认证方式">
-          {seg('key', '私钥路径')}
-          {seg('password', '密码')}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <SingleLine text={t('manualHostHint')} />
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 0.9fr) minmax(0, 1.35fr)', gap: 12 }}>
+          <FormRow label={t('nameLabel')}>
+            <TextInput value={form.alias} onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })} placeholder={t('aliasPlaceholder')} />
+          </FormRow>
+          <FormRow label={t('hostLabel')}>
+            <TextInput value={form.host} onChange={(e: { target: { value: string } }) => updForm({ host: e.target.value })} placeholder={t('hostPlaceholder')} />
+          </FormRow>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 112px', gap: 12 }}>
+          <FormRow label={t('userLabel')}>
+            <TextInput value={form.user} onChange={(e: { target: { value: string } }) => updForm({ user: e.target.value })} placeholder="root" />
+          </FormRow>
+          <FormRow label={t('portLabel')}>
+            <TextInput value={form.port} onChange={(e: { target: { value: string } }) => updForm({ port: e.target.value })} placeholder="22" inputMode="numeric" />
+          </FormRow>
+        </div>
+        <FormRow label={t('authMethodLabel')}>
+          {seg('key', t('keyPathLabel'))}
+          {seg('password', t('passwordLabel'))}
         </FormRow>
         {form.authKind === 'key' ? (
-          <>
-            <FormRow label="私钥路径">
-              <TextInput value={form.keyPath} onChange={(e: { target: { value: string } }) => updForm({ keyPath: e.target.value })} placeholder="~/.ssh/id_ed25519" style={{ fontFamily: 'monospace' }} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.35fr) minmax(0, 0.9fr)', gap: 12 }}>
+            <FormRow label={t('keyPathLabel')}>
+              <TextInput value={form.keyPath} onChange={(e: { target: { value: string } }) => updForm({ keyPath: e.target.value })} placeholder="~/.ssh/id_ed25519" />
             </FormRow>
-            <FormRow label="私钥口令">
-              <TextInput value={form.passphrase} onChange={(e: { target: { value: string } }) => updForm({ passphrase: e.target.value })} type="password" placeholder="可选" />
+            <FormRow label={t('passphraseLabel')}>
+              <TextInput value={form.passphrase} onChange={(e: { target: { value: string } }) => updForm({ passphrase: e.target.value })} type="password" placeholder={t('optionalPlaceholder')} />
             </FormRow>
-          </>
+          </div>
         ) : (
-          <FormRow label="密码">
-            <TextInput value={form.password} onChange={(e: { target: { value: string } }) => updForm({ password: e.target.value })} type="password" placeholder="不回显、仅保存" />
+          <FormRow label={t('passwordLabel')}>
+            <TextInput value={form.password} onChange={(e: { target: { value: string } }) => updForm({ password: e.target.value })} type="password" placeholder={t('passwordPlaceholder')} />
           </FormRow>
         )}
-        {formErr ? <div style={{ color: T.danger, fontSize: 12 }}>{formErr}</div> : null}
-        {testMsg ? <div style={{ color: testOk ? T.ok : T.danger, fontSize: 12 }}>{testMsg}</div> : null}
+        {formErr ? <SingleLine text={formErr} color={T.danger} /> : null}
+        {testMsg ? <SingleLine text={testMsg} color={testOk ? T.ok : T.danger} /> : null}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
           <Btn onClick={resetAddForm} disabled={busyForm}>
-            清空
+            {t('clear')}
           </Btn>
           <Btn onClick={testNewHost} disabled={busyForm}>
-            {testing ? '测试中…' : '测试连接'}
+            {testing ? t('testing') : t('testConnection')}
           </Btn>
           <Btn primary onClick={saveNewHost} disabled={busyForm}>
-            {saving ? '保存中…' : '保存'}
+            {saving ? t('saving') : t('save')}
           </Btn>
         </div>
       </div>
@@ -783,14 +823,14 @@ function DirPicker(props: DirPickerProps) {
 
   const selectedHost = hosts.find((h) => h.alias === alias)
 
-  // 卡片步：两张大卡片（本机 / 远程），各带一句说明，点击进对应表单页。
-  const card = (t: 'local' | 'remote', icon: unknown, title: string, desc: string) => <FlowCard onClick={() => openFlow(t)} icon={icon} title={title} desc={desc} />
+  // 卡片步：两张简洁入口卡片（本机 / 远程），点击进入对应表单页。
+  const card = (flow: 'local' | 'remote', icon: unknown, title: string) => <FlowCard onClick={() => openFlow(flow)} icon={icon} title={title} />
 
   // 圆形返回钮（无文字）：addHost 子页回远程表单页（接管旧「取消」职责，
   // 清空表单——密码与私钥口令不留存于 state），其余表单页回卡片步。
   const backBtn = (
     <Btn
-      title="返回"
+      title={t('back')}
       style={{ width: 32, height: 32, padding: 0, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
       onClick={() => {
         if (view === 'addHost') {
@@ -806,7 +846,13 @@ function DirPicker(props: DirPickerProps) {
     </Btn>
   )
 
-  const viewTitle = view === 'cards' ? '选择工作目录' : view === 'local' ? '本机目录' : view === 'remote' ? '远程工作区' : '添加远程主机'
+  const viewTitle = view === 'cards'
+    ? t('chooseWorkDirectory')
+    : view === 'local'
+      ? t('localDirectory')
+      : view === 'remote'
+        ? t('remoteWorkspace')
+        : t('addRemoteHost')
 
   // 全屏居中 modal（遮罩 + 面板）：在窄 sidebar 和 conversation 里渲染一致。
   return (
@@ -822,7 +868,7 @@ function DirPicker(props: DirPickerProps) {
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
           {view !== 'cards' ? backBtn : null}
-          <div style={{ flex: 1, fontSize: 17, fontWeight: 600 }}>{viewTitle}</div>
+          <div style={{ flex: 1, minWidth: 0, fontSize: 17, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{viewTitle}</div>
           <Btn
             style={{ padding: '4px 6px', border: '1px solid transparent', background: 'transparent', color: T.muted, display: 'flex', alignItems: 'center' }}
             onClick={() => {
@@ -835,26 +881,26 @@ function DirPicker(props: DirPickerProps) {
         </div>
         {view === 'cards' ? (
           <div style={{ display: 'flex', gap: 12 }}>
-            {card('local', <SvgMonitor size={22} />, '本机目录', '使用这台电脑上的文件夹，直接输入路径或打开系统文件夹选择器。')}
-            {card('remote', <SvgGlobe size={22} />, '远程工作区', '通过 SSH 在远程主机上选一个目录，本地操作都会实时落到远程。')}
+            {card('local', <SvgMonitor size={22} />, t('localCardTitle'))}
+            {card('remote', <SvgGlobe size={22} />, t('remoteCardTitle'))}
           </div>
         ) : null}
         {view === 'local' ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>系统选择器优先；不可用时直接输入本机目录。</div>
+            <SingleLine text={t('localPickerHint')} />
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <div style={labelS}>本机路径</div>
+              <div style={labelS}>{t('localPathLabel')}</div>
               <div style={{ display: 'flex', gap: 8 }}>
-                <TextInput value={localPath} onChange={(e) => setLocalPath(e.target.value)} placeholder="本机目录，如 /Users/you/project" />
+                <TextInput value={localPath} onChange={(e) => setLocalPath(e.target.value)} placeholder={t('localPathPlaceholder')} />
                 <Btn primary onClick={() => (localPath.trim() ? onPicked(localPath.trim()) : undefined)} disabled={!localPath.trim()}>
-                  选用
+                  {t('useDirectory')}
                 </Btn>
               </div>
             </div>
             <Btn style={{ alignSelf: 'flex-start' }} onClick={chooseLocal} disabled={loading}>
-              {loading ? '打开中…' : '打开系统文件夹选择器'}
+              {loading ? t('opening') : t('openSystemPicker')}
             </Btn>
-            {err ? <div style={{ color: T.danger, fontSize: 12 }}>{err}</div> : null}
+            {err ? <SingleLine text={err} color={T.danger} /> : null}
           </div>
         ) : null}
         {view === 'remote' || view === 'addHost' ? (
@@ -864,11 +910,11 @@ function DirPicker(props: DirPickerProps) {
             ) : (
               <>
                 {/* 工作区名称（可选）：Codex 式图标格输入框，置顶；留空用路径末级目录名 */}
-                <IconInput icon={<SvgFolder />} value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder="工作区名称（可选）" />
+                <IconInput icon={<SvgFolder />} value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder={t('workspaceNamePlaceholder')} />
                 {/* 远程主机：caption 行内放「+ 添加主机 / 删除」，下拉选项只显示别名 */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <div style={{ ...labelS, flex: 1 }}>远程主机</div>
+                    <div style={{ ...labelS, flex: 1 }}>{t('remoteHostLabel')}</div>
                     <Btn
                       style={{ padding: '2px 9px', border: '1px solid transparent', background: 'transparent', color: T.accent, fontSize: 12, whiteSpace: 'nowrap' }}
                       onClick={() => {
@@ -876,11 +922,11 @@ function DirPicker(props: DirPickerProps) {
                         setView('addHost')
                       }}
                     >
-                      + 添加主机
+                      {t('addHost')}
                     </Btn>
                     {selectedHost && selectedHost.source === 'manual' ? (
-                      <Btn danger style={{ padding: '2px 9px', fontSize: 12, whiteSpace: 'nowrap' }} title={`删除手动主机 ${selectedHost.alias}`} onClick={() => removeManualHost(selectedHost)}>
-                        删除
+                      <Btn danger style={{ padding: '2px 9px', fontSize: 12, whiteSpace: 'nowrap' }} title={t('removeManualHostTitle', { alias: selectedHost.alias })} onClick={() => removeManualHost(selectedHost)}>
+                        {t('remove')}
                       </Btn>
                     ) : null}
                   </div>
@@ -903,9 +949,9 @@ function DirPicker(props: DirPickerProps) {
                       }}
                       style={{ ...inputS, width: '100%', boxSizing: 'border-box', paddingLeft: 40, paddingRight: 36, appearance: 'none', WebkitAppearance: 'none' }}
                     >
-                      <option value="">— 选择 —</option>
+                      <option value="">{t('choose')}</option>
                       {hosts.map((h) => (
-                        <option key={h.alias} value={h.alias} disabled={hostProblem(h) !== null}>
+                        <option key={h.alias} value={h.alias} disabled={hostProblem(h, t) !== null}>
                           {h.alias}
                         </option>
                       ))}
@@ -916,45 +962,43 @@ function DirPicker(props: DirPickerProps) {
                   </div>
                 </div>
                 {hosts.length === 0 ? (
-                  <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.6 }}>
-                    未在 ~/.ssh/config 发现主机，也未手动添加。点击上方「+ 添加主机」登记一台，或在 ~/.ssh/config 配置 Host 条目后重新打开本窗口。
-                  </div>
+                  <SingleLine text={t('noHosts')} />
                 ) : null}
                 {/* 远程路径：↑ 上一级 + 输入框，下方行内目录列表实时跟随 */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={labelS}>远程路径</div>
+                  <div style={labelS}>{t('remotePathLabel')}</div>
                   <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
-                    <Btn style={{ padding: '0 12px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="上一级" onClick={goUp} disabled={!alias}>
+                    <Btn style={{ padding: '0 12px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }} title={t('parentDirectory')} onClick={goUp} disabled={!alias}>
                       <SvgArrowUp />
                     </Btn>
                     <TextInput
                       value={path}
                       onChange={(e: { target: { value: string } }) => onPathChange(e.target.value)}
                       onFocus={() => completePath(path)}
-                      placeholder={alias ? '输入远程路径（下方列表实时跟随）' : '先选择远程主机'}
+                      placeholder={alias ? t('remotePathPlaceholder') : t('chooseHostFirst')}
                       disabled={!alias}
                       style={{ flex: 1, minWidth: 120 }}
                     />
                   </div>
                   <div style={{ border: '1px solid ' + T.border, borderRadius: 10, background: T.bg, maxHeight: 240, overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
                     {!alias ? (
-                      <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>先选择远程主机</div>
+                      <SingleLine text={t('chooseHostFirst')} style={{ padding: 12 }} />
                     ) : loading ? (
-                      <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>加载中…</div>
+                      <SingleLine text={t('loading')} style={{ padding: 12 }} />
                     ) : dirItems.length ? (
-                      dirItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectDir(it.name)} />)
+                      dirItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectDir(it.name)} t={t} />)
                     ) : (
-                      <div style={{ color: T.muted, padding: 12, fontSize: 12 }}>（无匹配目录）</div>
+                      <SingleLine text={t('noMatchingDirectories')} style={{ padding: 12 }} />
                     )}
                   </div>
                 </div>
-                {err ? <div style={{ color: T.danger, fontSize: 12 }}>{err}</div> : null}
+                {err ? <SingleLine text={err} color={T.danger} /> : null}
                 <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
                   <Btn style={{ border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel} disabled={busy}>
-                    取消
+                    {t('cancel')}
                   </Btn>
                   <Btn primary onClick={() => commitPath(path)} disabled={busy || !alias || !path.trim()}>
-                    {busy ? '设置中…' : '设为远程工作区'}
+                    {busy ? t('setting') : t('setRemoteWorkspace')}
                   </Btn>
                 </div>
               </>
@@ -964,7 +1008,7 @@ function DirPicker(props: DirPickerProps) {
         {view === 'local' ? (
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Btn style={{ border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel}>
-              取消
+              {t('cancel')}
             </Btn>
           </div>
         ) : null}
@@ -988,6 +1032,11 @@ interface SlotsLike {
   register(meta: SlotMeta, component: unknown): unknown
 }
 
+const LOCALE_NS = 'dsh-rw'
+
+/** Client services required before the directory-flow contribution mounts. */
+export const inject = ['slots', 'locale']
+
 /**
  * Cordis client entry: register DirPicker into both directory-flow slots
  * (sidebar + conversation hero) at priority -100. The nested-inject shape is
@@ -997,11 +1046,29 @@ export function apply(ctx: unknown): void {
   const get = (ctx as { get?: unknown } | null | undefined)?.get
   if (typeof get !== 'function') return
   const slots = (get as (key: string) => unknown).call(ctx, 'slots') as SlotsLike | null | undefined
-  if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return
+  const locale = (get as (key: string) => unknown).call(ctx, 'locale') as LocaleLike | null | undefined
+  if (
+    !slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function' ||
+    !locale || typeof locale.register !== 'function' || typeof locale.bind !== 'function' ||
+    typeof locale.subscribe !== 'function' || typeof locale.getSnapshot !== 'function'
+  ) return
+
+  const registerDictionaries = () => locale.register(LOCALE_NS, { zh, en })
+  const effect = (ctx as { effect?: unknown }).effect
+  if (typeof effect === 'function') {
+    effect.call(ctx, registerDictionaries, 'dsh-rw: locale dictionaries')
+  } else {
+    // Structural test/legacy contexts may not expose effect; registering is
+    // still safe for their activation lifetime.
+    registerDictionaries()
+  }
+  const t = locale.bind(LOCALE_NS)
+  const LocalizedDirPicker = (props: DirPickerProps) => <DirPicker {...props} locale={locale} t={t} />
+
   slots.inject('conversation.hero.workspace.directoryFlow', () =>
     slots.inject('sidebar.workspaces.directoryFlow', function* () {
-      yield slots.register({ name: 'conversation.hero.workspace.directoryFlow', id: 'dsh-rw', priority: -100 }, DirPicker)
-      yield slots.register({ name: 'sidebar.workspaces.directoryFlow', id: 'dsh-rw', priority: -100 }, DirPicker)
+      yield slots.register({ name: 'conversation.hero.workspace.directoryFlow', id: 'dsh-rw', priority: -100 }, LocalizedDirPicker)
+      yield slots.register({ name: 'sidebar.workspaces.directoryFlow', id: 'dsh-rw', priority: -100 }, LocalizedDirPicker)
     }),
   )
 }

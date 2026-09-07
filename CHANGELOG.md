@@ -3,6 +3,21 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.4.3 — 2026-09-07
+
+- Add complete Chinese and English dictionaries for the workspace picker,
+  including host management, validation, loading, confirmation, and fallback
+  messages.
+- Register the dictionaries through DSH's official client locale service and
+  subscribe the picker to its revision snapshot. The picker now follows the
+  global **Settings → Language** preference and switches live without a restart.
+- Add `@deepseek-ai/dsh-client-locale` to the client composition and compatibility
+  ranges for DSH `0.1.2-rc.1`.
+- Simplify the picker entry cards to icon + short title (`LOCAL` / `REMOTE` in
+  English), rebuild the add-host form as balanced two-column field groups, and
+  shorten static hints so the interface stays on one line at the modal's normal
+  width. Long dynamic errors use ellipsis while preserving their full tooltip.
+
 ## 0.4.2 — 2026-09-07
 
 - Compatibility: support DSH `0.1.2-rc.1` by registering the `dsh-rw` settings

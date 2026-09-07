@@ -6,7 +6,7 @@
 
 Remote-SSH-style workspaces for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
-Version 0.4.2 supports DSH `0.1.2-rc.1` and compatible later `0.1.x` releases.
+Version 0.4.3 supports DSH `0.1.2-rc.1` and compatible later `0.1.x` releases.
 
 Pick an SSH host and a remote directory — that directory becomes a native DSH workspace, and the agent works **directly on the remote filesystem** through `rw_*` tools (SFTP/exec over a persistent ssh2 pool). No mirror, no sync: the remote is the single source of truth.
 
@@ -16,7 +16,8 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Features
 
-- **Remote directory as a native workspace** — a centered picker modal fills the DSH "Add workspace" flow: a two-card chooser (本机 / 远程) leads to the local page (OS folder chooser) or a Codex-style remote page (alias-only host dropdown, `~/`-prefilled remote-home path, inline directory browser with live type-to-filter, optional workspace name).
+- **Remote directory as a native workspace** — a centered picker modal fills the DSH "Add workspace" flow: a compact two-card chooser (`LOCAL` / `REMOTE` in English) leads to the local page (OS folder chooser) or a Codex-style remote page (alias-only host dropdown, `~/`-prefilled remote-home path, inline directory browser with live type-to-filter, optional workspace name).
+- **Follows DSH Language** — every picker label, hint, validation message, loading state, confirmation, and fallback message ships in Chinese and English. The active copy follows DSH's global **Settings → Language** preference and updates immediately while the picker is open; no plugin-specific language setting or restart is required.
 - **Hosts come from `~/.ssh/config`** — zero configuration: your existing aliases show up automatically (re-read on file change, no restart). Password-auth hosts can be added in the picker (stored locally, file mode `0600`).
 - **Real workspace confinement** — every `rw_*` file path is confined to the picked workspace root: `../`, absolute paths outside the root, and symlink escapes (`SYMLINK_ESCAPE` via remote `realpath`) are rejected with structured errors.
 - **SSH host key verification** — verifies against `~/.ssh/known_hosts` by default (`accept-new`: first-seen keys are recorded), with `strict` and an explicit `off` policy. A changed host key is refused, never silently accepted.
@@ -76,7 +77,7 @@ Restart `dsh web` afterwards. The plugin activates on boot; the "Add workspace" 
 
 ## Quick start
 
-1. **Pick a workspace** — sidebar / conversation **Add workspace** → 远程 card → choose a host (from `~/.ssh/config`, or **+ 添加主机** on its own subpage for password auth) → browse or type a remote path (starts at the remote home `~/`; optionally give it a 工作区名称) → 设为远程工作区.
+1. **Pick a workspace** — sidebar / conversation **Add workspace** → **REMOTE** card → choose a host (from `~/.ssh/config`, or **+ Add host** on its own subpage for password auth) → browse or type a remote path (starts at the remote home `~/`; optionally give it a workspace name) → **Use as remote workspace**. These labels appear in Chinese when the global DSH language is Chinese.
 2. **Work with the agent as usual** — with shim mode on (the default), the agent's native `read`/`write`/`edit`/`glob`/`grep`/`bash` calls inside the workspace are translated to the remote host automatically. Just ask it to fix a bug, run the tests, or refactor — nothing new to learn.
 3. **Explicit remote ops when you want them** — the `rw_*` tools stay available:
    - `rw_list_dir` / `rw_read_file` / `rw_write_file` / `rw_mkdir` / `rw_move` / `rw_delete` — file operations (workspace-confined)
@@ -121,6 +122,14 @@ Plugin config keys (defaults shown):
 | `shimBash` | `true` | cordis + settings | with shim on, also intercept `bash` (only when the agent session cwd is the placeholder workspace) |
 | `shimBashApproval` | `'ask'` | cordis + settings | shimmed `bash` approval: `'ask'` escalates to the DSH approval dialog (reason names the remote host), but stands down on never-ask presets such as `danger-full-access` — asking there auto-rejects without a dialog, so the command just runs; `'native'` always defers to the native bash policy |
 
+## Language
+
+dsh-rw registers its `zh` and `en` dictionaries with the official
+`@deepseek-ai/dsh-client-locale` service. It reads the same Host-backed global preference as the
+rest of DSH (`locale.preference` in `~/.dsh/settings.yaml`) and subscribes to locale revisions, so
+changing **Settings → Language** re-renders an already-open picker immediately. English is the
+fallback for other language packs until they contribute a `dsh-rw` namespace dictionary.
+
 ## Security model
 
 - **Workspace confinement** — file tools resolve every path against the workspace root and verify the *real* path (following symlinks) stays inside. Writes validate the nearest existing ancestor.
@@ -145,7 +154,7 @@ Complementary, not a replacement. `dsh-ssh` is an ops toolbox (web terminal, por
 ```bash
 pnpm install
 pnpm build        # tsc (host) + esbuild wrapper (client)
-pnpm test         # vitest, 354 tests — all SSH/SFTP mocked
+pnpm test         # vitest — all SSH/SFTP mocked
 pnpm typecheck
 ```
 
