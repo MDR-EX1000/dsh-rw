@@ -6,7 +6,7 @@
 // native workspace flow accepts it — it never holds a copy of remote files.
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
@@ -281,7 +281,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
   // entry config logged above stays in charge.
   ctx.inject(['settings'], (sctx) => {
     try {
-      const scope = sctx.settings.register(settingsNamespace('dsh-rw'), ShimSettingsSchema, {
+      const scope = sctx.settings.register('dsh-rw', ShimSettingsSchema, {
         base: {
           shim: config.shim ?? true,
           shimBash: config.shimBash ?? true,

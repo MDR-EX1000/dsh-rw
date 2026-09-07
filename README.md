@@ -6,6 +6,8 @@
 
 Remote-SSH-style workspaces for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
+Version 0.4.2 supports DSH `0.1.2-rc.1` and compatible later `0.1.x` releases.
+
 Pick an SSH host and a remote directory — that directory becomes a native DSH workspace, and the agent works **directly on the remote filesystem** through `rw_*` tools (SFTP/exec over a persistent ssh2 pool). No mirror, no sync: the remote is the single source of truth.
 
 **Zero config since 0.4.0** — once a remote workspace is active, the agent's native `read`/`write`/`edit`/`bash` tools run on the remote host automatically; you never have to teach it a new tool.

@@ -3,6 +3,16 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.4.2 — 2026-09-07
+
+- Compatibility: support DSH `0.1.2-rc.1` by registering the `dsh-rw` settings
+  namespace through the new literal-name API; the removed `settingsNamespace()`
+  helper is no longer imported.
+- Derive structured result values from the public `ToolExecutionResult` contract
+  now that `dsh-tools` no longer re-exports its internal `JsonValue` type.
+- Refresh DSH peer/development ranges to the versions shipped with DSH
+  `0.1.2-rc.1`.
+
 ## 0.4.1 — 2026-08-24
 
 Packaging fix for dsh-market and other package managers that block install-time build scripts.

@@ -22,7 +22,6 @@
 import { realpathSync } from 'node:fs'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import type {
-  JsonValue,
   PreToolDecision,
   ToolDispatchExecution,
   ToolExecution,
@@ -37,6 +36,9 @@ import type { Session } from './session.js'
 import type { HostEntry } from './hosts.js'
 import type { ExecResult, SftpLike } from './ssh-pool.js'
 import type { HostTableLike, PoolLike } from './tools.js'
+
+/** Canonical success value, derived from the public execution result contract. */
+type CanonicalToolValue = Extract<ToolExecutionResult, { isError: false }>['value']
 
 /** The shim configuration after apply() normalization (schema defaults applied). */
 export interface ShimConfig {
@@ -98,7 +100,7 @@ function ok(text: string): ToolExecutionResult {
  * false), so it must carry exactly the native fields; the rendered text stays
  * the model-facing content.
  */
-function okValue(value: JsonValue, text: string): ToolExecutionResult {
+function okValue(value: CanonicalToolValue, text: string): ToolExecutionResult {
   return { isError: false, value, content: [{ type: 'text', text }] }
 }
 
@@ -843,7 +845,7 @@ async function shimGlob(
   })
 }
 
-/** One parsed `path:line:text` row (a type alias, so the value keeps an implicit index signature for JsonValue). */
+/** One parsed `path:line:text` row (a type alias, so it remains a canonical JSON object value). */
 type GrepMatch = {
   path: string
   lineNumber: number
