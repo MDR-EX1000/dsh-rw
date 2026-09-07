@@ -3,6 +3,11 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## Unreleased
+
+- Make `github:MDR-EX1000/dsh-rw` the documented default installation target so
+  DSH Market keeps a compact GitHub basename source across future updates.
+
 ## 0.4.3 — 2026-09-07
 
 - Add complete Chinese and English dictionaries for the workspace picker,

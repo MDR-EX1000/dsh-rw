@@ -29,29 +29,31 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Install
 
-Prebuilt tarball from GitHub Release (no build step):
+GitHub source, using the compact repository basename shown by DSH Market:
+
+```bash
+dsh plugin --profile web add github:MDR-EX1000/dsh-rw
+```
+
+The repository tracks the compiled `lib/` output and has no `prepare`, `prepack`, `install`, or
+`postinstall` lifecycle hook. Installing this source therefore needs neither a local TypeScript
+toolchain nor permission to build the plugin. DSH Market keeps the `github:` source when updating
+the plugin and resolves the repository's current default-branch commit.
+
+The matching immutable release package remains available when an exact release archive is needed:
 
 ```bash
 dsh plugin --profile web add https://github.com/MDR-EX1000/dsh-rw/releases/latest/download/dsh-rw.tgz
 ```
 
-The `latest` URL always points at the newest release — no need to update the link per version.
-Release packages include the compiled `lib/` output and do not run a build lifecycle script during
-installation, so this path also works with dsh-market's default pnpm build-script policy.
-The release asset intentionally keeps the stable filename `dsh-rw.tgz` across versions, so the
-`releases/latest/download` URL continues to work after upgrades.
-
-The GitHub source repository also tracks the compiled `lib/` output. Installing
-`github:MDR-EX1000/dsh-rw` therefore does not require a local TypeScript toolchain or permission to
-run build scripts.
+Release packages include the same compiled `lib/` output. The stable `dsh-rw.tgz` filename keeps
+the `releases/latest/download` URL valid across versions.
 
 ### Source-install maintenance notes
 
-If the dsh-market catalog omits the `tarball` field, dsh-market falls back to
-`github:MDR-EX1000/dsh-rw`. This changes the download source from the latest Release package to the
-repository's current default-branch commit; it does not run this plugin's `build` script during
-installation. The runtime entry point is the committed `lib/index.js`, so keep generated `lib/`
-files in Git and rebuild them whenever `src/` changes:
+The basename installation follows the repository's default branch and does not run this plugin's
+`build` script during installation. The runtime entry point is the committed `lib/index.js`, so
+keep generated `lib/` files in Git and rebuild them whenever `src/` changes:
 
 ```bash
 pnpm build
@@ -63,9 +65,9 @@ dependency may still request pnpm permission for optional native modules (`ssh2`
 `cpu-features`); profiles using pnpm's build-script allowlist must allow those dependencies. This
 is dependency setup, not a rebuild of `dsh-rw`.
 
-Use a Release tarball when you need the exact tested Release contents. Use the GitHub source target
-when following the default branch is intentional; review that `lib/` matches `src/` before pushing
-changes that users may install directly from GitHub.
+For each release, build and commit `lib/` before pushing the version commit and tag. Existing
+basename installations then stay on the same concise GitHub source through future Market updates.
+Use a Release tarball only when an exact tested archive is required.
 
 From a local checkout (development):
 
