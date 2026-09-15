@@ -3,7 +3,7 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
-## Unreleased
+## 0.4.4 — 2026-09-15
 
 - Resolve the `directoryPicker` service at local-pick time instead of caching it
   once when the plugin applies. The web app's `directory-picker` row mounts its
