@@ -5,6 +5,12 @@ versioning follows [SemVer](https://semver.org/).
 
 ## Unreleased
 
+- Resolve the `directoryPicker` service at local-pick time instead of caching it
+  once when the plugin applies. The web app's `directory-picker` row mounts its
+  backend asynchronously during boot, so the apply-time snapshot raced that
+  mount and could permanently pin a missing backend — `/api/dsh-rw/local-pick`
+  answered 400 until the plugin was reloaded. A missing service is now reported
+  at call time with the same friendly message.
 - Make `github:MDR-EX1000/dsh-rw` the documented default installation target so
   DSH Market keeps a compact GitHub basename source across future updates.
 

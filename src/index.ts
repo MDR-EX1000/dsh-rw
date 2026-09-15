@@ -113,22 +113,29 @@ interface DirectoryPickerLike {
 
 /**
  * Adapt the ctx directoryPicker service (as used by dsh-remote's local-pick
- * endpoint) into a plain pick function. Undefined when the service is absent;
- * the returned function throws a friendly Error when the backend is not the
- * native picker, resolves null on cancel.
+ * endpoint) into a plain pick function. The service is resolved per call:
+ * the web app's directory-picker row mounts its backend asynchronously during
+ * boot (a nested loader.create), so a snapshot taken when this plugin applies
+ * can miss a service that registers moments later. The returned function
+ * throws a friendly Error when the service is absent or the backend is not
+ * the native picker, and resolves null on cancel.
  */
-function adaptDirectoryPicker(ctx: Context): (() => Promise<string | null>) | undefined {
+function adaptDirectoryPicker(ctx: Context): () => Promise<string | null> {
   // Use ctx.get('directoryPicker') only: property access ctx.directoryPicker
   // throws when the service is absent and 'directoryPicker' is not in inject.
   // The service is optional (provided by @deepseek-ai/dsh-host-directory-picker-*);
-  // when absent we degrade gracefully to undefined.
-  const dp = ctx.get('directoryPicker') as
-    | DirectoryPickerLike
-    | null
-    | undefined
-  if (!dp || typeof dp.capability !== 'function') return undefined
+  // when absent the pick function degrades to a friendly Error.
   return async () => {
-    const cap = await dp.capability!()
+    const dp = ctx.get('directoryPicker') as
+      | DirectoryPickerLike
+      | null
+      | undefined
+    if (!dp || typeof dp.capability !== 'function') {
+      throw new Error(
+        'local directory picker service is unavailable (no DSH directory-picker backend) — enter the path manually',
+      )
+    }
+    const cap = await dp.capability()
     if (!cap || cap.kind !== 'native' || typeof cap.pick !== 'function') {
       throw new Error('local directory picker is unavailable (non-native backend) — enter the local path manually')
     }
