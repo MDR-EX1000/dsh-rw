@@ -1,6 +1,6 @@
 {
   "name": "dsh-rw",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Remote-SSH-style workspace for DeepSeek Harness (DSH): pick an SSH host and a remote directory as a native DSH workspace; the agent operates the remote filesystem directly via rw_* tools (SFTP/exec). No mirror, no sync — the remote is the source of truth.",
   "license": "MIT",
   "repository": {
@@ -46,18 +46,18 @@
     "ssh2": "^1.16.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-client-locale": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-settings": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-client-locale": "^0.1.2-rc.1 || ^0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.1.2-rc.1 || ^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1 || ^0.2.0-rc.2",
     "schemastery": "^3.18.0"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-client-locale": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-host-webserver": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-settings": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-client-locale": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@types/node": "^22.19.0",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",

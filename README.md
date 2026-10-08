@@ -6,7 +6,8 @@
 
 Remote-SSH-style workspaces for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
-Version 0.4.3 supports DSH `0.1.2-rc.1` and compatible later `0.1.x` releases.
+Version 0.4.5 supports DSH `0.1.2-rc.1` and `0.2.0-rc.2`, plus compatible later `0.1.x` / `0.2.x`
+releases.
 
 Pick an SSH host and a remote directory — that directory becomes a native DSH workspace, and the agent works **directly on the remote filesystem** through `rw_*` tools (SFTP/exec over a persistent ssh2 pool). No mirror, no sync: the remote is the single source of truth.
 
@@ -24,7 +25,7 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 - **Structured errors** — connection refused / auth failed / timeout / no such path / permission denied / outside workspace / host key problems are distinct error codes, so the agent can react correctly.
 - **Self-healing connections** — the ssh2 pool keepalives (15s × 3) detect dropped connections, and channel/subsystem opens are bounded (`channelOpenTimeoutMs`, default 10s) so a silently dead connection (half-open TCP) can't hang an operation. An operation that lands on a dead connection is transparently retried once on a fresh redial — transient network blips never reach the agent as errors.
 - **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts. It takes a clean name — the remote basename or the name you give in the picker; a hash suffix appears only on a naming conflict (legacy hash-suffixed placeholders keep working).
-- **Shim mode (on by default)** — DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. On by default — set `shim: false` (cordis config or `dsh-rw:` in `~/.dsh/settings.yaml`) to opt out and use only the explicit `rw_*` tools. The shim anchors on the agent session's cwd placeholder — not the mutable `rw_*` session — so `rw_disconnect` or reconnecting `rw_*` to another host can't silently redirect native tools; calls rooted outside the placeholder always pass through to the local tool unchanged.
+- **Shim mode (on by default)** — DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. On by default — set `shim: false` (the plugin's cordis entry config, or its row in the DSH plugin configuration form) to opt out and use only the explicit `rw_*` tools. The shim anchors on the agent session's cwd placeholder — not the mutable `rw_*` session — so `rw_disconnect` or reconnecting `rw_*` to another host can't silently redirect native tools; calls rooted outside the placeholder always pass through to the local tool unchanged.
 - **Fail loud, never silently local** — if a placeholder's host was removed from the config, calls that would touch that placeholder fail with an actionable `NOT_CONNECTED` error instead of silently running against the empty local directory. The block is path-aware: only calls touching the broken placeholder fail; everything else still passes through.
 
 ## Install
@@ -88,26 +89,37 @@ Restart `dsh web` afterwards. The plugin activates on boot; the "Add workspace" 
 
 ## Configuration
 
-dsh-rw reads two configuration layers:
+dsh-rw reads one configuration layer for every key below: the plugin's **cordis entry config**, i.e.
+the `dsh-rw` entry in your profile's `cordis.patch.yml` / loader patch. `hostKeyPolicy`,
+`knownHostsPath`, `commandTimeoutMs`, `connectTimeoutMs`, and `maxOutputChars` are configured only
+there.
 
-- **Cordis entry config** (the plugin entry in your cordis.yml / loader patch) — the base layer for
-  every key below. `hostKeyPolicy`, `knownHostsPath`, `commandTimeoutMs`, `connectTimeoutMs`, and
-  `maxOutputChars` are configured **only** here.
-- **`~/.dsh/settings.yaml`** — the `dsh-rw:` section overrides **only the three shim switches**.
-  Changes made through the settings service apply live; after editing the file by hand,
-  restart `dsh web` to be sure they are picked up. Resolution order: schema defaults →
-  cordis entry config (base) → this user layer.
+The three **shim switches** are a settings-layer concern, and DSH changed that layer under the
+plugin:
+
+- **DSH 0.2.x** derives plugin settings from the plugin's own `Config` schema and edits them through
+  the profile composition — the plugin configuration form, or the entry's `config:` block. The
+  switches dsh-rw exposes live in `Config`, so they show up in that form automatically; an edit
+  re-applies the plugin with the new values.
+- **DSH 0.1.2** registers a `dsh-rw` settings namespace that adds one more layer on top of the entry
+  config, read from the `dsh-rw:` section of `~/.dsh/settings.yaml` and applied live. Resolution
+  order: schema defaults → cordis entry config (base) → user layer.
+
+dsh-rw selects the model from the service it finds (presence of the `register` method), never from a
+version check, so either line configures the same three keys:
 
 ```yaml
-# ~/.dsh/settings.yaml — all three keys default to the values shown; you only
-# need this section to opt OUT of shim mode.
-dsh-rw:
-  shim: false             # default true: native tools run on the remote workspace.
-                          # Set false to use only the explicit rw_* tools.
-  # shimBash: true        # also intercept bash (session cwd must be the placeholder)
-  # shimBashApproval: ask # ask = approval dialog naming the remote host (skipped on
-                          # never-ask presets like danger-full-access, which run directly);
-                          # native = defer to the native bash policy
+# Profile cordis.patch.yml — the dsh-rw entry config. All three keys default to the
+# values shown; you only need this block to opt OUT of shim mode. On DSH 0.1.2 the
+# same keys also resolve from `dsh-rw:` in ~/.dsh/settings.yaml, which wins over this.
+- id: dsh-rw
+  config:
+    shim: false             # default true: native tools run on the remote workspace.
+                            # Set false to use only the explicit rw_* tools.
+    # shimBash: true        # also intercept bash (session cwd must be the placeholder)
+    # shimBashApproval: ask # ask = approval dialog naming the remote host (skipped on
+                            # never-ask presets like danger-full-access, which run directly);
+                            # native = defer to the native bash policy
 ```
 
 Plugin config keys (defaults shown):
@@ -120,15 +132,16 @@ Plugin config keys (defaults shown):
 | `connectTimeoutMs` | `15000` | cordis only | SSH handshake timeout |
 | `channelOpenTimeoutMs` | `10000` | cordis only | channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried once on a fresh connection |
 | `maxOutputChars` | `200000` | cordis only | cap on collected stdout/stderr per call |
-| `shim` | `true` | cordis + settings | shim mode: intercept the native read/write/edit/str_replace_editor/glob/grep/bash tools and run them against the active remote workspace (set `false` to opt out and use only `rw_*`) |
-| `shimBash` | `true` | cordis + settings | with shim on, also intercept `bash` (only when the agent session cwd is the placeholder workspace) |
-| `shimBashApproval` | `'ask'` | cordis + settings | shimmed `bash` approval: `'ask'` escalates to the DSH approval dialog (reason names the remote host), but stands down on never-ask presets such as `danger-full-access` — asking there auto-rejects without a dialog, so the command just runs; `'native'` always defers to the native bash policy |
+| `shim` | `true` | cordis + settings layer | shim mode: intercept the native read/write/edit/str_replace_editor/glob/grep/bash tools and run them against the active remote workspace (set `false` to opt out and use only `rw_*`) |
+| `shimBash` | `true` | cordis + settings layer | with shim on, also intercept `bash` (only when the agent session cwd is the placeholder workspace) |
+| `shimBashApproval` | `'ask'` | cordis + settings layer | shimmed `bash` approval: `'ask'` escalates to the DSH approval dialog (reason names the remote host), but stands down on never-ask presets such as `danger-full-access` — asking there auto-rejects without a dialog, so the command just runs; `'native'` always defers to the native bash policy |
 
 ## Language
 
 dsh-rw registers its `zh` and `en` dictionaries with the official
 `@deepseek-ai/dsh-client-locale` service. It reads the same Host-backed global preference as the
-rest of DSH (`locale.preference` in `~/.dsh/settings.yaml`) and subscribes to locale revisions, so
+rest of DSH (the `locale.preference` setting, changed under **Settings → Language**) and subscribes
+to locale revisions, so
 changing **Settings → Language** re-renders an already-open picker immediately. English is the
 fallback for other language packs until they contribute a `dsh-rw` namespace dictionary.
 

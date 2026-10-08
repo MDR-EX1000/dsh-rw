@@ -911,7 +911,7 @@ describe('shim wiring in apply', () => {
       },
     }
     /** Fire the captured inject callbacks with a settings service, collecting their disposers. */
-    const attachSettings = (settings: FakeSettings): void => {
+    const attachSettings = (settings: FakeSettings | Record<string, unknown>): void => {
       for (const { cb } of injectCalls) {
         const dispose = cb({ settings })
         if (typeof dispose === 'function') injectDisposers.push(dispose as () => void)
@@ -974,6 +974,27 @@ describe('shim wiring in apply', () => {
     // The shim acquired the placeholder's remote connection to fulfil the read.
     expect(h.pool.connectedAliases.size).toBeGreaterThan(0)
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('shim config resolved (cordis base): shim=true'))
+  })
+
+  it('settings service without register (DSH 0.1.7+/0.2) → Config-derived model, cordis config stays authoritative', async () => {
+    const { ctx, attachSettings, executeListener } = makeCtx()
+    const h = makeHarness()
+    const root = connect(h)
+    applyTo(ctx, h, { ...BASE_CONFIG, shim: false }) // cordis entry config says shim off
+
+    // 0.2's SettingsForms: no per-plugin namespace registration — namespaces are
+    // derived from the plugin's own Config schema and edited through the profile
+    // composition, so the entry config apply() received is the only layer.
+    attachSettings({ describe: () => [], update: () => Promise.resolve() })
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'shim config resolved (cordis base — no settings namespace API on this DSH): shim=false',
+      ),
+    )
+
+    // No overlay was applied, so the cordis config stands: the read stays local.
+    const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
+    expect(res).toBe(LOCAL_RESULT)
   })
 
   it('settings user layer overrides the cordis base (base shim=false, user shim=true → intercepts)', async () => {

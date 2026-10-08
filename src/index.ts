@@ -64,11 +64,12 @@ export interface Config {
 }
 
 /**
- * Settings-layer schema (schemastery, per the dsh-settings contract): ONLY the
- * three shim switches live in the `dsh-rw` settings namespace, resolvable from
- * ~/.dsh/settings.yaml with hot reload. Resolution layers: schema defaults →
- * the cordis entry config (register `base`) → the user layer. Every other
- * config key stays cordis-only.
+ * Settings-layer schema for the DSH 0.1.2 namespace API only: it declares which
+ * of `Config`'s keys the `dsh-rw` namespace may carry, resolved as schema
+ * defaults → the cordis entry config (register `base`) → the user's `dsh-rw:`
+ * section in ~/.dsh/settings.yaml. DSH 0.1.7+ derives namespaces from the
+ * plugin's own `Config` schema instead and never calls this — see the settings
+ * inject below.
  */
 const ShimSettingsSchema = z.object({
   shim: z.boolean().default(true),
@@ -81,6 +82,22 @@ interface ShimSwitches {
   shim: boolean
   shimBash: boolean
   shimBashApproval: 'ask' | 'native'
+}
+
+/**
+ * The DSH 0.1.2 settings-namespace API, declared structurally on purpose: DSH
+ * 0.1.7+ (and 0.2) dropped `register` from the `settings` service, so this has
+ * to compile against a runtime whose service does not have the method at all.
+ */
+interface LegacySettingsRegistrar {
+  register(
+    ns: string,
+    schema: unknown,
+    options: { base: ShimSwitches },
+  ): {
+    get(): ShimSwitches
+    watch(onChange: (next: ShimSwitches) => void): () => void
+  }
 }
 
 /**
@@ -281,14 +298,31 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     }
   }, 'dsh-rw: surfaces')
 
-  // Settings layer: the three shim switches (and only they) may be overridden
-  // from ~/.dsh/settings.yaml's `dsh-rw:` section, hot-reloaded. The inject
-  // callback runs only when a settings service is mounted; without one, or
-  // when the stored section fails validation (register throws), the cordis
+  // Settings layer, and the only place the two DSH settings models diverge.
+  //
+  // DSH 0.1.2: a per-plugin settings NAMESPACE. `settings.register(ns, schema,
+  // { base })` returns a scope resolved as schema defaults → the cordis entry
+  // config → the user's `dsh-rw:` section in ~/.dsh/settings.yaml, with a
+  // watcher that hot-reloads a commit into the live switches.
+  //
+  // DSH 0.1.7+ / 0.2: that API is gone. Namespaces are DERIVED from the
+  // plugin's own `Config` schema (below) and edited through the profile
+  // composition, which is the cordis entry config this apply() already
+  // received — so there is no second layer to overlay and nothing to watch.
+  //
+  // Both lines still mount a `settings` service, so the inject callback fires
+  // either way: the model is selected by the method, never by a version check.
+  // With no settings service, or with one that dropped `register`, the cordis
   // entry config logged above stays in charge.
   ctx.inject(['settings'], (sctx) => {
+    const settings = sctx.settings as unknown as Partial<LegacySettingsRegistrar>
+    const register = settings.register
+    if (typeof register !== 'function') {
+      logShimConfig('cordis base — no settings namespace API on this DSH')
+      return undefined
+    }
     try {
-      const scope = sctx.settings.register('dsh-rw', ShimSettingsSchema, {
+      const scope = register.call(settings, 'dsh-rw', ShimSettingsSchema, {
         base: {
           shim: config.shim ?? true,
           shimBash: config.shimBash ?? true,

@@ -3,6 +3,24 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.4.5 — 2026-10-08
+
+- Support DSH `0.2.0-rc.2` while keeping `0.1.2-rc.1`: the DSH peer ranges are now
+  `^0.1.2-rc.1 || ^0.2.0-rc.2`, and the development ranges moved to the versions shipped with
+  `0.2.0-rc.2`. Before this, DSH's loader refused the plugin outright — `Plugin dsh-rw@0.4.4 is
+  incompatible with dsh 0.2.0-rc.2: peerDependencies {...}` — and rolled the installation back, so
+  the plugin could not be installed on, or loaded by, a 0.2 runtime at all.
+- Port the settings layer to DSH's `Config`-derived model. DSH 0.1.7+ (and 0.2) removed the
+  per-plugin namespace API (`SettingsService.register`); plugin settings are now derived from the
+  plugin's own `Config` schema and edited through the profile composition. The three shim switches
+  therefore come from the `dsh-rw` entry config on those runtimes — set `shim: false` there, or use
+  the plugin's row in the configuration form — instead of a `dsh-rw:` section in
+  `~/.dsh/settings.yaml`. The 0.1.2 namespace path is kept, and the model is selected by the
+  presence of `register` rather than a version check, so one build serves both lines.
+- Log the resolved shim source on the `Config`-derived path too, so a runtime without the namespace
+  API reports `shim config resolved (cordis base — no settings namespace API on this DSH)` instead
+  of saying nothing about which layer won.
+
 ## 0.4.4 — 2026-09-15
 
 - Resolve the `directoryPicker` service at local-pick time instead of caching it
