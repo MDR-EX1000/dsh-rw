@@ -3,6 +3,27 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 0.4.6 — 2026-10-08
+
+- Stop claiming native translation that is not happening. The prompt section used to say "this session's
+  workspace is remote-backed: the native read/write/... tools are translated to the remote host
+  automatically" whenever a remote workspace was recorded and shim was on — but the shim only translates
+  while the agent session's working directory lives inside that workspace's placeholder
+  (`src/shim.ts` `activeTarget`). With any other working directory the native tools ran on the LOCAL
+  machine while the prompt said remote, and the pass-through produced no log at all. The one combination
+  that could write to the wrong filesystem silently is now impossible to hit unaware:
+  - the shim records where each dispatch actually went, and the prompt section, `rw_info` and `/rw` report
+    that observation instead of inferring from the session record;
+  - the prompt states the rule (placeholder containment) until a dispatch settles it, then reports the
+    observed side: "translated to the remote host automatically" only after a translated call, and an
+    explicit `WARNING — the native … tools are running on the LOCAL machine` naming the working directory
+    and the expected placeholder after a pass-through;
+  - `rw_info` gains a `Native tools:` line (`remote` / `LOCAL` / `not observed yet` / `shim off`), so the
+    model can check where its own file tools go before using them;
+  - a pass-through caused by a local working directory logs one `console.warn` naming the cwd, the
+    workspace and the placeholder (once per distinct cwd — never per call). A runtime with no working
+    directory to compare (`cwd` unset) keeps the previous observation rather than guessing.
+
 ## 0.4.5 — 2026-10-08
 
 - Support DSH `0.2.0-rc.2` while keeping `0.1.2-rc.1`: the DSH peer ranges are now

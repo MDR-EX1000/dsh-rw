@@ -6,7 +6,7 @@
 
 Remote-SSH-style workspaces for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 
-Version 0.4.5 supports DSH `0.1.2-rc.1` and `0.2.0-rc.2`, plus compatible later `0.1.x` / `0.2.x`
+Version 0.4.6 supports DSH `0.1.2-rc.1` and `0.2.0-rc.2`, plus compatible later `0.1.x` / `0.2.x`
 releases.
 
 Pick an SSH host and a remote directory — that directory becomes a native DSH workspace, and the agent works **directly on the remote filesystem** through `rw_*` tools (SFTP/exec over a persistent ssh2 pool). No mirror, no sync: the remote is the single source of truth.
@@ -27,6 +27,7 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 - **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts. It takes a clean name — the remote basename or the name you give in the picker; a hash suffix appears only on a naming conflict (legacy hash-suffixed placeholders keep working).
 - **Shim mode (on by default)** — DSH's native `read`/`write`/`edit`/`str_replace_editor`/`glob`/`grep`/`bash` tools are intercepted on the tool pipeline and translated to remote execution, so the agent works as if the workspace were local without learning `rw_*`. Paths map placeholder↔remote in both directions, edits re-stat before writing back (`RW_EDIT_CONFLICT` on a concurrent change), and shimmed `bash` escalates to the approval dialog naming the remote host. On by default — set `shim: false` (the plugin's cordis entry config, or its row in the DSH plugin configuration form) to opt out and use only the explicit `rw_*` tools. The shim anchors on the agent session's cwd placeholder — not the mutable `rw_*` session — so `rw_disconnect` or reconnecting `rw_*` to another host can't silently redirect native tools; calls rooted outside the placeholder always pass through to the local tool unchanged.
 - **Fail loud, never silently local** — if a placeholder's host was removed from the config, calls that would touch that placeholder fail with an actionable `NOT_CONNECTED` error instead of silently running against the empty local directory. The block is path-aware: only calls touching the broken placeholder fail; everything else still passes through.
+- **Never claims remote while running local** — translation is anchored to the session's working directory, so the plugin reports what it *observed*, never what the recorded session implies. `rw_info` says where the native tools actually went (`remote` / `LOCAL` / `not observed yet`), a pass-through caused by a local working directory logs exactly one console line naming both the cwd and the placeholder it should have been in, and the prompt section states the rule until a dispatch settles it — switching to an explicit `WARNING … running on the LOCAL machine` the moment a local pass-through is observed, and to "translated automatically" only once a translated call has been seen.
 
 ## Install
 

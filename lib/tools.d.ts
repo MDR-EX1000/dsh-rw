@@ -1,5 +1,6 @@
 import type { HostEntry, HostSummary } from './hosts.js';
 import type { Session } from './session.js';
+import type { NativeRouting } from './shim.js';
 import type { ExecResult, SftpLike } from './ssh-pool.js';
 /**
  * Structural subset of HostTable consumed by the tools/routes. HostTable has
@@ -47,6 +48,10 @@ export interface ToolsDeps {
     };
     /** Base dir for placeholder dirs (tests inject a tmp dir). */
     placeholderBaseDir?: string;
+    /** Where native tools actually go, as observed by the shim (plugin-load scope). */
+    routing?: NativeRouting;
+    /** Whether the shim is currently on (a live getter: the settings layer can flip it). */
+    shimEnabled?: () => boolean;
 }
 /**
  * Shared pick-workspace validation used by rw_pick_workspace and the

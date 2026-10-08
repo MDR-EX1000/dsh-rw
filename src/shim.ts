@@ -49,6 +49,33 @@ export interface ShimConfig {
   maxOutputChars: number
 }
 
+/**
+ * Where the native read/write/edit/str_replace_editor/glob/grep/bash tools
+ * actually go in the CURRENT agent session. This is an OBSERVATION the shim
+ * updates on every dispatch, never an inference from the rw_* session record:
+ * a recorded remote workspace does not by itself tell anyone whether the
+ * agent's working directory lives inside its placeholder (translated) or on a
+ * real local directory (pass-through). The prompt section and rw_info report
+ * this record so a session cannot be told its native tools are remote while
+ * they are quietly running on the local machine.
+ */
+export interface NativeRouting {
+  /** 'unknown' until the first shimmed call of this plugin load is observed. */
+  mode: 'unknown' | 'remote' | 'local'
+  /** The agent cwd the observation was made at (in `local` mode: the offending directory). */
+  cwd?: string
+  /** The remote workspace active when the observation was made. */
+  alias?: string
+  workspace?: string
+  /** Placeholder directory the session must live in for native translation. */
+  placeholder?: string
+}
+
+/** A fresh, unobserved routing record (one per plugin load). */
+export function createNativeRouting(): NativeRouting {
+  return { mode: 'unknown' }
+}
+
 export interface ShimDeps {
   hosts: HostTableLike
   pool: PoolLike
@@ -56,6 +83,8 @@ export interface ShimDeps {
   config: ShimConfig
   /** Base dir for placeholder dirs (tests inject a tmp dir). */
   placeholderBaseDir?: string
+  /** Observation record shared with the prompt section and rw_info. */
+  routing?: NativeRouting
   /**
    * Resolve the caller-visible tool definition (ctx.tools.get in production).
    * Only used for the bash flavor check; undefined → bash is treated as
@@ -1024,12 +1053,73 @@ async function shimBash(
 // --- the middlewares --------------------------------------------------------------
 
 export function makeShim(deps: ShimDeps): Shim {
+  /** One console line per distinct (alias, workspace, local cwd) mismatch — never per call. */
+  const warnedRouting = new Set<string>()
+
+  /**
+   * Record where this dispatch actually went, and — for the case that used to
+   * fail silently — say so once on the console. `translated` is the shim's own
+   * resolution result (`activeTarget(...) !== null`), so `remote` means the
+   * session's cwd is inside a placeholder whose host is configured, and
+   * `local` means a remote workspace is recorded while the agent cwd is a real
+   * local directory: legitimate pass-through by design, but indistinguishable
+   * from a working remote session unless it is reported.
+   */
+  const recordRouting = (
+    exec: ToolDispatchExecution,
+    translated: boolean,
+  ): void => {
+    const routing = deps.routing
+    if (routing === undefined) return
+    const alias = deps.session.alias
+    const workspace = deps.session.workspace
+    if (alias === null || workspace === null) {
+      // No remote workspace recorded: the prompt section's idle guidance owns
+      // this state and there is nothing native calls could be translated to.
+      routing.mode = 'unknown'
+      delete routing.cwd
+      delete routing.alias
+      delete routing.workspace
+      delete routing.placeholder
+      return
+    }
+    const placeholder = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
+    if (translated) {
+      routing.mode = 'remote'
+      routing.alias = alias
+      routing.workspace = workspace
+      delete routing.cwd
+      if (placeholder !== null) routing.placeholder = placeholder
+      else delete routing.placeholder
+      return
+    }
+    const cwd = agentCwd(exec)
+    if (cwd === undefined || placeholder === null) return // cannot tell: keep the last observation
+    if (insideLocal(localRootsOf(placeholder), resolve(cwd))) return // the shim would have translated
+    routing.mode = 'local'
+    routing.cwd = cwd
+    routing.alias = alias
+    routing.workspace = workspace
+    routing.placeholder = placeholder
+    const key = `${alias}\u0000${workspace}\u0000${cwd}`
+    if (warnedRouting.has(key)) return
+    warnedRouting.add(key)
+    console.warn(
+      `[dsh-rw] native tools are running LOCALLY, not on the remote host: this session's working directory ` +
+        `(${cwd}) is not inside the dsh-rw placeholder for ${alias}:${workspace} (${placeholder}). The native ` +
+        'read/write/edit/str_replace_editor/glob/grep/bash tools operate on the local filesystem; use the rw_* ' +
+        'tools for remote work, or open the placeholder directory as this session\'s workspace to get native ' +
+        'translation.',
+    )
+  }
+
   const onExecute = async (
     exec: ToolDispatchExecution,
     next: () => Promise<ToolExecutionResult>,
   ): Promise<ToolExecutionResult> => {
     if (!deps.config.shim) return next()
     const target = activeTarget(deps, exec)
+    if (target !== null) recordRouting(exec, true)
     if (process.env.DSH_RW_DEBUG) {
       console.log('[dsh-rw shim] dispatch', {
         name: exec.name,
@@ -1050,6 +1140,10 @@ export function makeShim(deps: ShimDeps): Shim {
       if (broken !== null && callTouchesPlaceholder(exec.name, objectArgs(exec.arguments), localRootsOf(broken.dir), broken.dir)) {
         return fail(blockedMessage(broken), { name: 'RwError', code: 'NOT_CONNECTED' })
       }
+      // Pass-through by design (local cwd, or a call rooted outside the
+      // placeholder): record it, so the prompt and rw_info can report that
+      // this session's native tools are not reaching the remote.
+      recordRouting(exec, false)
       return next()
     }
     const args = objectArgs(exec.arguments)

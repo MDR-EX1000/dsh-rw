@@ -18,6 +18,7 @@ import type { HostEntry, HostSummary } from './hosts.js'
 import { ensurePlaceholder, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
+import type { NativeRouting } from './shim.js'
 import type { ExecResult, SftpLike } from './ssh-pool.js'
 
 /**
@@ -65,6 +66,10 @@ export interface ToolsDeps {
   }
   /** Base dir for placeholder dirs (tests inject a tmp dir). */
   placeholderBaseDir?: string
+  /** Where native tools actually go, as observed by the shim (plugin-load scope). */
+  routing?: NativeRouting
+  /** Whether the shim is currently on (a live getter: the settings layer can flip it). */
+  shimEnabled?: () => boolean
 }
 
 const TEXT_OUTPUT_SCHEMA = {
@@ -148,6 +153,36 @@ export async function resolveWorkspaceDir(
   return { workspace: real, placeholderDir }
 }
 
+/**
+ * Where the native read/write/edit/glob/grep/bash calls actually go, reported
+ * from the shim's own observation rather than from the session record. This is
+ * the line that makes a disagreement between the two tool families visible: a
+ * recorded remote workspace is not evidence that native calls are reaching it.
+ */
+function nativeRoutingLine(deps: ToolsDeps, placeholderDir: string | null): string {
+  if (deps.shimEnabled !== undefined && !deps.shimEnabled()) {
+    return (
+      'Native tools: shim off — read/write/edit/str_replace_editor/glob/grep/bash stay on the local machine; ' +
+      'use rw_* for the remote'
+    )
+  }
+  const routing = deps.routing
+  const where = routing?.placeholder ?? placeholderDir ?? 'the placeholder directory'
+  if (routing?.mode === 'remote') {
+    return `Native tools: remote — this session's cwd is inside ${where}, so native calls are translated to the host`
+  }
+  if (routing?.mode === 'local') {
+    return (
+      `Native tools: LOCAL — this session's cwd (${routing.cwd ?? 'unknown'}) is outside ${where}, so ` +
+      'read/write/edit/str_replace_editor/glob/grep/bash run on the local machine; use rw_* for the remote'
+    )
+  }
+  return (
+    'Native tools: not observed yet — translation starts with the first native tool call in this session; ' +
+    'rw_* always addresses the remote'
+  )
+}
+
 /** Sync status lines shared by rw_info and the /rw slash command. */
 export function statusText(deps: ToolsDeps): string {
   const { hosts, pool, session } = deps
@@ -174,6 +209,7 @@ export function statusText(deps: ToolsDeps): string {
         ? `Placeholder dir (register this as the DSH workspace): ${placeholderDir}`
         : 'Placeholder dir: (none found — call rw_pick_workspace to (re)create it)',
     )
+    lines.push(nativeRoutingLine(deps, placeholderDir))
   }
   lines.push(
     `Host key policy: ${deps.config.hostKeyPolicy ?? 'accept-new'} (plugin config hostKeyPolicy; keys verified against known_hosts)`,
@@ -224,9 +260,10 @@ export function makeTools(deps: ToolsDeps): unknown[] {
       name: 'rw_info',
       description:
         'Show the dsh-rw remote-workspace state: configured SSH host count, current host (user@host:port), ' +
-        'connection health, current remote workspace, its local placeholder directory, and the host-key policy. ' +
+        'connection health, current remote workspace, its local placeholder directory, where the native ' +
+        'read/write/bash tools actually run right now, and the host-key policy. ' +
         'Call this first to orient, or when an rw_* call fails to check connectivity. ' +
-        'Triggers: remote workspace, SSH host, server status, where am I working.',
+        'Triggers: remote workspace, SSH host, server status, where am I working, are my tools remote.',
       parameters: {},
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
       async execute() {

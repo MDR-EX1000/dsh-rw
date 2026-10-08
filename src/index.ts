@@ -14,8 +14,9 @@ import { HostTable } from './hosts.js'
 import { KnownHosts } from './known-hosts.js'
 import { makeRoutes } from './routes.js'
 import { Session } from './session.js'
-import { makeShim } from './shim.js'
+import { createNativeRouting, makeShim } from './shim.js'
 import type { ShimConfig } from './shim.js'
+import { resolvePlaceholderDir } from './placeholder.js'
 import { SshPool } from './ssh-pool.js'
 import { makeTools, statusText } from './tools.js'
 import type { HostTableLike, PoolLike, ToolsDeps } from './tools.js'
@@ -179,6 +180,10 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       maxOutputChars: config.maxOutputChars,
     })
   const session = overrides.session ?? new Session()
+  // Shared observation of where native tools actually go; the shim writes it on
+  // every dispatch, the prompt section and rw_info read it. Never inferred from
+  // the session record alone — see promptText.
+  const nativeRouting = createNativeRouting()
 
   const deps: ToolsDeps = {
     hosts,
@@ -189,6 +194,8 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       maxOutputChars: config.maxOutputChars,
       hostKeyPolicy: config.hostKeyPolicy,
     },
+    routing: nativeRouting,
+    shimEnabled: () => shimSettings.shim,
     ...(overrides.placeholderBaseDir !== undefined ? { placeholderBaseDir: overrides.placeholderBaseDir } : {}),
   }
 
@@ -227,19 +234,54 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     const entry = hosts.find(alias)
     const who = entry ? `${entry.user}@${entry.host}:${entry.port}` : alias
     if (shimSettings.shim) {
-      // Shim on: native tools are translated to the remote host, so steer the
-      // model to them — pushing rw_* here would keep the shim dormant.
       const native = shimSettings.shimBash
         ? 'read/write/edit/str_replace_editor/glob/grep/bash'
         : 'read/write/edit/str_replace_editor/glob/grep'
+      const rwTools =
+        'The rw_* tools (rw_list_dir / rw_read_file / rw_write_file / rw_mkdir / rw_move / rw_delete / rw_exec) ' +
+        'always address the remote host and are confined to the workspace root.'
+      const placeholder =
+        nativeRouting.placeholder ??
+        resolvePlaceholderDir(alias, workspace, overrides.placeholderBaseDir) ??
+        '(placeholder directory not found)'
+      if (nativeRouting.mode === 'local') {
+        // This session's cwd is a real local directory, so the shim passes the
+        // native tools through to the local machine. Saying anything else here
+        // is how a session ends up editing local files while believing it is
+        // working on the remote.
+        return [
+          '## Remote workspace (dsh-rw)',
+          `Current remote workspace: ${who}:${workspace}`,
+          `WARNING — the native ${native} tools are running on the LOCAL machine, not on the remote host: ` +
+            `this session's working directory (${nativeRouting.cwd ?? 'unknown'}) is not inside the dsh-rw ` +
+            `placeholder for that workspace (${placeholder}). Remote work needs the rw_* tools; to make the ` +
+            'native tools reach the remote, open the placeholder directory as this session\'s workspace. ' +
+            rwTools,
+        ].join('\n')
+      }
+      if (nativeRouting.mode === 'remote') {
+        // Observed: the session cwd lives inside the placeholder, so native
+        // calls are translated. Steer the model to them — pushing rw_* here
+        // would keep the shim dormant.
+        return [
+          '## Remote workspace (dsh-rw)',
+          `Current remote workspace: ${who}:${workspace}`,
+          `This session's workspace is remote-backed: the native ${native} tools are translated to the remote ` +
+            'host automatically — use them exactly as if the workspace were local. ' +
+            `${rwTools} The remote filesystem is the source of truth (no local mirror).`,
+        ].join('\n')
+      }
+      // Nothing observed yet (the plugin loaded after the last dispatch, or no
+      // tool has run in this session): state the rule instead of claiming an
+      // outcome, and point at the one call that reports it.
       return [
         '## Remote workspace (dsh-rw)',
         `Current remote workspace: ${who}:${workspace}`,
-        `This session's workspace is remote-backed: the native ${native} tools are translated to the remote ` +
-          'host automatically — use them exactly as if the workspace were local. The rw_* tools (rw_list_dir / ' +
-          'rw_read_file / rw_write_file / rw_mkdir / rw_move / rw_delete / rw_exec) remain available for explicit ' +
-          'remote operations; the remote filesystem is the source of truth (no local mirror). All rw_* file paths ' +
-          'are confined to the workspace root.',
+        `The native ${native} tools are translated to the remote host only while this session's working ` +
+          `directory is inside the dsh-rw placeholder directory (${placeholder}); calls rooted anywhere else run ` +
+          'on the local machine. No native tool call has been observed since the plugin loaded, so which of the ' +
+          'two is in effect is not known yet — call rw_info to see where the native tools actually go. ' +
+          rwTools,
       ].join('\n')
     }
     return [
@@ -275,6 +317,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       pool,
       session,
       config: shimSettings,
+      routing: nativeRouting,
       ...(overrides.placeholderBaseDir !== undefined ? { placeholderBaseDir: overrides.placeholderBaseDir } : {}),
       getTool: (toolName, agent) => ctx.tools.get(toolName, agent as Parameters<Context['tools']['get']>[1]),
       // Never-ask detection for the pre-execute gate; absent/legacy approval

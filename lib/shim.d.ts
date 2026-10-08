@@ -9,6 +9,29 @@ export interface ShimConfig {
     commandTimeoutMs: number;
     maxOutputChars: number;
 }
+/**
+ * Where the native read/write/edit/str_replace_editor/glob/grep/bash tools
+ * actually go in the CURRENT agent session. This is an OBSERVATION the shim
+ * updates on every dispatch, never an inference from the rw_* session record:
+ * a recorded remote workspace does not by itself tell anyone whether the
+ * agent's working directory lives inside its placeholder (translated) or on a
+ * real local directory (pass-through). The prompt section and rw_info report
+ * this record so a session cannot be told its native tools are remote while
+ * they are quietly running on the local machine.
+ */
+export interface NativeRouting {
+    /** 'unknown' until the first shimmed call of this plugin load is observed. */
+    mode: 'unknown' | 'remote' | 'local';
+    /** The agent cwd the observation was made at (in `local` mode: the offending directory). */
+    cwd?: string;
+    /** The remote workspace active when the observation was made. */
+    alias?: string;
+    workspace?: string;
+    /** Placeholder directory the session must live in for native translation. */
+    placeholder?: string;
+}
+/** A fresh, unobserved routing record (one per plugin load). */
+export declare function createNativeRouting(): NativeRouting;
 export interface ShimDeps {
     hosts: HostTableLike;
     pool: PoolLike;
@@ -16,6 +39,8 @@ export interface ShimDeps {
     config: ShimConfig;
     /** Base dir for placeholder dirs (tests inject a tmp dir). */
     placeholderBaseDir?: string;
+    /** Observation record shared with the prompt section and rw_info. */
+    routing?: NativeRouting;
     /**
      * Resolve the caller-visible tool definition (ctx.tools.get in production).
      * Only used for the bash flavor check; undefined → bash is treated as

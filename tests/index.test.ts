@@ -210,7 +210,7 @@ describe('apply', () => {
     expect(active).toContain('confined to the workspace root')
   })
 
-  it('the prompt section steers to native tools while shim is on (the default)', () => {
+  it('the prompt section states the translation rule while shim is on, without claiming the outcome', () => {
     const { ctx, getSection } = makeCtx()
     const overrides = makeOverrides()
     apply(ctx as unknown as Context, CONFIG, overrides)
@@ -218,10 +218,16 @@ describe('apply', () => {
 
     const active = getSection()!.text()
     expect(active).toContain('Current remote workspace: deploy@example.com:22:/srv/app')
-    expect(active).toContain('remote-backed')
+    // Nothing has been dispatched in this session, so whether native tools
+    // reach the remote is not known yet: state the rule, never the outcome.
+    // The old unconditional "remote-backed" claim is what let a session edit
+    // local files while believing it worked on the remote.
+    expect(active).not.toContain('remote-backed')
     expect(active).toContain('read/write/edit/str_replace_editor/glob/grep/bash')
-    expect(active).toContain('as if the workspace were local')
-    // rw_* stays mentioned as the explicit path, but is no longer the steering.
+    expect(active).toContain('inside the dsh-rw placeholder directory')
+    expect(active).toContain('run on the local machine')
+    expect(active).toContain('rw_info')
+    // rw_* stays mentioned as the path that always addresses the remote.
     expect(active).toContain('rw_exec')
   })
 

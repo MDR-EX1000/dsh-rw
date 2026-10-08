@@ -919,7 +919,17 @@ describe('shim wiring in apply', () => {
     }
     const executeListener = (): ExecuteListener =>
       listeners.find((l) => l.event === 'tools/execute')!.fn as ExecuteListener
-    return { ctx, listeners, injectCalls, injectDisposers, effectDisposers, effectLabels, attachSettings, executeListener }
+    return {
+      ctx,
+      listeners,
+      injectCalls,
+      injectDisposers,
+      effectDisposers,
+      effectLabels,
+      attachSettings,
+      executeListener,
+      getSection: () => section,
+    }
   }
 
   const BASE_CONFIG: Config = {
@@ -1057,5 +1067,69 @@ describe('shim wiring in apply', () => {
     const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
     expect(text(res)).toContain(`<path>${join(root, 'README.md')}</path>`)
     expect(settings.watcherCount).toBe(0)
+  })
+
+  // Bug A class: a recorded remote workspace does not mean native calls reach
+  // it. The prompt must not say "remote-backed" until the shim has OBSERVED a
+  // translated call, and a pass-through caused by a local session cwd must be
+  // reported rather than left implicit.
+  describe('native routing is observed, never assumed', () => {
+    it('a translated call marks the session remote and the prompt says so', async () => {
+      const { ctx, executeListener, getSection } = makeCtx()
+      const h = makeHarness()
+      const root = connect(h)
+      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+
+      // Before any dispatch the rule is stated, not the outcome.
+      expect(getSection()!.text()).not.toContain('remote-backed')
+      expect(getSection()!.text()).toContain('is not known yet')
+
+      const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
+      expect(text(res)).toContain(`<path>${join(root, 'README.md')}</path>`)
+
+      const active = getSection()!.text()
+      expect(active).toContain('remote-backed')
+      expect(active).toContain('translated to the remote host automatically')
+    })
+
+    it('a local session cwd warns once, keeps the call local, and the prompt reports LOCAL', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const { ctx, executeListener, getSection } = makeCtx()
+      const h = makeHarness()
+      connect(h) // a remote workspace IS recorded …
+      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+      const localDir = dir // … but this session works in a real local directory
+
+      const first = makeNext()
+      await executeListener()(execOf('read', { file_path: 'local.txt' }, localDir), first.next)
+      expect(first.passedThrough()).toBe(true)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('native tools are running LOCALLY'))
+
+      const local = getSection()!.text()
+      expect(local).toContain('WARNING')
+      expect(local).toContain('running on the LOCAL machine')
+      expect(local).toContain(localDir)
+      expect(local).not.toContain('remote-backed')
+
+      // Same cwd again: still local, but the console line is not repeated.
+      const second = makeNext()
+      await executeListener()(execOf('read', { file_path: 'local.txt' }, localDir), second.next)
+      expect(second.passedThrough()).toBe(true)
+      expect(warn).toHaveBeenCalledTimes(1)
+    })
+
+    it('a disconnect (no remote workspace) returns the routing record to unknown', async () => {
+      const { ctx, executeListener, getSection } = makeCtx()
+      const h = makeHarness()
+      const root = connect(h)
+      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+      await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
+      expect(getSection()!.text()).toContain('remote-backed')
+
+      h.session.set({ alias: null })
+      await executeListener()(execOf('read', { file_path: 'local.txt' }, dir), makeNext().next)
+      expect(getSection()!.text()).toContain('No remote workspace is active')
+    })
   })
 })

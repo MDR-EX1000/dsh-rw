@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RwError } from '../src/errors.js'
 import { ensurePlaceholder, readPlaceholderMeta } from '../src/placeholder.js'
-import { makeTools } from '../src/tools.js'
+import { makeTools, statusText } from '../src/tools.js'
 import { ENTRY_PROD, makeHarness, SECRET_PASSWORD } from './p4-fakes.js'
 import type { FakeHarness } from './p4-fakes.js'
 
@@ -98,6 +98,29 @@ describe('rw_info / rw_hosts', () => {
     expect(text).toContain(placeholderDir)
     expect(text).toContain(join('placeholders', 'prod', 'app'))
     expect(text).not.toContain(SECRET_PASSWORD)
+  })
+
+  it('rw_info reports where the native tools actually go, from the observed routing', async () => {
+    harness.connect()
+    ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    const deps = { ...harness.deps, shimEnabled: () => true }
+
+    // Nothing dispatched yet: no claim either way, plus the rw_* fallback.
+    expect(statusText(deps)).toContain('Native tools: not observed yet')
+
+    const remote = statusText({ ...deps, routing: { mode: 'remote', placeholder: '/p/prod/app' } })
+    expect(remote).toContain('Native tools: remote')
+    expect(remote).toContain('/p/prod/app')
+
+    const local = statusText({
+      ...deps,
+      routing: { mode: 'local', cwd: '/Users/me/project', placeholder: '/p/prod/app' },
+    })
+    expect(local).toContain('Native tools: LOCAL')
+    expect(local).toContain('/Users/me/project')
+    expect(local).toContain('use rw_* for the remote')
+
+    expect(statusText({ ...deps, shimEnabled: () => false })).toContain('Native tools: shim off')
   })
 
   it('rw_hosts renders a table of summaries without credentials', async () => {
