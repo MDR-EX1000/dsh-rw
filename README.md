@@ -144,6 +144,9 @@ Plugin config keys (defaults shown):
 | `shimBashApproval` | `'ask'` | cordis + settings layer | shimmed `bash` approval: `'ask'` escalates to the DSH approval dialog (reason names the remote host), but stands down on never-ask presets such as `danger-full-access` — asking there auto-rejects without a dialog, so the command just runs; `'native'` always defers to the native bash policy |
 | `persistentShell` | `true` | cordis only | run the persistent-bash flavor on one long-lived remote shell per (host, workspace), so `cd`/`export` survive between calls (set `false` for the pre-1.0 one-shot behavior) |
 | `persistentShellIdleMs` | `600000` | cordis only | close an idle persistent shell after this many ms (`0` disables the idle close) |
+| `backgroundJobs` | `true` | cordis only | run native `bash(run_in_background)` calls on the HOST as `ctx.jobs` jobs, collected with the usual `job_output`/`job_kill`; off (or no job registry) refuses the call instead of running it locally |
+| `jobPollMs` | `500` | cordis only | log poll cadence while narrating a remote background job |
+| `jobDir` | `'/tmp'` | cordis only | remote directory holding background-job logs |
 
 ## Language
 

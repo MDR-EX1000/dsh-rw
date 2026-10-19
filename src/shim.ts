@@ -36,6 +36,8 @@ import type { Session } from './session.js'
 import type { HostEntry } from './hosts.js'
 import type { ExecResult, SftpLike } from './ssh-pool.js'
 import type { ShellManagerLike } from './persistent-shell.js'
+import { startRemoteJob } from './jobs.js'
+import type { JobsRegistryLike, RemoteJobDeps } from './jobs.js'
 import type { HostTableLike, PoolLike } from './tools.js'
 
 /** Canonical success value, derived from the public execution result contract. */
@@ -50,6 +52,8 @@ export interface ShimConfig {
   maxOutputChars: number
   /** Run the persistent-bash flavor on a long-lived remote shell (default true). */
   persistentShell?: boolean
+  /** Run native background bash calls as remote jobs (default true). */
+  backgroundJobs?: boolean
 }
 
 /**
@@ -115,6 +119,17 @@ export interface ShimDeps {
    * one-shot exec and the result says so.
    */
   shells?: ShellManagerLike
+  /**
+   * The host job registry (`ctx.jobs`). A remote background bash call is
+   * registered here so the model collects it with the SAME job_output /
+   * job_kill tools as a local job. Absent → such a call is REFUSED rather than
+   * passed through, because passing it through runs it on the local machine.
+   */
+  jobs?: JobsRegistryLike
+  /** Poll cadence for a remote job's log (default 500 ms). */
+  jobPollMs?: number
+  /** Remote directory holding job logs (default /tmp). */
+  jobDir?: string
 }
 
 /** The two middlewares apply() wires onto the tool pipeline. */
@@ -1169,6 +1184,33 @@ function isPersistentBash(deps: ShimDeps, exec: ToolDispatchExecution): boolean 
   return !('workdir' in props) && !('timeoutMs' in props) && !('description' in props)
 }
 
+/** Wire the job launcher to the pool: exec for control, SFTP for the log. */
+function remoteJobDeps(deps: ShimDeps): RemoteJobDeps {
+  return {
+    exec: async (entry, command, opts) => await deps.pool.exec(entry, command, opts),
+    readFile: async (entry, path) => {
+      const sftp = await deps.pool.sftp(entry)
+      try {
+        return (await sftp.readFile(path)).toString('utf8')
+      } catch (err) {
+        // "not created yet" is normal for a job that just started; anything
+        // else is a real failure the poller must report.
+        const mapped = mapSftpError(err, path)
+        if (mapped instanceof RwError && mapped.code === 'NO_SUCH_PATH') return null
+        throw mapped
+      }
+    },
+    ...(deps.jobPollMs !== undefined ? { pollMs: deps.jobPollMs } : {}),
+    ...(deps.jobDir !== undefined ? { logDir: deps.jobDir } : {}),
+  }
+}
+
+/** The owning agent's id, as `ctx.jobs` fences access with it. */
+function agentIdOf(exec: ToolDispatchExecution): string | undefined {
+  const id = (exec.agent as { id?: unknown } | undefined)?.id
+  return typeof id === 'string' && id !== '' ? id : undefined
+}
+
 /** Replace every placeholder path form in the command with the remote root. */
 function rewriteCommand(target: ActiveTarget, command: string): string {
   const roots = [...new Set([target.localRoot, ...target.localRoots])].sort((a, b) => b.length - a.length)
@@ -1194,13 +1236,48 @@ async function shimBash(
   if (!sessionInsidePlaceholder(target, exec)) return null
   const command = strArg(args, 'command')
   if (command === undefined) return null
-  if (args.run_in_background === true) return null // no remote background jobs — pass through
   if (args.workdir !== undefined && typeof args.workdir !== 'string') return null // invalid → native validation
   let cwd = target.remoteRoot
   if (typeof args.workdir === 'string') {
     const mapped = toRemotePath(target, args.workdir)
     if (mapped === null) return null
     cwd = mapped
+  }
+  if (args.run_in_background === true) {
+    // Reaching here means the session cwd IS a remote placeholder, so a
+    // pass-through would run the command on the LOCAL machine while every
+    // other signal says it is remote. Start it on the host instead and let the
+    // host job registry narrate it (job_output / job_kill work unchanged).
+    if (deps.jobs === undefined || deps.config.backgroundJobs === false) {
+      return fail(
+        'background jobs are unavailable for remote workspaces in this deployment — run the command in the ' +
+          'foreground (it would otherwise run on the LOCAL machine, not the host)',
+      )
+    }
+    return guarded(async () => {
+      if (command.trim().length === 0) throw new Error('command must be a non-empty string')
+      const owner = agentIdOf(exec)
+      const jobId = startRemoteJob(remoteJobDeps(deps), deps.jobs as JobsRegistryLike, {
+        entry: target.entry,
+        command: rewriteCommand(target, command),
+        cwd,
+        label: command.trim().split('\n')[0] ?? command,
+        ...(owner !== undefined ? { owner } : {}),
+      })
+      return {
+        isError: false,
+        // The native background result is exactly { kind, jobId, cwd }.
+        value: { kind: 'background', jobId, cwd },
+        content: [
+          {
+            type: 'text',
+            text:
+              `started background job ${jobId} on ${target.entry.alias} (cwd: ${cwd})\n` +
+              'collect its output with job_output, stop it with job_kill',
+          },
+        ],
+      }
+    })
   }
   return guarded(async () => {
     if (command.trim().length === 0) throw new Error('command must be a non-empty string')
@@ -1398,7 +1475,8 @@ export function makeShim(deps: ShimDeps): Shim {
     if (target === null) return next()
     if (!sessionInsidePlaceholder(target, exec)) return next()
     const args = objectArgs(exec.arguments)
-    if (args?.run_in_background === true) return next() // passes through locally in onExecute too
+    // A background command now runs on the HOST (registered as a job), so it
+    // needs the same approval as a foreground remote command.
     // Never-ask presets (danger-full-access): an ask would auto-reject without
     // a dialog, so stand down — onExecute still intercepts and runs remotely.
     if (deps.approvalPolicyOf?.(exec.agent?.session) === 'never') return next()

@@ -29,6 +29,12 @@ export declare const Config: z<Schemastery.ObjectS<{
     persistentShell: z<boolean, boolean>;
     /** Close a persistent shell after this many ms without a command (default 10 minutes). */
     persistentShellIdleMs: z<number, number>;
+    /** Run native background bash calls as REMOTE jobs registered with ctx.jobs (default true). Off → such a call is refused rather than run locally. */
+    backgroundJobs: z<boolean, boolean>;
+    /** Poll cadence for a remote job's log (default 500 ms). */
+    jobPollMs: z<number, number>;
+    /** Remote directory holding background-job logs (default /tmp). */
+    jobDir: z<string, string>;
 }>, Schemastery.ObjectT<{
     /** Host key policy: verify against ~/.ssh/known_hosts (accept-new learns on first connect). */
     hostKeyPolicy: z<string, string>;
@@ -52,6 +58,12 @@ export declare const Config: z<Schemastery.ObjectS<{
     persistentShell: z<boolean, boolean>;
     /** Close a persistent shell after this many ms without a command (default 10 minutes). */
     persistentShellIdleMs: z<number, number>;
+    /** Run native background bash calls as REMOTE jobs registered with ctx.jobs (default true). Off → such a call is refused rather than run locally. */
+    backgroundJobs: z<boolean, boolean>;
+    /** Poll cadence for a remote job's log (default 500 ms). */
+    jobPollMs: z<number, number>;
+    /** Remote directory holding background-job logs (default /tmp). */
+    jobDir: z<string, string>;
 }>>;
 export interface Config {
     hostKeyPolicy: HostKeyPolicy;
@@ -67,6 +79,9 @@ export interface Config {
     /** Optional so hand-built test configs still typecheck (schema default: true). */
     persistentShell?: boolean;
     persistentShellIdleMs?: number;
+    backgroundJobs?: boolean;
+    jobPollMs?: number;
+    jobDir?: string;
 }
 /**
  * Test seams for apply(): the DSH loader calls apply(ctx, config); tests pass

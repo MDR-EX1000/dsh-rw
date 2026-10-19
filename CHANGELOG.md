@@ -3,6 +3,34 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.3.0 — 2026-10-19
+
+### Fixed — a background bash call inside a remote workspace ran on the LOCAL machine
+
+`bash` with `run_in_background: true` was passed through to the native tool so
+the command ran on the **local** machine while every other signal in the
+session said the workspace was remote — the last place dsh-rw silently lied
+about where work happens (and a direct contradiction of "never silently
+local"). A remote background call is now started **on the host**:
+
+- the command runs detached (`setsid` + log redirect) so closing the SSH
+  channel cannot kill it, and the log gets an exit marker carrying `$?`;
+- the job is registered with the host job registry (`ctx.jobs`), so the model
+  collects and stops it with the **same** `job_output` / `job_kill` tools it
+  uses for a local job — no second tool family;
+- output is narrated incrementally (only new bytes are appended, the marker
+  never leaks), terminal status comes from the exit marker, and `job_kill`
+  signals the remote pid;
+- a host without `setsid` fails loudly with the launch error instead of
+  pretending;
+- with no job registry composed (or `backgroundJobs: false`) the call is
+  **refused** with an explicit message rather than run locally;
+- the pre-execute approval gate now applies to background calls too, since
+  they run on the host.
+
+New config: `backgroundJobs` (default true), `jobPollMs` (500), `jobDir`
+(`/tmp`). New module `src/jobs.ts`; 7 unit tests plus 2 shim-wiring tests.
+
 ## 1.2.0 — 2026-10-19
 
 ### Changed — the SSH host picker is a host list, not a dropdown

@@ -162,12 +162,53 @@ describe('shim pass-through', () => {
       expect(res).toBe(LOCAL_RESULT)
       expect(passedThrough()).toBe(true)
     }
-    // run_in_background also passes through (no remote background jobs).
+  })
+
+  it('refuses a background bash call instead of running it on the local machine', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    // No job registry composed: the pre-1.3 behaviour was to pass the call
+    // through, which ran it LOCALLY while the session's workspace was remote.
+    const shim = makeShim(makeDeps(h))
     const { next, passedThrough } = makeNext()
-    const res = await shim.onExecute(execOf('bash', { command: 'ls', run_in_background: true }, root), next)
-    expect(res).toBe(LOCAL_RESULT)
-    expect(passedThrough()).toBe(true)
+    const res = await shim.onExecute(execOf('bash', { command: 'make test', run_in_background: true }, root), next)
+    expect(passedThrough()).toBe(false)
+    expect(res.isError).toBe(true)
+    expect(text(res)).toContain('background jobs are unavailable')
+    expect(text(res)).toContain('LOCAL machine')
     expect(h.pool.execCalls).toEqual([])
+  })
+
+  it('starts a background bash call as a REMOTE job when the registry is composed', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    const started: { kind: string; label: string; owner?: string }[] = []
+    const jobs = {
+      start(spec: {
+        kind: string
+        label: string
+        owner?: string
+        run(job: { id: string; append: () => void; updateProgress: () => void }): {
+          cancel: () => void
+          done: Promise<{ status: 'completed' | 'killed' | 'failed' }>
+        }
+      }): string {
+        started.push({ kind: spec.kind, label: spec.label, ...(spec.owner !== undefined ? { owner: spec.owner } : {}) })
+        spec.run({ id: 'bash-x1', append: () => undefined, updateProgress: () => undefined })
+        return 'bash-x1'
+      },
+    }
+    const shim = makeShim(makeDeps(h, { jobs, jobPollMs: 1000 }))
+    const { next, passedThrough } = makeNext()
+    const res = await shim.onExecute(execOf('bash', { command: 'make test', run_in_background: true }, root), next)
+    expect(passedThrough()).toBe(false)
+    expect(res.isError).toBe(false)
+    expect(res.value).toEqual({ kind: 'background', jobId: 'bash-x1', cwd: '/srv/app' })
+    expect(text(res)).toContain('job_output')
+    expect(started).toEqual([{ kind: 'bash', label: 'make test' }])
+    // The launch went to the host, not the local machine.
+    expect(h.pool.execCalls[0]?.alias).toBe('prod')
+    expect(h.pool.execCalls[0]?.command).toContain('setsid sh -c')
   })
 
   it('bash passes through when shimBash is false', async () => {

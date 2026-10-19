@@ -1,6 +1,7 @@
 import type { PreToolDecision, ToolDispatchExecution, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools';
 import type { Session } from './session.js';
 import type { ShellManagerLike } from './persistent-shell.js';
+import type { JobsRegistryLike } from './jobs.js';
 import type { HostTableLike, PoolLike } from './tools.js';
 /** The shim configuration after apply() normalization (schema defaults applied). */
 export interface ShimConfig {
@@ -11,6 +12,8 @@ export interface ShimConfig {
     maxOutputChars: number;
     /** Run the persistent-bash flavor on a long-lived remote shell (default true). */
     persistentShell?: boolean;
+    /** Run native background bash calls as remote jobs (default true). */
+    backgroundJobs?: boolean;
 }
 /**
  * Where the native read/write/edit/str_replace_editor/glob/grep/bash tools
@@ -73,6 +76,17 @@ export interface ShimDeps {
      * one-shot exec and the result says so.
      */
     shells?: ShellManagerLike;
+    /**
+     * The host job registry (`ctx.jobs`). A remote background bash call is
+     * registered here so the model collects it with the SAME job_output /
+     * job_kill tools as a local job. Absent → such a call is REFUSED rather than
+     * passed through, because passing it through runs it on the local machine.
+     */
+    jobs?: JobsRegistryLike;
+    /** Poll cadence for a remote job's log (default 500 ms). */
+    jobPollMs?: number;
+    /** Remote directory holding job logs (default /tmp). */
+    jobDir?: string;
 }
 /** The two middlewares apply() wires onto the tool pipeline. */
 export interface Shim {

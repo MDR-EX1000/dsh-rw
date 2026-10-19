@@ -19,6 +19,7 @@ import type { ShimConfig } from './shim.js'
 import { resolvePlaceholderDir } from './placeholder.js'
 import { SshPool } from './ssh-pool.js'
 import { PersistentShellManager } from './persistent-shell.js'
+import type { JobsRegistryLike } from './jobs.js'
 import { makeTools, statusText } from './tools.js'
 import type { HostTableLike, PoolLike, ToolsDeps } from './tools.js'
 
@@ -54,6 +55,12 @@ export const Config = z.object({
   persistentShell: z.boolean().default(true),
   /** Close a persistent shell after this many ms without a command (default 10 minutes). */
   persistentShellIdleMs: z.number().step(1).min(0).default(600000),
+  /** Run native background bash calls as REMOTE jobs registered with ctx.jobs (default true). Off → such a call is refused rather than run locally. */
+  backgroundJobs: z.boolean().default(true),
+  /** Poll cadence for a remote job's log (default 500 ms). */
+  jobPollMs: z.number().step(1).min(50).default(500),
+  /** Remote directory holding background-job logs (default /tmp). */
+  jobDir: z.string().default('/tmp'),
 })
 
 export interface Config {
@@ -70,6 +77,9 @@ export interface Config {
   /** Optional so hand-built test configs still typecheck (schema default: true). */
   persistentShell?: boolean
   persistentShellIdleMs?: number
+  backgroundJobs?: boolean
+  jobPollMs?: number
+  jobDir?: string
 }
 
 /**
@@ -230,7 +240,11 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     commandTimeoutMs: config.commandTimeoutMs,
     maxOutputChars: config.maxOutputChars,
     persistentShell: config.persistentShell ?? true,
+    backgroundJobs: config.backgroundJobs ?? true,
   }
+  // The host job registry is optional (no jobs plugin → no background jobs).
+  // Its absence is reported per call; it never falls back to running locally.
+  const jobs = ctx.get('jobs') as JobsRegistryLike | undefined
   const logShimConfig = (source: string): void => {
     console.log(
       `[dsh-rw] shim config resolved (${source}): shim=${String(shimSettings.shim)} ` +
@@ -346,6 +360,9 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       config: shimSettings,
       routing: nativeRouting,
       shells,
+      ...(jobs !== undefined ? { jobs } : {}),
+      jobPollMs: config.jobPollMs,
+      jobDir: config.jobDir,
       ...(overrides.placeholderBaseDir !== undefined ? { placeholderBaseDir: overrides.placeholderBaseDir } : {}),
       getTool: (toolName, agent) => ctx.tools.get(toolName, agent as Parameters<Context['tools']['get']>[1]),
       // Never-ask detection for the pre-execute gate; absent/legacy approval
