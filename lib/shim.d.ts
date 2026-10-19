@@ -1,5 +1,6 @@
 import type { PreToolDecision, ToolDispatchExecution, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools';
 import type { Session } from './session.js';
+import type { ShellManagerLike } from './persistent-shell.js';
 import type { HostTableLike, PoolLike } from './tools.js';
 /** The shim configuration after apply() normalization (schema defaults applied). */
 export interface ShimConfig {
@@ -8,6 +9,8 @@ export interface ShimConfig {
     shimBashApproval: 'ask' | 'native';
     commandTimeoutMs: number;
     maxOutputChars: number;
+    /** Run the persistent-bash flavor on a long-lived remote shell (default true). */
+    persistentShell?: boolean;
 }
 /**
  * Where the native read/write/edit/str_replace_editor/glob/grep/bash tools
@@ -27,8 +30,14 @@ export interface NativeRouting {
     /** The remote workspace active when the observation was made. */
     alias?: string;
     workspace?: string;
-    /** Placeholder directory the session must live in for native translation. */
+    /** Placeholder directory the translated call was rooted at. */
     placeholder?: string;
+    /**
+     * How the last translated call was anchored: its own path argument
+     * (`'path'` — works from any working directory) or the agent session cwd
+     * (`'cwd'` — the pre-1.0 rule). Absent in `local`/`unknown` mode.
+     */
+    reason?: 'cwd' | 'path';
 }
 /** A fresh, unobserved routing record (one per plugin load). */
 export declare function createNativeRouting(): NativeRouting;
@@ -58,6 +67,12 @@ export interface ShimDeps {
      * (no approval service) keeps the plain 'ask' behavior.
      */
     approvalPolicyOf?(session: unknown): string | undefined;
+    /**
+     * The persistent-shell manager (index.ts wires it to the pool). Undefined
+     * keeps the pre-1.0 behavior: the persistent-bash flavor degrades to a
+     * one-shot exec and the result says so.
+     */
+    shells?: ShellManagerLike;
 }
 /** The two middlewares apply() wires onto the tool pipeline. */
 export interface Shim {

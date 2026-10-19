@@ -31,6 +31,18 @@ export interface SftpLike {
     unlink(p: string): Promise<void>;
     rmdir(p: string): Promise<void>;
 }
+/**
+ * One open remote shell channel (see `SshPool.openShell`). Deliberately tiny:
+ * the persistent-shell layer owns framing, timeouts and lifecycle; the pool
+ * only guarantees a live connection and a bounded channel open.
+ */
+export interface RemoteShellChannel {
+    write(data: string): void;
+    onData(cb: (chunk: Buffer) => void): void;
+    onError(cb: (err: Error) => void): void;
+    onClose(cb: () => void): void;
+    close(): void;
+}
 export interface PoolOptions {
     hostKeyPolicy: 'accept-new' | 'strict' | 'off';
     knownHosts: KnownHosts;
@@ -81,6 +93,14 @@ export declare class SshPool {
      */
     private dropped;
     dispose(): void;
+    /**
+     * Open a long-lived remote shell channel (`bash --noprofile --norc`) on the
+     * pooled connection. The caller frames commands and owns the lifetime; the
+     * pool supplies a live connection and bounds the open with
+     * channelOpenTimeoutMs, exactly like `exec`. A dead connection surfaces as an
+     * RwError here too, so the caller reopens on its next use.
+     */
+    openShell(entry: HostEntry, command?: string): Promise<RemoteShellChannel>;
     /** Aliases with an established (ready) connection — for status display. */
     connected(): string[];
     private ensureConnected;

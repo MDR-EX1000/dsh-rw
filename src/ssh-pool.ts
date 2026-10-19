@@ -53,6 +53,19 @@ export interface SftpLike {
   rmdir(p: string): Promise<void>
 }
 
+/**
+ * One open remote shell channel (see `SshPool.openShell`). Deliberately tiny:
+ * the persistent-shell layer owns framing, timeouts and lifecycle; the pool
+ * only guarantees a live connection and a bounded channel open.
+ */
+export interface RemoteShellChannel {
+  write(data: string): void
+  onData(cb: (chunk: Buffer) => void): void
+  onError(cb: (err: Error) => void): void
+  onClose(cb: () => void): void
+  close(): void
+}
+
 export interface PoolOptions {
   hostKeyPolicy: 'accept-new' | 'strict' | 'off'
   knownHosts: KnownHosts
@@ -404,6 +417,61 @@ export class SshPool {
 
   dispose(): void {
     for (const alias of [...this.pool.keys()]) this.disconnect(alias)
+  }
+
+  /**
+   * Open a long-lived remote shell channel (`bash --noprofile --norc`) on the
+   * pooled connection. The caller frames commands and owns the lifetime; the
+   * pool supplies a live connection and bounds the open with
+   * channelOpenTimeoutMs, exactly like `exec`. A dead connection surfaces as an
+   * RwError here too, so the caller reopens on its next use.
+   */
+  async openShell(entry: HostEntry, command = 'bash --noprofile --norc'): Promise<RemoteShellChannel> {
+    const client = await this.ensureConnected(entry)
+    const openTimeoutMs = this.opts.channelOpenTimeoutMs ?? 10000
+    return await new Promise<RemoteShellChannel>((resolve, reject) => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new OpenTimeoutError())
+      }, openTimeoutMs)
+      client.exec(command, (err, stream) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (err) {
+          reject(new ChannelOpenError(mapConnectError(err)))
+          return
+        }
+        resolve({
+          write: (data: string) => {
+            stream.write(data)
+          },
+          onData: (cb: (chunk: Buffer) => void) => {
+            stream.on('data', cb)
+          },
+          onError: (cb: (err: Error) => void) => {
+            stream.on('error', cb)
+          },
+          onClose: (cb: () => void) => {
+            stream.once('close', cb)
+          },
+          close: () => {
+            try {
+              stream.end()
+            } catch {
+              // stream already ended
+            }
+            try {
+              stream.close()
+            } catch {
+              // stream already closed
+            }
+          },
+        })
+      })
+    })
   }
 
   /** Aliases with an established (ready) connection — for status display. */

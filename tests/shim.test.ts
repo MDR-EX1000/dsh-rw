@@ -423,25 +423,51 @@ describe('shim fs tools', () => {
 })
 
 describe('shim glob/grep', () => {
-  it('glob runs remote rg (find fallback) and maps results back to placeholder paths', async () => {
+  /** rg-branch stdout: the engine marker first, then the tool's own lines. */
+  const rgOut = (body: string): string => `__DSH_RW_ENGINE__=rg\n${body}`
+  const fallbackOut = (body: string): string => `__DSH_RW_ENGINE__=fallback\n${body}`
+
+  it('glob runs remote rg and maps results back to placeholder paths', async () => {
     const h = makeHarness()
     const root = connect(h)
-    h.pool.execQueue.push(execResult('README.md\nsrc/index.ts\n'))
+    h.pool.execQueue.push(execResult(rgOut('/srv/app/README.md\n/srv/app/src/index.ts\n')))
     const shim = makeShim(makeDeps(h))
 
     const res = await shim.onExecute(execOf('glob', { pattern: '*' }, root), makeNext().next)
     expect(res.isError).toBe(false)
     expect(text(res)).toBe(`${join(root, 'README.md')}\n${join(root, 'src', 'index.ts')}`)
     expect(h.pool.execCalls.length).toBe(1)
-    expect(h.pool.execCalls[0]!.command).toContain(`rg --files -g '*'`)
-    expect(h.pool.execCalls[0]!.command).toContain('find . -type f')
     expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app')
+  })
+
+  it('glob mirrors the native ripgrep semantics and keeps the find fallback labelled', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    h.pool.execQueue.push(execResult(rgOut('')))
+    const shim = makeShim(makeDeps(h))
+
+    await shim.onExecute(execOf('glob', { pattern: '*.ts' }, root), makeNext().next)
+    const command = h.pool.execCalls[0]!.command
+    // The native argv: sorted, ignoring .gitignore, including hidden files, VCS dirs pruned.
+    expect(command).toContain('rg --files')
+    expect(command).toContain('--sort=modified')
+    expect(command).toContain('--no-ignore')
+    expect(command).toContain('--hidden')
+    expect(command).toContain(`--glob=!**/.git`)
+    expect(command).toContain(`-- '/srv/app'`)
+    expect(command).toContain(`find '/srv/app' -type f -name '*.ts'`)
+
+    // A host without ripgrep says so, instead of silently returning find semantics.
+    h.pool.execQueue.push(execResult(fallbackOut('/srv/app/src/index.ts\n')))
+    const fallback = await shim.onExecute(execOf('glob', { pattern: '*.ts' }, root), makeNext().next)
+    expect(text(fallback)).toContain(join(root, 'src', 'index.ts'))
+    expect(text(fallback)).toContain('ripgrep is not installed')
   })
 
   it('glob with an explicit path searches there; a path outside the placeholder passes through', async () => {
     const h = makeHarness()
     const root = connect(h)
-    h.pool.execQueue.push(execResult('./index.ts\n'))
+    h.pool.execQueue.push(execResult(rgOut('/srv/app/src/index.ts\n')))
     const shim = makeShim(makeDeps(h))
 
     const res = await shim.onExecute(execOf('glob', { pattern: '*.ts', path: join(root, 'src') }, root), makeNext().next)
@@ -458,7 +484,7 @@ describe('shim glob/grep', () => {
   it('glob returns the native schema-shaped value the registry validates against', async () => {
     const h = makeHarness()
     const root = connect(h)
-    h.pool.execQueue.push(execResult('README.md\nsrc/index.ts\n'))
+    h.pool.execQueue.push(execResult(rgOut('/srv/app/README.md\n/srv/app/src/index.ts\n')))
     const shim = makeShim(makeDeps(h))
     const res = await shim.onExecute(execOf('glob', { pattern: '*' }, root), makeNext().next)
     expect(res.isError).toBe(false)
@@ -468,10 +494,18 @@ describe('shim glob/grep', () => {
     })
   })
 
-  it('grep maps match paths back to placeholder paths, grouped by file', async () => {
+  it('grep parses rg --json, maps paths back to placeholders, and groups by file', async () => {
     const h = makeHarness()
     const root = connect(h)
-    h.pool.execQueue.push(execResult('/srv/app/src/index.ts:1:export {}\n/srv/app/README.md:2:line2\n'))
+    h.pool.execQueue.push(
+      execResult(
+        rgOut(
+          '{"type":"begin","data":{"path":{"text":"/srv/app/src/index.ts"}}}\n' +
+            '{"type":"match","data":{"path":{"text":"/srv/app/src/index.ts"},"line_number":1,"lines":{"text":"export {}\\n"}}}\n' +
+            '{"type":"match","data":{"path":{"text":"/srv/app/README.md"},"line_number":2,"lines":{"text":"line2\\n"}}}\n',
+        ),
+      ),
+    )
     const shim = makeShim(makeDeps(h))
 
     const res = await shim.onExecute(execOf('grep', { pattern: 'e', path: root }, root), makeNext().next)
@@ -479,18 +513,51 @@ describe('shim glob/grep', () => {
     expect(text(res)).toBe(
       `Found 2 matches\n\n${join(root, 'src', 'index.ts')}\nLine 1: export {}\n\n${join(root, 'README.md')}\nLine 2: line2`,
     )
-    expect(h.pool.execCalls[0]!.command).toContain('rg --line-number --with-filename -e')
-    expect(h.pool.execCalls[0]!.command).toContain(`grep -rnE -e 'e' '/srv/app'`)
+    expect(h.pool.execCalls[0]!.command).toContain('rg --json --regexp=')
+    expect(h.pool.execCalls[0]!.command).toContain(`grep -rnI -E -e 'e' -- '/srv/app'`)
 
-    h.pool.execQueue.push(execResult('', { code: 1 }))
+    h.pool.execQueue.push(execResult(rgOut(''), { code: 1 }))
     const none = await shim.onExecute(execOf('grep', { pattern: 'zzz', path: root }, root), makeNext().next)
     expect(text(none)).toBe('No matches found')
+  })
+
+  it('grep keeps a colon-bearing path intact (rg --json transport, not colon splitting)', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    // A path that would be mis-split by a `path:line:text` parser.
+    h.pool.execQueue.push(
+      execResult(
+        rgOut(
+          '{"type":"match","data":{"path":{"text":"/srv/app/a:1:b.ts"},"line_number":7,"lines":{"text":"hit\\n"}}}\n',
+        ),
+      ),
+    )
+    const shim = makeShim(makeDeps(h))
+    const res = await shim.onExecute(execOf('grep', { pattern: 'hit', path: root }, root), makeNext().next)
+    expect(res.value).toEqual({ matches: [{ path: join(root, 'a:1:b.ts'), lineNumber: 7, line: 'hit' }] })
+  })
+
+  it('grep labels the grep fallback so differing ignore rules are never silent', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    h.pool.execQueue.push(execResult(fallbackOut('/srv/app/README.md:2:line2\n')))
+    const shim = makeShim(makeDeps(h))
+    const res = await shim.onExecute(execOf('grep', { pattern: 'line', path: root }, root), makeNext().next)
+    expect(text(res)).toContain(`Line 2: line2`)
+    expect(text(res)).toContain('ripgrep is not installed')
   })
 
   it('grep returns the native schema-shaped value the registry validates against', async () => {
     const h = makeHarness()
     const root = connect(h)
-    h.pool.execQueue.push(execResult('/srv/app/src/index.ts:1:export {}\n/srv/app/README.md:2:line2\n'))
+    h.pool.execQueue.push(
+      execResult(
+        rgOut(
+          '{"type":"match","data":{"path":{"text":"/srv/app/src/index.ts"},"line_number":1,"lines":{"text":"export {}\\n"}}}\n' +
+            '{"type":"match","data":{"path":{"text":"/srv/app/README.md"},"line_number":2,"lines":{"text":"line2\\n"}}}\n',
+        ),
+      ),
+    )
     const shim = makeShim(makeDeps(h))
     const res = await shim.onExecute(execOf('grep', { pattern: 'e', path: root }, root), makeNext().next)
     expect(res.isError).toBe(false)
@@ -1104,7 +1171,8 @@ describe('shim wiring in apply', () => {
       await executeListener()(execOf('read', { file_path: 'local.txt' }, localDir), first.next)
       expect(first.passedThrough()).toBe(true)
       expect(warn).toHaveBeenCalledTimes(1)
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('native tools are running LOCALLY'))
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('ran LOCALLY'))
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('placeholder path ARE translated from any'))
 
       const local = getSection()!.text()
       expect(local).toContain('WARNING')
@@ -1131,5 +1199,125 @@ describe('shim wiring in apply', () => {
       await executeListener()(execOf('read', { file_path: 'local.txt' }, dir), makeNext().next)
       expect(getSection()!.text()).toContain('No remote workspace is active')
     })
+
+    it('a path-anchored call from a local cwd reports remote (by path) in the prompt', async () => {
+      const { ctx, executeListener, getSection } = makeCtx()
+      const h = makeHarness()
+      const root = connect(h)
+      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+
+      // The session cwd is a plain local directory; only the call's own path
+      // points into the placeholder.
+      const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, dir), makeNext().next)
+      expect(text(res)).toContain('line1')
+
+      const section = getSection()!.text()
+      expect(section).toContain('remote-backed')
+      expect(section).toContain('translated to the remote host automatically')
+      expect(section).toContain('any working directory')
+      expect(section).not.toContain('WARNING')
+    })
+  })
+})
+
+describe('shim path-anchored target', () => {
+  it('translates a file call that names a placeholder path from a local working directory', async () => {
+    const h = makeHarness()
+    const root = connect(h) // remote workspace recorded: prod:/srv/app
+    const shim = makeShim(makeDeps(h))
+    const localDir = dir // a real local directory, outside every placeholder
+
+    const read = makeNext()
+    const res = await shim.onExecute(execOf('read', { file_path: join(root, 'README.md') }, localDir), read.next)
+    expect(read.passedThrough()).toBe(false)
+    expect(text(res)).toContain('line1')
+    expect(text(res)).toContain(join(root, 'README.md'))
+    expect(h.pool.connectedAliases.has('prod')).toBe(true)
+  })
+
+  it('writes and edits by placeholder path from a local working directory', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    const shim = makeShim(makeDeps(h))
+    const localDir = dir
+
+    const w = makeNext()
+    await shim.onExecute(execOf('write', { file_path: join(root, 'src', 'new.ts'), content: 'x=1\n' }, localDir), w.next)
+    expect(w.passedThrough()).toBe(false)
+    expect(h.pool.fs.fileContent('/srv/app/src/new.ts')).toBe('x=1\n')
+
+    const e = makeNext()
+    await shim.onExecute(
+      execOf('edit', { file_path: join(root, 'README.md'), old_string: 'line1', new_string: 'LINE1' }, localDir),
+      e.next,
+    )
+    expect(e.passedThrough()).toBe(false)
+    expect(h.pool.fs.fileContent('/srv/app/README.md')).toContain('LINE1')
+  })
+
+  it('translates grep/glob that carry a placeholder path from a local working directory', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    const shim = makeShim(makeDeps(h))
+    const localDir = dir
+
+    h.pool.execQueue.push(execResult('/srv/app/README.md:1:line1\n'))
+    const g = makeNext()
+    await shim.onExecute(execOf('grep', { pattern: 'line', path: join(root, 'src') }, localDir), g.next)
+    expect(g.passedThrough()).toBe(false)
+    expect(h.pool.execCalls.length).toBe(1)
+    expect(h.pool.execCalls[0]!.command).toContain('rg ')
+    expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app/src')
+
+    h.pool.execQueue.push(execResult('a.ts\n'))
+    const gl = makeNext()
+    await shim.onExecute(execOf('glob', { pattern: '*.ts', path: join(root, 'src') }, localDir), gl.next)
+    expect(gl.passedThrough()).toBe(false)
+    expect(h.pool.execCalls.length).toBe(2)
+    expect(h.pool.execCalls[1]!.opts?.cwd).toBe('/srv/app/src')
+  })
+
+  it('does not path-anchor bash: a command naming a placeholder path still runs locally', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    const shim = makeShim(makeDeps(h))
+    const bash = makeNext()
+    const res = await shim.onExecute(execOf('bash', { command: `ls ${root}`, description: 'list' }, dir), bash.next)
+    expect(res).toBe(LOCAL_RESULT)
+    expect(bash.passedThrough()).toBe(true)
+    expect(h.pool.execCalls).toEqual([])
+  })
+
+  it('fails loud when the anchored placeholder host is gone (never the local stand-in)', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    const shim = makeShim(makeDeps(h))
+    h.hosts.entries.length = 0 // the host was removed from the config
+
+    const read = makeNext()
+    const res = await shim.onExecute(execOf('read', { file_path: join(root, 'README.md') }, dir), read.next)
+    expect(read.passedThrough()).toBe(false)
+    expect(res.isError).toBe(true)
+    expect(text(res)).toContain('no longer configured')
+  })
+
+  it('a path outside every placeholder still runs locally', async () => {
+    const h = makeHarness()
+    connect(h)
+    const shim = makeShim(makeDeps(h))
+    const read = makeNext()
+    const res = await shim.onExecute(execOf('read', { file_path: join(dir, 'local.txt') }, dir), read.next)
+    expect(res).toBe(LOCAL_RESULT)
+    expect(read.passedThrough()).toBe(true)
+  })
+
+  it('resolves a relative path against the agent cwd before anchoring', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    const shim = makeShim(makeDeps(h))
+    const read = makeNext()
+    const res = await shim.onExecute(execOf('read', { file_path: 'index.ts' }, join(root, 'src')), read.next)
+    expect(read.passedThrough()).toBe(false)
+    expect(text(res)).toContain('export {}')
   })
 })

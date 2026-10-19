@@ -158,7 +158,7 @@ async function callLocalPick(routes: CapturedRoute[]): Promise<{ status: number;
 }
 
 describe('apply', () => {
-  it('registers the twelve rw_* tools, the six routes, and the /rw command', () => {
+  it('registers the sixteen rw_* tools, the six routes, and the /rw command', () => {
     const { ctx, tools, routes, commands, effectLabels } = makeCtx()
     apply(ctx as unknown as Context, CONFIG, makeOverrides())
 
@@ -174,6 +174,10 @@ describe('apply', () => {
       'rw_move',
       'rw_delete',
       'rw_exec',
+      'rw_exec_many',
+      'rw_watch',
+      'rw_diff',
+      'rw_apply_patch',
       'rw_disconnect',
     ])
     expect(routes.map((r) => r.path)).toEqual([
@@ -296,7 +300,7 @@ describe('apply', () => {
     const { ctx, tools, routes, commands, effectDisposers, getSection } = makeCtx()
     const overrides = makeOverrides()
     apply(ctx as unknown as Context, CONFIG, overrides)
-    expect(tools.length).toBe(12)
+    expect(tools.length).toBe(16)
     expect(routes.length).toBe(6)
 
     for (const dispose of effectDisposers) dispose()

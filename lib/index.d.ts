@@ -25,6 +25,10 @@ export declare const Config: z<Schemastery.ObjectS<{
     shimBash: z<boolean, boolean>;
     /** Shimmed bash approval: 'ask' escalates to the DSH approval dialog, 'native' defers to the native policy. */
     shimBashApproval: z<"ask" | "native", "ask" | "native">;
+    /** Run the persistent-bash flavor on one long-lived remote shell per (host, workspace) instead of a fresh one-shot exec. Default true. */
+    persistentShell: z<boolean, boolean>;
+    /** Close a persistent shell after this many ms without a command (default 10 minutes). */
+    persistentShellIdleMs: z<number, number>;
 }>, Schemastery.ObjectT<{
     /** Host key policy: verify against ~/.ssh/known_hosts (accept-new learns on first connect). */
     hostKeyPolicy: z<string, string>;
@@ -44,6 +48,10 @@ export declare const Config: z<Schemastery.ObjectS<{
     shimBash: z<boolean, boolean>;
     /** Shimmed bash approval: 'ask' escalates to the DSH approval dialog, 'native' defers to the native policy. */
     shimBashApproval: z<"ask" | "native", "ask" | "native">;
+    /** Run the persistent-bash flavor on one long-lived remote shell per (host, workspace) instead of a fresh one-shot exec. Default true. */
+    persistentShell: z<boolean, boolean>;
+    /** Close a persistent shell after this many ms without a command (default 10 minutes). */
+    persistentShellIdleMs: z<number, number>;
 }>>;
 export interface Config {
     hostKeyPolicy: HostKeyPolicy;
@@ -56,6 +64,9 @@ export interface Config {
     shim?: boolean;
     shimBash?: boolean;
     shimBashApproval?: 'ask' | 'native';
+    /** Optional so hand-built test configs still typecheck (schema default: true). */
+    persistentShell?: boolean;
+    persistentShellIdleMs?: number;
 }
 /**
  * Test seams for apply(): the DSH loader calls apply(ctx, config); tests pass

@@ -2,10 +2,10 @@
 
 How dsh-rw is verified before a release, and the current status of each item.
 
-## 1. Unit tests — 285/285 PASS
+## 1. Unit tests — 494/494 PASS
 
 ```bash
-pnpm test        # vitest run, 13 files / 285 tests
+pnpm test        # vitest run, 18 files / 494 tests
 pnpm typecheck   # tsc --noEmit
 ```
 
@@ -56,6 +56,32 @@ Last run (2026-08-21, dsh-rw 0.3.0 + fix):
 | ------- | -------- |
 | freedom | 8/8 PASS |
 | docker  | 8/8 PASS |
+
+## 2c. Live 1.0 capability check — PASS
+
+`scripts/live-v1.mjs` consumes the compiled `lib/` and exercises the 1.0
+primitives against two real hosts: persistent shell state across calls, exit
+code propagation, multi-host fan-out, `rw_watch` baseline + added-file
+detection, unified diff generation, workspace-confined patch targets, a real
+`patch -p1` application, patch-escape rejection, and the optimistic-write hash
+gate. It only writes inside the `/tmp/dsh-rw-v1.*` directory it is given.
+
+```bash
+node scripts/live-v1.mjs <aliasA> <aliasB> /tmp/dsh-rw-v1.XXXX
+```
+
+Last run (2026-10-19, dsh-rw 1.0.0):
+
+| hosts          | result     |
+| -------------- | ---------- |
+| docker+freedom | 12/12 PASS |
+
+## 2d. Live acceptance re-run for 1.0.0 — PASS
+
+| host   | script            | result     |
+| ------ | ----------------- | ---------- |
+| docker | `acceptance.mjs`  | 23/23 PASS |
+| docker | `live-shim.mjs`   | 8/8 PASS   |
 
 ## 3. Web UI manual checks — pending human confirmation
 

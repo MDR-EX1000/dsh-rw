@@ -2,9 +2,13 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
 import { RwError } from '../src/errors.js'
 import { ensurePlaceholder, readPlaceholderMeta } from '../src/placeholder.js'
 import { makeTools, statusText } from '../src/tools.js'
+import type { PoolLike } from '../src/tools.js'
+import type { ExecResult, SftpLike } from '../src/ssh-pool.js'
+import type { HostEntry } from '../src/hosts.js'
 import { ENTRY_PROD, makeHarness, SECRET_PASSWORD } from './p4-fakes.js'
 import type { FakeHarness } from './p4-fakes.js'
 
@@ -13,6 +17,45 @@ interface TestTool {
   name: string
   description: string
   execute(args?: Record<string, unknown>): Promise<{ text: string }>
+}
+
+/**
+ * A PoolLike that tracks how many calls are in flight at once and can refuse
+ * specific aliases — the two properties rw_exec_many must guarantee (parallel
+ * execution, per-host failure isolation) that FakePool cannot demonstrate.
+ */
+class TrackingPool implements PoolLike {
+  maxInFlight = 0
+  private inFlight = 0
+  readonly calls: string[] = []
+
+  constructor(private readonly refuse: readonly string[] = []) {}
+
+  async exec(entry: HostEntry, command: string): Promise<ExecResult> {
+    this.calls.push(`${entry.alias}:${command}`)
+    this.inFlight += 1
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    this.inFlight -= 1
+    if (this.refuse.includes(entry.alias)) throw new RwError('NOT_CONNECTED', `${entry.alias} unreachable`)
+    return { code: 0, signal: null, stdout: `${entry.alias}:ok\n`, stderr: '', timedOut: false }
+  }
+
+  async sftp(): Promise<SftpLike> {
+    throw new Error('sftp not used by rw_exec_many')
+  }
+
+  async testConnect(): Promise<number> {
+    return 1
+  }
+
+  disconnect(): void {}
+
+  connected(): string[] {
+    return []
+  }
+
+  dispose(): void {}
 }
 
 const EXPECTED_NAMES = [
@@ -27,6 +70,10 @@ const EXPECTED_NAMES = [
   'rw_move',
   'rw_delete',
   'rw_exec',
+  'rw_exec_many',
+  'rw_watch',
+  'rw_diff',
+  'rw_apply_patch',
   'rw_disconnect',
 ]
 
@@ -66,7 +113,7 @@ async function expectToolError(p: Promise<unknown>, code: string): Promise<Error
 }
 
 describe('makeTools shape', () => {
-  it('registers exactly the twelve rw_* tools in fixed order', () => {
+  it('registers exactly the sixteen rw_* tools in fixed order', () => {
     expect([...tools.keys()]).toEqual(EXPECTED_NAMES)
   })
 
@@ -349,6 +396,260 @@ describe('rw_exec', () => {
     await expectToolError(tool('rw_exec').execute({ command: '   ' }), 'INVALID_INPUT')
     harness.pool.execError = new RwError('NOT_CONNECTED', 'connection to prod closed before ready')
     await expectToolError(tool('rw_exec').execute({ command: 'ls' }), 'NOT_CONNECTED')
+  })
+})
+
+describe('rw_exec_many', () => {
+  it('fans one command out to several hosts, one section per host, in input order', async () => {
+    harness.connect()
+    harness.pool.execQueue.push(
+      { code: 0, signal: null, stdout: 'docker-ok\n', stderr: '', timedOut: false },
+      { code: 0, signal: null, stdout: 'dev-ok\n', stderr: '', timedOut: false },
+    )
+    const { text } = await tool('rw_exec_many').execute({ command: 'uname -a', hosts: ['prod', 'dev'] })
+    expect(harness.pool.execCalls.map((c) => c.alias)).toEqual(['prod', 'dev'])
+    // The current host runs in its workspace; every other host uses the SSH default dir.
+    expect(harness.pool.execCalls[0]?.opts?.cwd).toBe('/srv/app')
+    expect(harness.pool.execCalls[1]?.opts?.cwd).toBeUndefined()
+    expect(text).toContain('rw_exec_many: 2/2 succeeded')
+    expect(text).toContain('--- [1] prod (exit 0) ---')
+    expect(text).toContain('--- [2] dev (exit 0) ---')
+    expect(text).toContain('docker-ok')
+    expect(text).toContain('dev-ok')
+  })
+
+  it('honors per-call alias, cwd and timeout, and keeps a failure in its own section', async () => {
+    harness.connect()
+    harness.pool.execQueue.push(
+      { code: 0, signal: null, stdout: 'ok\n', stderr: '', timedOut: false },
+      { code: 2, signal: null, stdout: '', stderr: 'boom\n', timedOut: false },
+    )
+    const { text } = await tool('rw_exec_many').execute({
+      calls: [
+        { command: 'ls', cwd: '/tmp', timeoutMs: 1234 },
+        { alias: 'dev', command: 'false' },
+      ],
+    })
+    expect(harness.pool.execCalls[0]?.opts).toEqual({ cwd: '/tmp', timeoutMs: 1234 })
+    expect(harness.pool.execCalls[1]?.alias).toBe('dev')
+    expect(text).toContain('1/2 succeeded')
+    expect(text).toContain('--- [2] dev (exit 2) ---')
+    expect(text).toContain('stderr:\nboom')
+  })
+
+  it('runs in parallel up to the limit and isolates an unreachable host', async () => {
+    harness.connect()
+    const pool = new TrackingPool(['dev'])
+    const localTools = new Map(
+      (makeTools({ ...harness.deps, pool }) as unknown as TestTool[]).map((t) => [t.name, t]),
+    )
+    const { text } = await localTools.get('rw_exec_many')!.execute({
+      command: 'true',
+      hosts: ['prod', 'dev', 'prod'],
+      concurrency: 3,
+    })
+    expect(pool.maxInFlight).toBeGreaterThan(1) // actually parallel …
+    expect(pool.maxInFlight).toBeLessThanOrEqual(3) // … but never above the limit
+    expect(text).toContain('2/3 succeeded')
+    expect(text).toContain('--- [2] dev (not reached) ---')
+    expect(text).toContain('unreachable')
+    expect(text).toContain('prod:ok')
+  })
+
+  it('defaults the alias to the current host and requires a connection when it is absent', async () => {
+    await expectToolError(tool('rw_exec_many').execute({ calls: [{ command: 'ls' }] }), 'NOT_CONNECTED')
+  })
+
+  it('rejects ambiguous, empty and oversized inputs before touching a host', async () => {
+    harness.connect()
+    await expectToolError(
+      tool('rw_exec_many').execute({ calls: [{ command: 'ls' }], command: 'ls', hosts: ['prod'] }),
+      'INVALID_INPUT',
+    )
+    await expectToolError(tool('rw_exec_many').execute({ calls: [] }), 'INVALID_INPUT')
+    await expectToolError(tool('rw_exec_many').execute({ command: '   ', hosts: ['prod'] }), 'INVALID_INPUT')
+    await expectToolError(tool('rw_exec_many').execute({ command: 'ls', hosts: [] }), 'INVALID_INPUT')
+    await expectToolError(tool('rw_exec_many').execute({ calls: [{ command: '   ' }] }), 'INVALID_INPUT')
+    await expectToolError(
+      tool('rw_exec_many').execute({ calls: Array.from({ length: 33 }, () => ({ command: 'ls' })) }),
+      'INVALID_INPUT',
+    )
+    expect(harness.pool.execCalls).toEqual([])
+  })
+
+  it('rejects an unknown alias before any host runs', async () => {
+    harness.connect()
+    await expectToolError(
+      tool('rw_exec_many').execute({ calls: [{ command: 'ls' }, { alias: 'nope', command: 'ls' }] }),
+      'INVALID_INPUT',
+    )
+    expect(harness.pool.execCalls).toEqual([])
+  })
+})
+
+describe('rw_write_file optimistic write', () => {
+  const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex')
+
+  it('writes when ifHash matches the current content', async () => {
+    harness.connect()
+    const current = harness.pool.fs.fileContent('/srv/app/README.md') ?? ''
+    const { text } = await tool('rw_write_file').execute({ path: 'README.md', content: 'next\n', ifHash: sha256(current) })
+    expect(text).toContain('wrote')
+    expect(harness.pool.fs.fileContent('/srv/app/README.md')).toBe('next\n')
+  })
+
+  it('refuses a write when the remote content moved on', async () => {
+    harness.connect()
+    await expectToolError(
+      tool('rw_write_file').execute({ path: 'README.md', content: 'next\n', ifHash: sha256('stale') }),
+      'RW_WRITE_CONFLICT',
+    )
+    expect(harness.pool.fs.fileContent('/srv/app/README.md')).toBe('line1\nline2\nline3\n')
+  })
+
+  it('honours ifHash: "absent" for create-only and existing-file cases', async () => {
+    harness.connect()
+    const created = await tool('rw_write_file').execute({ path: 'fresh.txt', content: 'x\n', ifHash: 'absent' })
+    expect(created.text).toContain('wrote')
+    await expectToolError(
+      tool('rw_write_file').execute({ path: 'fresh.txt', content: 'y\n', ifHash: 'absent' }),
+      'RW_WRITE_CONFLICT',
+    )
+    expect(harness.pool.fs.fileContent('/srv/app/fresh.txt')).toBe('x\n')
+  })
+})
+
+describe('rw_watch', () => {
+  it('lists an empty registry', async () => {
+    const { text } = await tool('rw_watch').execute({ action: 'list' })
+    expect(text).toContain('no watchers')
+  })
+
+  it('establishes a baseline, then reports added / changed / removed since the last poll', async () => {
+    harness.connect()
+    const start = await tool('rw_watch').execute({ action: 'start', name: 'app' })
+    expect(start.text).toContain('baseline of 2 entries')
+
+    // No change yet.
+    const quiet = await tool('rw_watch').execute({ action: 'poll', name: 'app' })
+    expect(quiet.text).toContain('0 change(s)')
+
+    // Mutate the fake remote: one added, one changed (new mtime), one removed.
+    harness.pool.fs.addFile('/srv/app/src/new.ts', 'x\n', 99)
+    harness.pool.fs.addFile('/srv/app/README.md', 'line1\nline2\nline3\n', 99)
+    harness.pool.fs.nodes.delete('/srv/app/src/index.ts')
+
+    const poll = await tool('rw_watch').execute({ action: 'poll', name: 'app' })
+    expect(poll.text).toMatch(/added\s+src\/new\.ts/)
+    expect(poll.text).toMatch(/changed\s+README\.md/)
+    expect(poll.text).toMatch(/removed\s+src\/index\.ts/)
+    expect(poll.text).toContain('3 change(s)')
+  })
+
+  it('honours an include filter and a workspace-relative path', async () => {
+    harness.connect()
+    const start = await tool('rw_watch').execute({ action: 'start', name: 'ts', path: 'src', include: '*.ts' })
+    expect(start.text).toContain('baseline of 1 entries')
+
+    harness.pool.fs.addFile('/srv/app/src/notes.md', 'x\n', 99)
+    harness.pool.fs.addFile('/srv/app/src/more.ts', 'x\n', 99)
+    const poll = await tool('rw_watch').execute({ action: 'poll', name: 'ts' })
+    expect(poll.text).toContain('more.ts')
+    expect(poll.text).not.toContain('notes.md')
+  })
+
+  it('lists and stops watchers', async () => {
+    harness.connect()
+    await tool('rw_watch').execute({ action: 'start', name: 'one' })
+    const list = await tool('rw_watch').execute({ action: 'list' })
+    expect(list.text).toContain('one: /srv/app')
+    const stop = await tool('rw_watch').execute({ action: 'stop', name: 'one' })
+    expect(stop.text).toContain("stopped watcher 'one'")
+    expect((await tool('rw_watch').execute({ action: 'stop', name: 'one' })).text).toContain('no watcher named')
+  })
+
+  it('requires a connection and a workspace, and confines the path', async () => {
+    await expectToolError(tool('rw_watch').execute({ action: 'start' }), 'NOT_CONNECTED')
+    harness.session.set({ alias: 'prod' }) // connected, workspace not picked yet
+    await expectToolError(tool('rw_watch').execute({ action: 'start' }), 'NO_WORKSPACE')
+    harness.connect()
+    await expectToolError(tool('rw_watch').execute({ action: 'start', path: '../escape' }), 'OUTSIDE_WORKSPACE')
+    await expectToolError(tool('rw_watch').execute({ action: 'poll', name: 'nope' }), 'INVALID_INPUT')
+  })
+})
+
+describe('rw_diff', () => {
+  it('reports no differences for identical content', async () => {
+    harness.connect()
+    const { text } = await tool('rw_diff').execute({ path: 'README.md', content: 'line1\nline2\nline3\n' })
+    expect(text).toContain('no differences')
+  })
+
+  it('diffs against supplied content with unified headers and hunks', async () => {
+    harness.connect()
+    const { text } = await tool('rw_diff').execute({ path: 'README.md', content: 'line1\nCHANGED\nline3\n' })
+    expect(text).toContain('--- a/README.md')
+    expect(text).toContain('+++ b/README.md')
+    expect(text).toContain('-line2')
+    expect(text).toContain('+CHANGED')
+  })
+
+  it('diffs against another remote file', async () => {
+    harness.connect()
+    const { text } = await tool('rw_diff').execute({ path: 'README.md', against: 'src/index.ts' })
+    expect(text).toContain('--- a/README.md')
+    expect(text).toContain('+export {}')
+  })
+
+  it('rejects binary content, missing/ambiguous after-sides, and paths outside the workspace', async () => {
+    harness.connect()
+    harness.pool.fs.addFile('/srv/app/blob.bin', Buffer.from([0, 1, 2, 0]))
+    await expectToolError(tool('rw_diff').execute({ path: 'blob.bin', content: 'x' }), 'INVALID_INPUT')
+    await expectToolError(tool('rw_diff').execute({ path: 'README.md' }), 'INVALID_INPUT')
+    await expectToolError(tool('rw_diff').execute({ path: 'README.md', content: 'a', against: 'src/index.ts' }), 'INVALID_INPUT')
+    await expectToolError(tool('rw_diff').execute({ path: '/etc/passwd', content: 'a' }), 'OUTSIDE_WORKSPACE')
+  })
+})
+
+describe('rw_apply_patch', () => {
+  const PATCH = ['--- a/src/index.ts', '+++ b/src/index.ts', '@@ -1 +1 @@', '-export {}', '+export const x = 1', ''].join('\n')
+
+  it('dry-runs by default-check and reports the validated targets without applying', async () => {
+    harness.connect()
+    const { text } = await tool('rw_apply_patch').execute({ patch: PATCH, dryRun: true })
+    expect(text).toContain('applies cleanly to 1 file(s)')
+    expect(text).toContain('/srv/app/src/index.ts')
+    expect(harness.pool.execCalls.length).toBe(1)
+    expect(harness.pool.execCalls[0]?.command).toContain('patch -p1 --dry-run -i')
+    expect(harness.pool.execCalls[0]?.opts?.cwd).toBe('/srv/app')
+  })
+
+  it('applies after a clean dry run and removes the staged patch file', async () => {
+    harness.connect()
+    const { text } = await tool('rw_apply_patch').execute({ patch: PATCH })
+    expect(text).toContain('applied patch to 1 file(s)')
+    expect(harness.pool.execCalls.map((c) => c.command.includes('--dry-run'))).toEqual([true, false])
+    // No staged .dsh-rw-patch-* file survives the call.
+    expect([...harness.pool.fs.nodes.keys()].filter((k) => k.includes('.dsh-rw-patch-'))).toEqual([])
+  })
+
+  it('rejects a patch that escapes the workspace before running anything', async () => {
+    harness.connect()
+    const escaping = ['--- a/../../etc/passwd', '+++ b/../../etc/passwd', '@@ -1 +1 @@', '-a', '+b', ''].join('\n')
+    await expectToolError(tool('rw_apply_patch').execute({ patch: escaping }), 'INVALID_INPUT')
+    expect(harness.pool.execCalls).toEqual([])
+  })
+
+  it('surfaces a failed dry run and does not apply', async () => {
+    harness.connect()
+    harness.pool.execQueue.push({ code: 1, signal: null, stdout: '', stderr: 'hunk FAILED', timedOut: false })
+    await expectToolError(tool('rw_apply_patch').execute({ patch: PATCH }), 'INVALID_INPUT')
+    expect(harness.pool.execCalls.length).toBe(1)
+  })
+
+  it('rejects an empty patch', async () => {
+    harness.connect()
+    await expectToolError(tool('rw_apply_patch').execute({ patch: '   ' }), 'INVALID_INPUT')
   })
 })
 

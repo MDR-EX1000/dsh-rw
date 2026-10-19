@@ -11,15 +11,19 @@
 // toRwError and rethrown as `Error("[CODE] message")` — RwError messages do
 // not carry their code, and the agent needs the code to classify failures.
 // Messages must never contain passwords, key material, or passphrases.
+import { createHash, randomBytes } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError, toRwError } from './errors.js'
-import { normalizeRemote, expandRemoteHome } from './guard.js'
+import { normalizeRemote, expandRemoteHome, resolveInWorkspace, assertRealpathInside, shq } from './guard.js'
 import type { HostEntry, HostSummary } from './hosts.js'
 import { ensurePlaceholder, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { NativeRouting } from './shim.js'
-import type { ExecResult, SftpLike } from './ssh-pool.js'
+import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js'
+import { applyUnifiedDiff, looksBinary, patchTargets, unifiedDiff } from './patch.js'
+import { WatchManager } from './watch.js'
+import type { WatchFs, WatchSnapshotResult } from './watch.js'
 
 /**
  * Structural subset of HostTable consumed by the tools/routes. HostTable has
@@ -48,6 +52,12 @@ export interface HostTableLike {
 export interface PoolLike {
   exec(entry: HostEntry, command: string, opts?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult>
   sftp(entry: HostEntry): Promise<SftpLike>
+  /**
+   * Open a long-lived shell channel. Optional so structural test doubles stay
+   * valid; the persistent-shell manager reports a clear error when a pool
+   * cannot provide one.
+   */
+  openShell?(entry: HostEntry): Promise<RemoteShellChannel>
   testConnect(entry: HostEntry): Promise<number>
   disconnect(alias: string): void
   connected(): string[]
@@ -169,12 +179,19 @@ function nativeRoutingLine(deps: ToolsDeps, placeholderDir: string | null): stri
   const routing = deps.routing
   const where = routing?.placeholder ?? placeholderDir ?? 'the placeholder directory'
   if (routing?.mode === 'remote') {
+    if (routing.reason === 'path') {
+      return (
+        `Native tools: remote (by path) — the last translated call named a path inside ${where}, which works ` +
+        "from any working directory; bash and pathless glob/grep still need this session's cwd inside it"
+      )
+    }
     return `Native tools: remote — this session's cwd is inside ${where}, so native calls are translated to the host`
   }
   if (routing?.mode === 'local') {
     return (
-      `Native tools: LOCAL — this session's cwd (${routing.cwd ?? 'unknown'}) is outside ${where}, so ` +
-      'read/write/edit/str_replace_editor/glob/grep/bash run on the local machine; use rw_* for the remote'
+      `Native tools: LOCAL — this call's paths were outside ${where} and this session's cwd ` +
+      `(${routing.cwd ?? 'unknown'}) is not inside it, so it ran on the local machine; a call naming a path ` +
+      `inside ${where} IS translated, and rw_* always addresses the remote — use rw_* for the remote`
     )
   }
   return (
@@ -249,10 +266,131 @@ function renderExecResult(command: string, cwd: string | undefined, res: ExecRes
   return parts.join('\n')
 }
 
+/** One rw_exec_many call: a remote shell command on one host. */
+interface ExecManyCall {
+  alias: string
+  command: string
+  cwd?: string
+  timeoutMs?: number
+}
+
+/** One rw_exec_many outcome, in input order. */
+interface ExecManyResult extends ExecManyCall {
+  ok: boolean
+  code: number | null
+  signal: string | null
+  timedOut: boolean
+  stdout: string
+  stderr: string
+  /** Set when the call never reached the host (connect/channel failure). */
+  error?: string
+}
+
+/** Hard ceiling on one fan-out: enough for a fleet, small enough to bound output. */
+const EXEC_MANY_MAX_CALLS = 32
+const EXEC_MANY_MAX_CONCURRENCY = 16
+const EXEC_MANY_DEFAULT_CONCURRENCY = 4
+
+/**
+ * Run `fn` over `items` with a fixed number of workers, preserving input order.
+ * One worker failing cannot cancel the others — the caller records per-item
+ * errors, which is the whole point of a fan-out.
+ */
+async function mapBounded<T, R>(items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor
+      cursor += 1
+      if (index >= items.length) return
+      out[index] = await fn(items[index]!, index)
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+/** Render one rw_exec_many outcome as its own section; bodies are already capped. */
+function renderExecManyResult(result: ExecManyResult, index: number): string {
+  const head =
+    `--- [${index + 1}] ${result.alias}` +
+    (result.error !== undefined
+      ? ' (not reached)'
+      : result.timedOut
+        ? ' (timed out)'
+        : ` (exit ${result.code ?? 'null'}${result.signal ? `, signal: ${result.signal}` : ''})`) +
+    ' ---'
+  const parts = [head, `$ ${result.command}`]
+  parts.push(result.cwd !== undefined ? `cwd: ${result.cwd}` : 'cwd: (SSH default directory)')
+  if (result.error !== undefined) parts.push(`error: ${result.error}`)
+  if (result.stdout !== '') parts.push(`stdout:\n${result.stdout.replace(/\s+$/, '')}`)
+  if (result.stderr !== '') parts.push(`stderr:\n${result.stderr.replace(/\s+$/, '')}`)
+  return parts.join('\n')
+}
+
+/**
+ * Read a workspace file as raw utf-8 text with its trailing newline preserved.
+ * RemoteFs.read() returns joined LINES (the terminator is dropped), which would
+ * make every rw_diff show a phantom "no newline at end of file" change.
+ */
+async function readWorkspaceText(fs: RemoteFs, path: string): Promise<string> {
+  const p = resolveInWorkspace(fs.root, path)
+  const real = await assertRealpathInside(fs.sftp, fs.root, p)
+  let buf: Buffer
+  try {
+    buf = await fs.sftp.readFile(real)
+  } catch (err) {
+    throw mapSftpError(err, p)
+  }
+  if (buf.length > 2 * 1024 * 1024) throw new RwError('INVALID_INPUT', `file too large to diff: ${p}`)
+  return buf.toString('utf8')
+}
+
+/** Adapt the SFTP listing to the watcher's single-method interface. */
+function watchFsOf(sftp: SftpLike): WatchFs {
+  return {
+    async readdir(path: string) {
+      const entries = await sftp.readdir(path)
+      return entries.map((entry) => {
+        const kind: 'file' | 'dir' | 'other' = entry.attrs.isDirectory()
+          ? 'dir'
+          : entry.attrs.isSymbolicLink()
+            ? 'other'
+            : 'file'
+        return { name: entry.filename, kind, size: entry.attrs.size, mtimeMs: entry.attrs.mtime * 1000 }
+      })
+    },
+  }
+}
+
+/** Render one watcher snapshot: what changed and whether the scan was complete. */
+function renderWatchSnapshot(action: 'start' | 'poll', name: string, snapshot: WatchSnapshotResult): string {
+  const head =
+    action === 'start'
+      ? `watching '${name}': baseline of ${snapshot.entries} entries` +
+        (snapshot.truncated ? ' (truncated: maxEntries/maxDepth reached)' : '')
+      : `watcher '${name}': ${snapshot.changes.length} change(s), ${snapshot.entries} entries scanned` +
+        (snapshot.truncated ? ' (truncated: maxEntries/maxDepth reached)' : '')
+  if (action === 'start' || snapshot.changes.length === 0) return `${head}\n(no changes to report)`
+  const lines = snapshot.changes.map((change) =>
+    change.kind === 'removed'
+      ? `  removed  ${change.path}`
+      : `  ${change.kind === 'added' ? 'added   ' : 'changed '}${change.path} (${change.size ?? 0} B)`,
+  )
+  return [head, ...lines].join('\n')
+}
+
+/** The fixed number of rw_* tools, exported so the registration-order tests track it. */
+export const RW_TOOL_COUNT = 16
+
 /** The twelve rw_* tools in their fixed registration order. */
 export function makeTools(deps: ToolsDeps): unknown[] {
   const { hosts, pool, session, config } = deps
   const text = (value: { text: string }): { type: 'text'; text: string }[] => [{ type: 'text', text: value.text }]
+  // One watcher registry per plugin instance. It holds no timers and no remote
+  // state, so plugin teardown simply drops it with the rest of this closure.
+  const managers = new WatchManager()
 
   return [
     // ------------------------------------------------------------- rw_info
@@ -426,11 +564,36 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         path: { type: 'string', required: true, description: 'File path (absolute, or relative to the workspace root).' },
         content: { type: 'string', required: true, description: 'Full file content (overwrites any existing file).' },
         mkdir: { type: 'boolean', description: 'Create missing parent directories (default true).' },
+        ifHash: {
+          type: 'string',
+          description:
+            'Optimistic concurrency: write only if the current remote content hashes to this sha256 (hex), ' +
+            'or pass "absent" to only create a file that does not exist yet. A mismatch fails with RW_WRITE_CONFLICT.',
+        },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
       async execute(args) {
         try {
           const fs = await requireWorkspaceFs(deps)
+          if (args.ifHash !== undefined) {
+            // Read the raw bytes: the guard is about content identity, so the
+            // trailing newline must be part of the hash.
+            let current: Buffer | null = null
+            try {
+              current = await fs.sftp.readFile(resolveInWorkspace(fs.root, args.path))
+            } catch (err) {
+              // A missing file is the "absent" case, everything else is a real failure.
+              if (!(err instanceof Error && /no such file/i.test(err.message))) throw mapSftpError(err, args.path)
+            }
+            const expected = args.ifHash
+            const actual = current === null ? 'absent' : createHash('sha256').update(current).digest('hex')
+            if (expected !== actual) {
+              throw new RwError(
+                'RW_WRITE_CONFLICT',
+                `refusing to write ${args.path}: expected ${JSON.stringify(expected)} but the remote is ${JSON.stringify(actual)}`,
+              )
+            }
+          }
           const { bytes } = await fs.write(args.path, args.content, { mkdir: args.mkdir })
           return { text: `wrote ${bytes} bytes to ${args.path}` }
         } catch (err) {
@@ -528,6 +691,317 @@ export function makeTools(deps: ToolsDeps): unknown[] {
           const timeoutMs = args.timeoutMs ?? config.commandTimeoutMs
           const res = await pool.exec(entry, args.command, { cwd, timeoutMs })
           return { text: renderExecResult(args.command, cwd, res, timeoutMs) }
+        } catch (err) {
+          throw toToolError(err)
+        }
+      },
+    }),
+
+    // ------------------------------------------------------ rw_exec_many
+    defineTool({
+      name: 'rw_exec_many',
+      description:
+        'Run shell commands on several hosts in one call, in parallel (bounded concurrency), and get one result ' +
+        'section per call in input order — the fan-out primitive for "do the same thing on every machine". Give ' +
+        'either `calls` (independent command per host) or `command` + `hosts` (one command across hosts). A ' +
+        'failure or timeout in one call never cancels the others; each section reports its own exit code. ' +
+        'Like rw_exec, commands are NOT workspace-confined; cwd defaults to the current host workspace, else the ' +
+        'SSH default directory. Triggers: run on all servers, upgrade every host, fleet-wide check.',
+      parameters: {
+        calls: {
+          type: 'array',
+          description: 'Independent calls, one per entry. Mutually exclusive with command + hosts.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              alias: { type: 'string', description: 'Host alias from rw_hosts (default: the current host).' },
+              command: { type: 'string', required: true, description: 'Shell command to run on that host.' },
+              cwd: { type: 'string', description: 'Remote working directory for this call.' },
+              timeoutMs: { type: 'integer', description: `Timeout in milliseconds (default ${config.commandTimeoutMs}).` },
+            },
+          },
+        },
+        command: { type: 'string', description: 'One command to run on every alias in `hosts`.' },
+        hosts: {
+          type: 'array',
+          description: 'Host aliases to fan `command` out to.',
+          items: { type: 'string' },
+        },
+        concurrency: {
+          type: 'integer',
+          description: `Max parallel calls (default ${EXEC_MANY_DEFAULT_CONCURRENCY}, ceiling ${EXEC_MANY_MAX_CONCURRENCY}).`,
+        },
+      },
+      output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
+      async execute(args) {
+        try {
+          const callsArg = args.calls
+          const hasCalls = callsArg !== undefined
+          const hasFanout = args.command !== undefined || args.hosts !== undefined
+          if (hasCalls && hasFanout) {
+            throw new RwError('INVALID_INPUT', 'give either `calls` or `command` + `hosts`, not both')
+          }
+          let calls: ExecManyCall[]
+          if (callsArg !== undefined) {
+            if (callsArg.length === 0) throw new RwError('INVALID_INPUT', 'calls must not be empty')
+            calls = callsArg.map((call, index) => {
+              const alias = call.alias ?? session.alias
+              if (alias === null) {
+                throw new RwError(
+                  'NOT_CONNECTED',
+                  `calls[${index}] has no alias and no host is connected — call rw_connect(alias) or name the alias`,
+                )
+              }
+              if (call.command.trim() === '') {
+                throw new RwError('INVALID_INPUT', `calls[${index}].command must not be empty`)
+              }
+              return {
+                alias,
+                command: call.command,
+                ...(call.cwd !== undefined ? { cwd: call.cwd } : {}),
+                ...(call.timeoutMs !== undefined ? { timeoutMs: call.timeoutMs } : {}),
+              }
+            })
+          } else if (args.command !== undefined && args.hosts !== undefined) {
+            if (args.command.trim() === '') throw new RwError('INVALID_INPUT', 'command must not be empty')
+            if (args.hosts.length === 0) throw new RwError('INVALID_INPUT', 'hosts must not be empty')
+            calls = args.hosts.map((alias) => ({ alias, command: args.command! }))
+          } else {
+            throw new RwError('INVALID_INPUT', 'give `calls`, or `command` + `hosts`')
+          }
+          if (calls.length > EXEC_MANY_MAX_CALLS) {
+            throw new RwError('INVALID_INPUT', `at most ${EXEC_MANY_MAX_CALLS} calls per fan-out (got ${calls.length})`)
+          }
+          // Resolve every alias up front: a typo fails the whole call before any
+          // remote side effect runs, which is safer than a partial fan-out.
+          const entries = calls.map((call) => {
+            const entry = hosts.find(call.alias)
+            if (!entry) throw unknownAliasError(deps, call.alias)
+            return entry
+          })
+          const concurrency = Math.min(
+            EXEC_MANY_MAX_CONCURRENCY,
+            Math.max(1, args.concurrency ?? EXEC_MANY_DEFAULT_CONCURRENCY),
+          )
+          const results = await mapBounded(calls, concurrency, async (call, index) => {
+            const entry = entries[index]!
+            // Same rule as rw_exec: the workspace cwd only applies to the host
+            // that owns it; every other host starts in its SSH default dir
+            // unless the call names one.
+            const cwd = call.cwd ?? (call.alias === session.alias ? (session.workspace ?? undefined) : undefined)
+            const timeoutMs = call.timeoutMs ?? config.commandTimeoutMs
+            const base: ExecManyCall = { ...call, ...(cwd !== undefined ? { cwd } : {}) }
+            try {
+              const res = await pool.exec(entry, call.command, cwd !== undefined ? { cwd, timeoutMs } : { timeoutMs })
+              return {
+                ...base,
+                ok: !res.timedOut && res.code === 0,
+                code: res.code,
+                signal: res.signal,
+                timedOut: res.timedOut,
+                stdout: res.stdout,
+                stderr: res.stderr,
+              }
+            } catch (err) {
+              // One unreachable host must not void the rest of the fan-out.
+              return {
+                ...base,
+                ok: false,
+                code: null,
+                signal: null,
+                timedOut: false,
+                stdout: '',
+                stderr: '',
+                error: err instanceof Error ? err.message : String(err),
+              }
+            }
+          })
+          const okCount = results.reduce((n, r) => n + (r.ok ? 1 : 0), 0)
+          const header = `rw_exec_many: ${okCount}/${results.length} succeeded (concurrency ${concurrency})`
+          return { text: [header, ...results.map(renderExecManyResult)].join('\n\n') }
+        } catch (err) {
+          throw toToolError(err)
+        }
+      },
+    }),
+
+    // ---------------------------------------------------------- rw_watch
+    defineTool({
+      name: 'rw_watch',
+      description:
+        'Watch a remote directory for changes by polling it on demand. `start` establishes a baseline (optional ' +
+        'path relative to the workspace root, and an include glob), `poll` reports what was added, changed ' +
+        '(size or mtime) or removed since the previous snapshot, `stop` drops a watcher, `list` shows them. ' +
+        'Nothing runs on the remote between polls — the snapshot lives in this plugin process — so one poll ' +
+        'costs one recursive SFTP listing. Triggers: watch files, detect remote changes, what changed on the ' +
+        'server.',
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          enum: ['start', 'poll', 'stop', 'list'],
+          description: 'start a watcher, poll it, stop it, or list the registered watchers.',
+        },
+        name: { type: 'string', description: 'Watcher name (default "default").' },
+        path: { type: 'string', description: 'Directory to watch, relative to the workspace root (default: the root).' },
+        include: {
+          type: 'string',
+          description: 'One glob filter: "*.ts" matches a basename at any depth, "src/**" matches the relative path.',
+        },
+        maxEntries: { type: 'integer', description: 'Cap on tracked entries (default 20000).' },
+      },
+      output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
+      async execute(args) {
+        try {
+          const name = args.name ?? 'default'
+          if (args.action === 'list') {
+            const watchers = managers.list()
+            return {
+              text:
+                watchers.length === 0
+                  ? 'no watchers registered'
+                  : watchers
+                      .map(
+                        (watcher) =>
+                          `${watcher.name}: ${watcher.root}` +
+                          (watcher.include !== undefined ? ` (include ${watcher.include})` : ''),
+                      )
+                      .join('\n'),
+            }
+          }
+          if (args.action === 'stop') {
+            return { text: managers.stop(name) ? `stopped watcher '${name}'` : `no watcher named '${name}'` }
+          }
+          const fs = await requireWorkspaceFs(deps)
+          if (args.action === 'start') {
+            const root = resolveInWorkspace(fs.root, args.path)
+            const real = await assertRealpathInside(fs.sftp, fs.root, root)
+            const snapshot = await managers.start(name, watchFsOf(fs.sftp), {
+              root: real,
+              ...(args.include !== undefined ? { include: args.include } : {}),
+              ...(args.maxEntries !== undefined ? { maxEntries: args.maxEntries } : {}),
+            })
+            return { text: renderWatchSnapshot('start', name, snapshot) }
+          }
+          if (!managers.list().some((watcher) => watcher.name === name)) {
+            throw new RwError('INVALID_INPUT', `no watcher named ${JSON.stringify(name)} — start one first`)
+          }
+          return { text: renderWatchSnapshot('poll', name, await managers.poll(name)) }
+        } catch (err) {
+          throw toToolError(err)
+        }
+      },
+    }),
+
+    // ----------------------------------------------------------- rw_diff
+    defineTool({
+      name: 'rw_diff',
+      description:
+        'Show a unified diff for one remote file: compare it against a text you supply (`content`, the after ' +
+        'side) or against another remote file (`against`). Read-only — nothing is written. Binary files are ' +
+        'rejected rather than diffed as mojibake. Triggers: diff a file, what changed, compare with the server.',
+      parameters: {
+        path: { type: 'string', required: true, description: 'File to diff (absolute, or relative to the workspace root).' },
+        content: { type: 'string', description: 'Compare the file against this text (the "after" side).' },
+        against: { type: 'string', description: 'Compare the file against this other remote file (the "after" side).' },
+        context: { type: 'integer', description: 'Context lines per hunk (default 3).' },
+      },
+      output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
+      async execute(args) {
+        try {
+          const hasContent = args.content !== undefined
+          const hasAgainst = args.against !== undefined
+          if (hasContent === hasAgainst) {
+            throw new RwError('INVALID_INPUT', 'give exactly one of `content` or `against` as the after side')
+          }
+          const fs = await requireWorkspaceFs(deps)
+          const before = await readWorkspaceText(fs, args.path)
+          const after = hasContent ? (args.content ?? '') : await readWorkspaceText(fs, args.against!)
+          if (looksBinary(before) || looksBinary(after)) {
+            throw new RwError('INVALID_INPUT', 'binary file — rw_diff only diffs text')
+          }
+          const context = args.context ?? 3
+          if (!Number.isInteger(context) || context < 0) throw new RwError('INVALID_INPUT', 'context must be an integer >= 0')
+          const diff = unifiedDiff(args.path, before, after, context)
+          if (diff === '') return { text: `no differences in ${args.path}` }
+          const cap = config.maxOutputChars
+          return { text: diff.length > cap ? `${diff.slice(0, cap)}\n…[truncated]` : diff }
+        } catch (err) {
+          throw toToolError(err)
+        }
+      },
+    }),
+
+    // ----------------------------------------------------- rw_apply_patch
+    defineTool({
+      name: 'rw_apply_patch',
+      description:
+        'Apply a unified diff inside the remote workspace. Every path the patch would touch is validated ' +
+        'against the workspace root FIRST (a patch can never escape it), then the patch is staged on the host ' +
+        'and run with `patch -pN` — with `--dry-run` first, so a mismatch changes nothing. Use `dryRun: true` ' +
+        'to only check. Triggers: apply patch, apply diff, land a git patch on the server.',
+      parameters: {
+        patch: {
+          type: 'string',
+          required: true,
+          description: 'Unified diff text (as produced by diff -u / git diff).',
+        },
+        strip: { type: 'integer', description: 'Strip N leading path components (default 1, like patch -p1).' },
+        dryRun: { type: 'boolean', description: 'Only check that the patch applies (default false).' },
+      },
+      output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
+      async execute(args) {
+        try {
+          if (args.patch.trim() === '') throw new RwError('INVALID_INPUT', 'patch must not be empty')
+          const strip = args.strip ?? 1
+          if (!Number.isInteger(strip) || strip < 0) throw new RwError('INVALID_INPUT', 'strip must be an integer >= 0')
+          const fs = await requireWorkspaceFs(deps)
+          // Confinement is decided here, before anything runs on the host.
+          let targets: string[]
+          try {
+            targets = patchTargets(args.patch, fs.root, strip)
+          } catch (err) {
+            // PathEscapeError / PatchFormatError are validation failures, not
+            // internal errors: report them as actionable input problems.
+            throw new RwError('INVALID_INPUT', err instanceof Error ? err.message : String(err))
+          }
+          const entry = requireEntry(deps)
+          const staged = `${fs.root}/.dsh-rw-patch-${randomBytes(6).toString('hex')}`
+          await fs.sftp.writeFile(staged, Buffer.from(args.patch, 'utf8'))
+          const runPatch = async (dryRun: boolean): Promise<ExecResult> =>
+            await deps.pool.exec(entry, `patch -p${strip}${dryRun ? ' --dry-run' : ''} -i ${shq(staged)}`, {
+              cwd: fs.root,
+              timeoutMs: config.commandTimeoutMs,
+            })
+          try {
+            const dry = await runPatch(true)
+            if (dry.code !== 0) {
+              throw new RwError(
+                'INVALID_INPUT',
+                `patch does not apply cleanly (patch -p${strip} --dry-run exited ${dry.code ?? 'null'}): ${(dry.stderr || dry.stdout).trim()}`,
+              )
+            }
+            if (args.dryRun === true) {
+              return { text: `patch applies cleanly to ${targets.length} file(s):\n${targets.map((t) => `  ${t}`).join('\n')}` }
+            }
+            const applied = await runPatch(false)
+            if (applied.code !== 0) {
+              throw new RwError(
+                'INVALID_INPUT',
+                `patch failed while applying (exit ${applied.code ?? 'null'}): ${(applied.stderr || applied.stdout).trim()}`,
+              )
+            }
+            const body = (applied.stdout || applied.stderr).trim()
+            return {
+              text:
+                `applied patch to ${targets.length} file(s):\n${targets.map((t) => `  ${t}`).join('\n')}` +
+                (body === '' ? '' : `\n\n${body}`),
+            }
+          } finally {
+            // The staged file is an implementation detail, never a workspace artifact.
+            await fs.sftp.unlink(staged).catch(() => undefined)
+          }
         } catch (err) {
           throw toToolError(err)
         }

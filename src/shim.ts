@@ -35,6 +35,7 @@ import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { HostEntry } from './hosts.js'
 import type { ExecResult, SftpLike } from './ssh-pool.js'
+import type { ShellManagerLike } from './persistent-shell.js'
 import type { HostTableLike, PoolLike } from './tools.js'
 
 /** Canonical success value, derived from the public execution result contract. */
@@ -47,6 +48,8 @@ export interface ShimConfig {
   shimBashApproval: 'ask' | 'native'
   commandTimeoutMs: number
   maxOutputChars: number
+  /** Run the persistent-bash flavor on a long-lived remote shell (default true). */
+  persistentShell?: boolean
 }
 
 /**
@@ -67,8 +70,14 @@ export interface NativeRouting {
   /** The remote workspace active when the observation was made. */
   alias?: string
   workspace?: string
-  /** Placeholder directory the session must live in for native translation. */
+  /** Placeholder directory the translated call was rooted at. */
   placeholder?: string
+  /**
+   * How the last translated call was anchored: its own path argument
+   * (`'path'` — works from any working directory) or the agent session cwd
+   * (`'cwd'` — the pre-1.0 rule). Absent in `local`/`unknown` mode.
+   */
+  reason?: 'cwd' | 'path'
 }
 
 /** A fresh, unobserved routing record (one per plugin load). */
@@ -100,6 +109,12 @@ export interface ShimDeps {
    * (no approval service) keeps the plain 'ask' behavior.
    */
   approvalPolicyOf?(session: unknown): string | undefined
+  /**
+   * The persistent-shell manager (index.ts wires it to the pool). Undefined
+   * keeps the pre-1.0 behavior: the persistent-bash flavor degrades to a
+   * one-shot exec and the result says so.
+   */
+  shells?: ShellManagerLike
 }
 
 /** The two middlewares apply() wires onto the tool pipeline. */
@@ -260,6 +275,82 @@ function blockedMessage(found: { dir: string; meta: PlaceholderMeta }): string {
     `and rw_connect('${found.meta.alias}') to operate on the remote; native tools will not ` +
     `use the local placeholder`
   )
+}
+
+/**
+ * The explicit path argument a native call can be anchored by, or null when the
+ * call carries no usable path (`bash` never has one; `glob`/`grep` may omit it).
+ */
+function callPathArg(name: string, args: Record<string, unknown>): { key: string; value: string } | null {
+  const key =
+    name === 'read' || name === 'write' || name === 'edit'
+      ? 'file_path'
+      : name === 'str_replace_editor' || name === 'glob' || name === 'grep'
+        ? 'path'
+        : null
+  if (key === null) return null
+  const value = strArg(args, key)
+  if (value === undefined || value === '') return null
+  return { key, value }
+}
+
+/** Where one native call resolved to: a remote target (with its anchor) or a host-less placeholder. */
+type CallResolution =
+  | { kind: 'target'; target: ActiveTarget; reason: 'cwd' | 'path'; args: Record<string, unknown> }
+  | { kind: 'broken'; found: { dir: string; meta: PlaceholderMeta } }
+
+/**
+ * Resolve where a native call must run. Two independent anchors, in this order:
+ *
+ *  1. the call's own path argument — an explicit path inside a dsh-rw
+ *     placeholder is remote by definition, wherever the session's cwd lives.
+ *     This lets a session started in a local directory reach the remote simply
+ *     by naming a placeholder path: the anchor travels with the call, so it can
+ *     never be confused with ambient session state.
+ *  2. the agent session cwd (the pre-1.0 rule) — used for calls that carry no
+ *     path (`bash`, pathless `glob`/`grep`) and for paths outside every
+ *     placeholder.
+ *
+ * A path inside a placeholder whose host is no longer configured resolves to
+ * `broken`; the caller turns that into an actionable error when the call really
+ * touches the placeholder — it must never fall back to the local stand-in.
+ * Null means the call is not ours: pass it through to the native tool.
+ */
+function resolveCall(deps: ShimDeps, exec: ToolDispatchExecution): CallResolution | null {
+  const args = objectArgs(exec.arguments)
+  if (args === null) return null
+
+  // 1) Explicit path anchor.
+  const anchor = callPathArg(exec.name, args)
+  if (anchor !== null) {
+    const cwd = agentCwd(exec)
+    const abs = isAbsolute(anchor.value)
+      ? resolve(anchor.value)
+      : cwd !== undefined
+        ? resolve(cwd, anchor.value)
+        : undefined
+    if (abs !== undefined) {
+      const found = findPlaceholderByPath(abs, deps.placeholderBaseDir)
+      if (found !== null) {
+        const entry = deps.hosts.find(found.meta.alias)
+        if (entry === undefined) return { kind: 'broken', found }
+        return {
+          kind: 'target',
+          target: buildTarget(entry, found.meta.remotePath, found.dir),
+          reason: 'path',
+          // Normalize to the absolute local form the anchor was resolved at, so
+          // toRemotePath and the workspace guard see exactly the anchored path.
+          args: { ...args, [anchor.key]: abs },
+        }
+      }
+    }
+  }
+
+  // 2) Session-cwd anchor.
+  const target = activeTarget(deps, exec)
+  if (target !== null) return { kind: 'target', target, reason: 'cwd', args }
+
+  return null
 }
 
 /**
@@ -841,7 +932,41 @@ function searchDir(
   return { remoteDir: target.remoteRoot }
 }
 
-/** Remote glob: `rg --files -g` when available, `find` as the fallback (best-effort glob). */
+/**
+ * Marker every remote search prints as its first line, so the shim knows which
+ * engine actually ran. `rg` and the `find`/`grep` fallbacks do not have
+ * identical semantics (ignore rules, hidden files, ordering), and a silent
+ * difference would make the same call return different results depending on
+ * which binary a host happens to have installed.
+ */
+const ENGINE_MARK = '__DSH_RW_ENGINE__='
+
+/** VCS metadata directories the native glob tool excludes — mirrored verbatim. */
+const VCS_EXCLUDES = ['.git', '.svn', '.hg', '.bzr', '.jj', '.sl']
+
+/** Split the engine marker off a remote search's stdout. */
+function readEngine(stdout: string): { engine: 'rg' | 'fallback'; body: string } {
+  if (!stdout.startsWith(ENGINE_MARK)) return { engine: 'fallback', body: stdout }
+  const nl = stdout.indexOf('\n')
+  const name = stdout.slice(ENGINE_MARK.length, nl < 0 ? undefined : nl)
+  return { engine: name === 'rg' ? 'rg' : 'fallback', body: nl < 0 ? '' : stdout.slice(nl + 1) }
+}
+
+/** The note appended to a rendered fallback search: never silently different semantics. */
+function engineNote(kind: 'glob' | 'grep'): string {
+  return kind === 'glob'
+    ? '(dsh-rw shim: ripgrep is not installed on this host, so this glob ran `find` — ignore rules, hidden ' +
+        'files and mtime ordering differ from the native tool)'
+    : '(dsh-rw shim: ripgrep is not installed on this host, so this grep ran `grep -rnE` — .gitignore and ' +
+        'hidden-file rules differ from the native tool)'
+}
+
+/**
+ * Remote glob with the native tool's exact ripgrep semantics: `--files
+ * --glob=<pattern> --sort=modified --no-ignore --hidden` plus the VCS
+ * excludes. The `find` fallback is labelled in the rendered text because it
+ * cannot reproduce those semantics.
+ */
 async function shimGlob(
   deps: ShimDeps,
   target: ActiveTarget,
@@ -854,34 +979,83 @@ async function shimGlob(
   if (dir === null) return null
   return guarded(async () => {
     if (pattern.trim().length === 0) throw new Error('pattern must be a non-empty string')
-    const fallback = pattern.includes('/') ? `find . -type f -path ${shq(`./${pattern}`)}` : `find . -type f -name ${shq(pattern)}`
-    const command = `if command -v rg >/dev/null 2>&1; then rg --files -g ${shq(pattern)}; else ${fallback}; fi`
-    const res = await execRemote(deps, target, command, { cwd: dir.remoteDir, timeoutMs: deps.config.commandTimeoutMs }, exec.signal)
+    const root = dir.remoteDir
+    const excludes = VCS_EXCLUDES.flatMap((name) => [`--glob=!**/${name}`, `--glob=!**/${name}/**`]).map(shq).join(' ')
+    const rg = `rg --files --glob=${shq(pattern)} --sort=modified --no-ignore --hidden ${excludes} -- ${shq(root)}`
+    const fallback = pattern.includes('/')
+      ? `find ${shq(root)} -type f -path ${shq(`${root}/${pattern}`)}`
+      : `find ${shq(root)} -type f -name ${shq(pattern)}`
+    const command =
+      `if command -v rg >/dev/null 2>&1; then printf '${ENGINE_MARK}rg\\n'; ${rg}; ` +
+      `else printf '${ENGINE_MARK}fallback\\n'; ${fallback}; fi`
+    const res = await execRemote(deps, target, command, { cwd: root, timeoutMs: deps.config.commandTimeoutMs }, exec.signal)
     if (res === 'aborted') return fail('command aborted (remote execution interrupted)')
     if (res.code !== 0 && res.code !== 1) {
       throw new Error(`remote glob failed (exit code ${res.code ?? 'null'}): ${(res.stderr || res.stdout).trim()}`)
     }
-    const displayDir = toLocalPath(target, dir.remoteDir)
-    const paths = res.stdout
+    const { engine, body } = readEngine(res.stdout)
+    const displayDir = toLocalPath(target, root)
+    const paths = body
       .split('\n')
       .filter((line) => line !== '')
-      .map((line) => (line.startsWith('./') ? line.slice(2) : line))
-      .map((rel) => join(displayDir, ...rel.split('/')))
+      .map((line) => toLocalPath(target, line))
     // Native glob output: { root, paths } — the complete list; the rendered
     // text stays capped at GLOB_MAX_RESULTS.
     const shown = paths.slice(0, GLOB_MAX_RESULTS)
-    return okValue({ root: displayDir, paths }, shown.length === 0 ? 'No files found' : shown.join('\n'))
+    const rendered = shown.length === 0 ? 'No files found' : shown.join('\n')
+    return okValue({ root: displayDir, paths }, engine === 'rg' ? rendered : `${rendered}\n${engineNote('glob')}`)
   })
 }
 
-/** One parsed `path:line:text` row (a type alias, so it remains a canonical JSON object value). */
+/** One parsed grep row (a type alias, so it remains a canonical JSON object value). */
 type GrepMatch = {
   path: string
   lineNumber: number
   line: string
 }
 
-/** Parse `path:line:text` rows; the greedy path keeps colons inside file names working. */
+/** Decode an `rg --json` string field, which is either `{ text }` or base64 `{ bytes }`. */
+function jsonField(field: { text?: string; bytes?: string } | undefined): string | undefined {
+  if (field === undefined) return undefined
+  if (typeof field.text === 'string') return field.text
+  if (typeof field.bytes === 'string') return Buffer.from(field.bytes, 'base64').toString('utf8')
+  return undefined
+}
+
+/**
+ * Parse `rg --json` NDJSON — the same transport the native grep tool uses, so a
+ * path containing colons or newlines can never be mis-split. Only `match`
+ * records are hits; `begin`/`end`/`context`/`summary` are ignored.
+ */
+function parseRgJson(target: ActiveTarget, stdout: string): GrepMatch[] {
+  const matches: GrepMatch[] = []
+  for (const raw of stdout.split('\n')) {
+    if (raw === '') continue
+    let record: unknown
+    try {
+      record = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    const rec = record as {
+      type?: string
+      data?: {
+        path?: { text?: string; bytes?: string }
+        line_number?: number
+        lines?: { text?: string; bytes?: string }
+      }
+    }
+    if (rec.type !== 'match' || rec.data === undefined) continue
+    const path = jsonField(rec.data.path)
+    const line = jsonField(rec.data.lines)
+    const lineNumber = rec.data.line_number
+    if (path === undefined || line === undefined || lineNumber === undefined) continue
+    matches.push({ path: toLocalPath(target, path), lineNumber, line: line.replace(/\r?\n$/, '') })
+  }
+  return matches
+}
+
+/** Parse `path:line:text` rows from the grep fallback; the greedy path keeps colons inside file names working. */
 function parseGrepStdout(target: ActiveTarget, stdout: string): GrepMatch[] {
   const matches: GrepMatch[] = []
   for (const raw of stdout.split('\n')) {
@@ -897,8 +1071,9 @@ function parseGrepStdout(target: ActiveTarget, stdout: string): GrepMatch[] {
 }
 
 /** Native grep render: found-count header, matches grouped by file (`Line N: text`). */
-function renderGrepMatches(matches: GrepMatch[]): string {
-  if (matches.length === 0) return 'No matches found'
+function renderGrepMatches(matches: GrepMatch[], engine: 'rg' | 'fallback'): string {
+  const note = engine === 'fallback' ? `\n\n${engineNote('grep')}` : ''
+  if (matches.length === 0) return `No matches found${note}`
   const kept = matches.slice(0, GREP_MAX_MATCHES)
   const byFile = new Map<string, GrepMatch[]>()
   for (const match of kept) {
@@ -914,10 +1089,13 @@ function renderGrepMatches(matches: GrepMatch[]): string {
     matches.length > GREP_MAX_MATCHES
       ? `Found ${kept.length} of ${matches.length} matches`
       : `Found ${matches.length} ${matches.length === 1 ? 'match' : 'matches'}`
-  return `${header}\n\n${sections.join('\n\n')}`
+  return `${header}\n\n${sections.join('\n\n')}${note}`
 }
 
-/** Remote grep: `rg --line-number --with-filename` when available, `grep -rnE` fallback. */
+/**
+ * Remote grep with the native tool's semantics: `rg --json` (the native argv,
+ * so default ignore rules match) and a labelled `grep -rnE` fallback.
+ */
 async function shimGrep(
   deps: ShimDeps,
   target: ActiveTarget,
@@ -933,18 +1111,23 @@ async function shimGrep(
   return guarded(async () => {
     if (pattern.trim().length === 0) throw new Error('pattern must be a non-empty string')
     if (include !== undefined && include.trim().length === 0) throw new Error('include must be a non-empty glob when given')
-    const rgInclude = include !== undefined ? ` -g ${shq(include)}` : ''
-    const grepInclude = include !== undefined ? ` --include=${shq(include)}` : ''
-    const command = `if command -v rg >/dev/null 2>&1; then rg --line-number --with-filename${rgInclude} -e ${shq(pattern)} ${shq(dir.remoteDir)}; else grep -rnE${grepInclude} -e ${shq(pattern)} ${shq(dir.remoteDir)}; fi`
-    const res = await execRemote(deps, target, command, { cwd: dir.remoteDir, timeoutMs: deps.config.commandTimeoutMs }, exec.signal)
+    const root = dir.remoteDir
+    const rgArgs = `rg --json --regexp=${shq(pattern)}${include !== undefined ? ` --glob=${shq(include)}` : ''} -- ${shq(root)}`
+    const grepArgs =
+      `grep -rnI -E${include !== undefined ? ` --include=${shq(include)}` : ''} -e ${shq(pattern)} -- ${shq(root)}`
+    const command =
+      `if command -v rg >/dev/null 2>&1; then printf '${ENGINE_MARK}rg\\n'; ${rgArgs}; ` +
+      `else printf '${ENGINE_MARK}fallback\\n'; ${grepArgs}; fi`
+    const res = await execRemote(deps, target, command, { cwd: root, timeoutMs: deps.config.commandTimeoutMs }, exec.signal)
     if (res === 'aborted') return fail('command aborted (remote execution interrupted)')
     if (res.code !== 0 && res.code !== 1) {
       throw new Error(`remote grep failed (exit code ${res.code ?? 'null'}): ${(res.stderr || res.stdout).trim()}`)
     }
     // Native grep output: { matches: [{ path, lineNumber, line }] } — the
     // complete list; the rendered text stays capped at GREP_MAX_MATCHES.
-    const matches = parseGrepStdout(target, res.stdout)
-    return okValue({ matches }, renderGrepMatches(matches))
+    const { engine, body } = readEngine(res.stdout)
+    const matches = engine === 'rg' ? parseRgJson(target, body) : parseGrepStdout(target, body)
+    return okValue({ matches }, renderGrepMatches(matches, engine))
   })
 }
 
@@ -954,7 +1137,7 @@ async function shimGrep(
 const TRUNC_SUFFIX = '\n…[truncated]'
 
 /** Native bash result body: stdout, an optional [stderr] section, then status markers. */
-function renderBashResult(res: ExecResult, timeoutMs: number, persistent: boolean): string {
+function renderBashResult(res: ExecResult, timeoutMs: number, note?: string): string {
   const out = res.stdout.replace(/\n+$/, '')
   const err = res.stderr.replace(/\n+$/, '')
   let body = out
@@ -967,11 +1150,9 @@ function renderBashResult(res: ExecResult, timeoutMs: number, persistent: boolea
   if (res.timedOut) markers.push(`[timed out after ${timeoutMs}ms]`)
   if (res.signal !== null) markers.push(`[killed by signal: ${res.signal}]`)
   else if (res.code !== 0) markers.push(`[exit code: ${res.code ?? 'null'}]`)
-  // The one place a shim note is allowed: a persistent-shell call degrades to
-  // a one-shot remote exec, and the model must know state does not carry over.
-  if (persistent) {
-    markers.push('(dsh-rw shim: persistent bash ran as a one-shot remote command — shell state (cwd, exports) is NOT preserved between calls)')
-  }
+  // One shim note is allowed here: the model must know when shell state does
+  // not carry over, and when the two streams are merged.
+  if (note !== undefined) markers.push(note)
   if (markers.length === 0) return body
   return `${body}\n${markers.join('\n')}`
 }
@@ -1028,8 +1209,31 @@ async function shimBash(
         ? Math.floor(args.timeoutMs)
         : deps.config.commandTimeoutMs
     const rewritten = rewriteCommand(target, command)
-    const res = await execRemote(deps, target, rewritten, { cwd, timeoutMs }, exec.signal)
+    // The persistent-bash flavor gets a real long-lived shell so `cd` and
+    // exports survive; without a manager (or with persistentShell: false) it
+    // degrades to the one-shot exec and the result says so.
+    const persistent = isPersistentBash(deps, exec)
+    const shells = deps.shells
+    const usePersistent = persistent && shells !== undefined && deps.config.persistentShell !== false
+    let res: ExecResult | 'aborted'
+    try {
+      res =
+        usePersistent && shells !== undefined
+          ? await shells.run(target.entry, cwd, rewritten, {
+              timeoutMs,
+              ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
+            })
+          : await execRemote(deps, target, rewritten, { cwd, timeoutMs }, exec.signal)
+    } catch (err) {
+      if (exec.signal.aborted) return fail('command aborted (remote execution interrupted)')
+      throw err
+    }
     if (res === 'aborted') return fail('command aborted (remote execution interrupted)')
+    const note = usePersistent
+      ? 'persistent shell: stdout and stderr are merged into one ordered stream'
+      : persistent
+        ? 'dsh-rw shim: persistent bash ran as a one-shot remote command — shell state (cwd, exports) is NOT preserved between calls'
+        : undefined
     // The registry validates bash results against the native tool's oneOf
     // output schema (foreground/background), so value must be the structured
     // foreground object; the rendered text stays the model-facing content.
@@ -1045,7 +1249,7 @@ async function shimBash(
         stdout: { text: res.stdout, truncated: res.stdout.endsWith(TRUNC_SUFFIX) },
         stderr: { text: res.stderr, truncated: res.stderr.endsWith(TRUNC_SUFFIX) },
       },
-      content: [{ type: 'text', text: renderBashResult(res, timeoutMs, isPersistentBash(deps, exec)) }],
+      content: [{ type: 'text', text: renderBashResult(res, timeoutMs, note) }],
     }
   })
 }
@@ -1058,19 +1262,30 @@ export function makeShim(deps: ShimDeps): Shim {
 
   /**
    * Record where this dispatch actually went, and — for the case that used to
-   * fail silently — say so once on the console. `translated` is the shim's own
-   * resolution result (`activeTarget(...) !== null`), so `remote` means the
-   * session's cwd is inside a placeholder whose host is configured, and
-   * `local` means a remote workspace is recorded while the agent cwd is a real
-   * local directory: legitimate pass-through by design, but indistinguishable
-   * from a working remote session unless it is reported.
+   * fail silently — say so once on the console. `resolved` is the shim's own
+   * resolution result, so `remote` means this call was translated, and with
+   * 1.0 it also carries WHICH anchor did it: `path` (the call named a
+   * placeholder path, so it reaches the remote from any working directory) or
+   * `cwd` (the session cwd lives inside a placeholder — the pre-1.0 rule).
+   * `local` means a remote workspace is recorded while this call was rooted
+   * elsewhere: legitimate pass-through by design, but indistinguishable from a
+   * working remote session unless it is reported.
    */
   const recordRouting = (
     exec: ToolDispatchExecution,
-    translated: boolean,
+    resolved: { target: ActiveTarget; reason: 'cwd' | 'path' } | null,
   ): void => {
     const routing = deps.routing
     if (routing === undefined) return
+    if (resolved !== null) {
+      routing.mode = 'remote'
+      routing.alias = resolved.target.entry.alias
+      routing.workspace = resolved.target.remoteRoot
+      routing.placeholder = resolved.target.localRoot
+      routing.reason = resolved.reason
+      delete routing.cwd
+      return
+    }
     const alias = deps.session.alias
     const workspace = deps.session.workspace
     if (alias === null || workspace === null) {
@@ -1081,18 +1296,10 @@ export function makeShim(deps: ShimDeps): Shim {
       delete routing.alias
       delete routing.workspace
       delete routing.placeholder
+      delete routing.reason
       return
     }
     const placeholder = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
-    if (translated) {
-      routing.mode = 'remote'
-      routing.alias = alias
-      routing.workspace = workspace
-      delete routing.cwd
-      if (placeholder !== null) routing.placeholder = placeholder
-      else delete routing.placeholder
-      return
-    }
     const cwd = agentCwd(exec)
     if (cwd === undefined || placeholder === null) return // cannot tell: keep the last observation
     if (insideLocal(localRootsOf(placeholder), resolve(cwd))) return // the shim would have translated
@@ -1101,15 +1308,16 @@ export function makeShim(deps: ShimDeps): Shim {
     routing.alias = alias
     routing.workspace = workspace
     routing.placeholder = placeholder
+    delete routing.reason
     const key = `${alias}\u0000${workspace}\u0000${cwd}`
     if (warnedRouting.has(key)) return
     warnedRouting.add(key)
     console.warn(
-      `[dsh-rw] native tools are running LOCALLY, not on the remote host: this session's working directory ` +
-        `(${cwd}) is not inside the dsh-rw placeholder for ${alias}:${workspace} (${placeholder}). The native ` +
-        'read/write/edit/str_replace_editor/glob/grep/bash tools operate on the local filesystem; use the rw_* ' +
-        'tools for remote work, or open the placeholder directory as this session\'s workspace to get native ' +
-        'translation.',
+      `[dsh-rw] this call ran LOCALLY, not on the remote host: it was rooted outside the dsh-rw placeholder ` +
+        `for ${alias}:${workspace} (${placeholder}) and this session's working directory (${cwd}) is not inside ` +
+        'that placeholder either. Native file calls that name a placeholder path ARE translated from any ' +
+        'working directory; bash and pathless glob/grep need the session cwd to be the placeholder. Use the ' +
+        'rw_* tools for remote work, or open the placeholder directory as this session\'s workspace.',
     )
   }
 
@@ -1118,18 +1326,24 @@ export function makeShim(deps: ShimDeps): Shim {
     next: () => Promise<ToolExecutionResult>,
   ): Promise<ToolExecutionResult> => {
     if (!deps.config.shim) return next()
-    const target = activeTarget(deps, exec)
-    if (target !== null) recordRouting(exec, true)
+    const resolved = resolveCall(deps, exec)
     if (process.env.DSH_RW_DEBUG) {
       console.log('[dsh-rw shim] dispatch', {
         name: exec.name,
-        target: target === null ? null : `${target.entry.alias}:${target.localRoot}`,
+        target:
+          resolved !== null && resolved.kind === 'target'
+            ? `${resolved.target.entry.alias}:${resolved.target.localRoot}`
+            : null,
+        anchor: resolved === null ? null : resolved.kind === 'target' ? resolved.reason : 'broken',
         hasAgent: exec.agent !== undefined && exec.agent !== null,
         cwd: agentCwd(exec) ?? null,
-        inside: target === null ? null : sessionInsidePlaceholder(target, exec),
+        inside:
+          resolved !== null && resolved.kind === 'target'
+            ? sessionInsidePlaceholder(resolved.target, exec)
+            : null,
       })
     }
-    if (target === null) {
+    if (resolved === null) {
       // The agent cwd pointing at a dsh-rw placeholder whose host is gone
       // means the user expects remote-backed native tools; never silently run
       // them on the local empty placeholder. But the block is path-aware:
@@ -1143,11 +1357,20 @@ export function makeShim(deps: ShimDeps): Shim {
       // Pass-through by design (local cwd, or a call rooted outside the
       // placeholder): record it, so the prompt and rw_info can report that
       // this session's native tools are not reaching the remote.
-      recordRouting(exec, false)
+      recordRouting(exec, null)
       return next()
     }
-    const args = objectArgs(exec.arguments)
-    if (args === null) return next()
+    if (resolved.kind === 'broken') {
+      // The call names a path inside a placeholder whose host is no longer
+      // configured: fail loud rather than run against the local stand-in.
+      if (callTouchesPlaceholder(exec.name, objectArgs(exec.arguments), localRootsOf(resolved.found.dir), resolved.found.dir)) {
+        return fail(blockedMessage(resolved.found), { name: 'RwError', code: 'NOT_CONNECTED' })
+      }
+      recordRouting(exec, null)
+      return next()
+    }
+    const { target, args } = resolved
+    recordRouting(exec, { target, reason: resolved.reason })
     switch (exec.name) {
       case 'read':
         return (await shimRead(deps, target, args)) ?? next()

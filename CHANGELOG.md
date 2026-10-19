@@ -3,6 +3,95 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.0.0 — 2026-10-19
+
+The first release where remote work stops being a second-class citizen: native
+tools reach the remote from any working directory, the persistent shell keeps
+its state, and the primitives a code workflow needs (fan-out, change watching,
+diff/patch, optimistic write) exist.
+
+### Added — path-anchored translation
+
+- A native file call that names a path inside a dsh-rw placeholder is now
+  translated to the remote **from any working directory**, not only when the
+  agent session's cwd lives in that placeholder. The anchor travels with the
+  call (`resolveCall` in `src/shim.ts`), so it can never be confused with
+  ambient session state; `bash` — which has no path to anchor on — stays
+  cwd-gated, and pathless `glob`/`grep` fall back to the cwd rule.
+- The observation record, the prompt section and `rw_info` report *which*
+  anchor translated the last call (`remote (by path)` vs `remote`), and the
+  pass-through warning states that placeholder paths still translate.
+
+### Added — `rw_exec_many`
+
+- Fan a command out across hosts in one call with bounded concurrency (default
+  4, ceiling 16), one section per call **in input order**. Give either `calls`
+  (independent command per host, with `alias`/`cwd`/`timeoutMs`) or `command` +
+  `hosts`.
+- One unreachable host never voids the rest: its section reports
+  `(not reached)` plus the error, while siblings complete normally. Every alias
+  is resolved *before* anything runs, so a typo cannot half-apply a fan-out.
+- `cwd` follows `rw_exec`'s rule: the current host's workspace when the call
+  targets the current alias, otherwise the SSH default directory.
+
+### Added — persistent shell
+
+- The persistent-bash flavor now runs on one long-lived remote `bash` per
+  (host, workspace), so `cd` and `export` survive between calls instead of
+  degrading to a fresh one-shot exec. Commands are framed with a per-call
+  random sentinel carrying the exit code (`src/persistent-shell.ts`).
+- Streams are merged (`2>&1`) on purpose — a shell has ONE ordered stream, and
+  losing that ordering would be worse than losing the stdout/stderr split; the
+  rendered result says so. A stuck command kills the shell (state reset) rather
+  than leaving unread output on the stream, and an idle shell closes after
+  `persistentShellIdleMs`.
+- `persistentShell: false` restores the pre-1.0 behavior (and its note).
+
+### Added — `rw_watch`
+
+- Poll-based remote change tracking: `start` (optional relative `path`, one
+  `include` glob, `maxEntries`), `poll` (added / changed by size-or-mtime /
+  removed since the previous snapshot), `stop`, `list`. Nothing runs on the
+  remote between polls: the snapshot lives in the plugin process, so one poll
+  costs one recursive SFTP listing.
+
+### Added — `rw_diff`, `rw_apply_patch`, optimistic write
+
+- `rw_diff` compares one remote file against supplied text or another remote
+  file and renders a unified diff; it reads **raw bytes**, so a trailing
+  newline is never reported as a phantom change, and binary files are rejected
+  instead of diffed as mojibake.
+- `rw_apply_patch` validates every path the patch would touch against the
+  workspace root **before anything runs** (`patchTargets`), stages the patch on
+  the host, and runs `patch -pN --dry-run` first, so a mismatch changes nothing.
+  The staged file is always removed.
+- `rw_write_file` gains `ifHash`: write only when the remote content hashes to
+  the given sha256, or pass `"absent"` to only create. A mismatch fails with
+  `RW_WRITE_CONFLICT` and reports the current hash.
+
+### Changed
+
+- **Shim semantics**: native file calls are now translated by their own path
+  argument as well as by the session cwd. This is a behavior change — a session
+  started in a local directory will translate calls that name a placeholder
+  path (previously they ran locally). The "never silently local" guarantee is
+  preserved: every pass-through is still observed, reported and warned once.
+- **Remote search now mirrors the native tools**: `glob` runs with
+  `--sort=modified --no-ignore --hidden` plus the VCS excludes, `grep` uses
+  `rg --json` (the native transport, so a path containing colons cannot be
+  mis-split), and both put `--` before the search root. When ripgrep is missing
+  on the host, the `find`/`grep -rnE` fallback is labelled in the result rather
+  than silently returning different ignore/hidden semantics.
+- Tool count 12 → 16: `rw_exec_many`, `rw_watch`, `rw_diff`, `rw_apply_patch`
+  are inserted between `rw_exec` and `rw_disconnect` (fixed registration order).
+- DSH peer ranges extend to `^0.2.1-rc.1` (keeping `^0.1.2-rc.1` and
+  `^0.2.0-rc.2`), and the development dependencies move to `0.2.1-rc.1`.
+
+### Fixed
+
+- Reading a file for diffing no longer loses its trailing newline (the line
+  reader used before this release rejoins lines without the terminator).
+
 ## 0.4.6 — 2026-10-08
 
 - Stop claiming native translation that is not happening. The prompt section used to say "this session's

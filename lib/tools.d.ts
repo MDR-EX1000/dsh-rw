@@ -1,7 +1,7 @@
 import type { HostEntry, HostSummary } from './hosts.js';
 import type { Session } from './session.js';
 import type { NativeRouting } from './shim.js';
-import type { ExecResult, SftpLike } from './ssh-pool.js';
+import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js';
 /**
  * Structural subset of HostTable consumed by the tools/routes. HostTable has
  * private fields (nominally typed), so depending on this interface is what
@@ -31,6 +31,12 @@ export interface PoolLike {
         timeoutMs?: number;
     }): Promise<ExecResult>;
     sftp(entry: HostEntry): Promise<SftpLike>;
+    /**
+     * Open a long-lived shell channel. Optional so structural test doubles stay
+     * valid; the persistent-shell manager reports a clear error when a pool
+     * cannot provide one.
+     */
+    openShell?(entry: HostEntry): Promise<RemoteShellChannel>;
     testConnect(entry: HostEntry): Promise<number>;
     disconnect(alias: string): void;
     connected(): string[];
@@ -66,5 +72,7 @@ export declare function resolveWorkspaceDir(deps: ToolsDeps, alias: string, path
 }>;
 /** Sync status lines shared by rw_info and the /rw slash command. */
 export declare function statusText(deps: ToolsDeps): string;
+/** The fixed number of rw_* tools, exported so the registration-order tests track it. */
+export declare const RW_TOOL_COUNT = 16;
 /** The twelve rw_* tools in their fixed registration order. */
 export declare function makeTools(deps: ToolsDeps): unknown[];

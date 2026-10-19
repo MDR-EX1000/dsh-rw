@@ -18,6 +18,7 @@ import { createNativeRouting, makeShim } from './shim.js'
 import type { ShimConfig } from './shim.js'
 import { resolvePlaceholderDir } from './placeholder.js'
 import { SshPool } from './ssh-pool.js'
+import { PersistentShellManager } from './persistent-shell.js'
 import { makeTools, statusText } from './tools.js'
 import type { HostTableLike, PoolLike, ToolsDeps } from './tools.js'
 
@@ -49,6 +50,10 @@ export const Config = z.object({
   shimBash: z.boolean().default(true),
   /** Shimmed bash approval: 'ask' escalates to the DSH approval dialog, 'native' defers to the native policy. */
   shimBashApproval: z.union(['ask', 'native']).default('ask'),
+  /** Run the persistent-bash flavor on one long-lived remote shell per (host, workspace) instead of a fresh one-shot exec. Default true. */
+  persistentShell: z.boolean().default(true),
+  /** Close a persistent shell after this many ms without a command (default 10 minutes). */
+  persistentShellIdleMs: z.number().step(1).min(0).default(600000),
 })
 
 export interface Config {
@@ -62,6 +67,9 @@ export interface Config {
   shim?: boolean
   shimBash?: boolean
   shimBashApproval?: 'ask' | 'native'
+  /** Optional so hand-built test configs still typecheck (schema default: true). */
+  persistentShell?: boolean
+  persistentShellIdleMs?: number
 }
 
 /**
@@ -184,6 +192,15 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
   // every dispatch, the prompt section and rw_info read it. Never inferred from
   // the session record alone — see promptText.
   const nativeRouting = createNativeRouting()
+  // One long-lived remote shell per (host, workspace) backs the persistent-bash
+  // flavor; ids are the pool's own so channel opens behave like every other op.
+  const shells = new PersistentShellManager({
+    open: (entry) => {
+      if (pool.openShell === undefined) throw new Error('this pool cannot open a persistent shell')
+      return pool.openShell(entry)
+    },
+    idleMs: config.persistentShellIdleMs ?? 600000,
+  })
 
   const deps: ToolsDeps = {
     hosts,
@@ -212,6 +229,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     shimBashApproval: config.shimBashApproval ?? 'ask',
     commandTimeoutMs: config.commandTimeoutMs,
     maxOutputChars: config.maxOutputChars,
+    persistentShell: config.persistentShell ?? true,
   }
   const logShimConfig = (source: string): void => {
     console.log(
@@ -245,29 +263,35 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
         resolvePlaceholderDir(alias, workspace, overrides.placeholderBaseDir) ??
         '(placeholder directory not found)'
       if (nativeRouting.mode === 'local') {
-        // This session's cwd is a real local directory, so the shim passes the
-        // native tools through to the local machine. Saying anything else here
-        // is how a session ends up editing local files while believing it is
-        // working on the remote.
+        // The last native call was rooted outside every placeholder and the
+        // session cwd is a real local directory, so it went to the local
+        // machine. Saying it reached the remote is how a session ends up
+        // editing local files while believing it is working on the remote.
         return [
           '## Remote workspace (dsh-rw)',
           `Current remote workspace: ${who}:${workspace}`,
-          `WARNING — the native ${native} tools are running on the LOCAL machine, not on the remote host: ` +
-            `this session's working directory (${nativeRouting.cwd ?? 'unknown'}) is not inside the dsh-rw ` +
-            `placeholder for that workspace (${placeholder}). Remote work needs the rw_* tools; to make the ` +
-            'native tools reach the remote, open the placeholder directory as this session\'s workspace. ' +
+          `WARNING — the native tools were running on the LOCAL machine for the last call: it named paths outside ` +
+            `the dsh-rw placeholder (${placeholder}) and this session's working directory ` +
+            `(${nativeRouting.cwd ?? 'unknown'}) is not inside that placeholder either. Native file calls that DO ` +
+            `name a path inside ${placeholder} are translated to the remote from any working directory; bash and ` +
+            'pathless glob/grep need the session cwd to be the placeholder. ' +
             rwTools,
         ].join('\n')
       }
       if (nativeRouting.mode === 'remote') {
-        // Observed: the session cwd lives inside the placeholder, so native
-        // calls are translated. Steer the model to them — pushing rw_* here
-        // would keep the shim dormant.
+        // Observed: native calls are being translated. Steer the model to them —
+        // pushing rw_* here would keep the shim dormant. The anchor decides how
+        // much of the session is remote-backed, so state it.
+        const how =
+          nativeRouting.reason === 'path'
+            ? `an explicit path inside ${placeholder} is translated from any working directory (bash and pathless ` +
+              'glob/grep still need the session cwd to be the placeholder)'
+            : `this session's working directory is inside ${placeholder}`
         return [
           '## Remote workspace (dsh-rw)',
           `Current remote workspace: ${who}:${workspace}`,
           `This session's workspace is remote-backed: the native ${native} tools are translated to the remote ` +
-            'host automatically — use them exactly as if the workspace were local. ' +
+            `host automatically — ${how}. Use them exactly as if the workspace were local. ` +
             `${rwTools} The remote filesystem is the source of truth (no local mirror).`,
         ].join('\n')
       }
@@ -277,10 +301,13 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       return [
         '## Remote workspace (dsh-rw)',
         `Current remote workspace: ${who}:${workspace}`,
-        `The native ${native} tools are translated to the remote host only while this session's working ` +
-          `directory is inside the dsh-rw placeholder directory (${placeholder}); calls rooted anywhere else run ` +
-          'on the local machine. No native tool call has been observed since the plugin loaded, so which of the ' +
-          'two is in effect is not known yet — call rw_info to see where the native tools actually go. ' +
+        `The native ${native} tools have two translation anchors: (1) a call whose path argument is inside the ` +
+          `dsh-rw placeholder directory (${placeholder}) is translated to the remote host from ANY working ` +
+          `directory; (2) bash — and glob/grep without an explicit path — is translated only while this ` +
+          "session's working directory is inside that placeholder, because it has no path to anchor on. Calls " +
+          'rooted outside both run on the local machine. No native tool call has been observed since the plugin ' +
+          'loaded, so which anchor is in effect is not known yet — call rw_info to see where the native tools ' +
+          'actually go. ' +
           rwTools,
       ].join('\n')
     }
@@ -318,6 +345,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       session,
       config: shimSettings,
       routing: nativeRouting,
+      shells,
       ...(overrides.placeholderBaseDir !== undefined ? { placeholderBaseDir: overrides.placeholderBaseDir } : {}),
       getTool: (toolName, agent) => ctx.tools.get(toolName, agent as Parameters<Context['tools']['get']>[1]),
       // Never-ask detection for the pre-execute gate; absent/legacy approval
@@ -403,5 +431,11 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     'dsh-rw: prompt',
   )
 
-  ctx.effect(() => () => pool.dispose(), 'dsh-rw: pool')
+  ctx.effect(
+    () => () => {
+      shells.dispose()
+      pool.dispose()
+    },
+    'dsh-rw: pool',
+  )
 }
