@@ -33,6 +33,11 @@ export interface HostSummary {
   keyReady: boolean
   /** password auth: whether a password is stored. */
   passwordSet: boolean
+  /**
+   * key auth: the configured private-key path. Not a secret (it is a path),
+   * and the edit form needs it to prefill without forcing a re-entry.
+   */
+  keyPath?: string
   source: 'ssh-config' | 'manual'
 }
 
@@ -195,6 +200,7 @@ export class HostTable {
       authKind: entry.auth.kind,
       keyReady: entry.auth.kind === 'key' && entry.auth.keyPath !== '' && existsSync(entry.auth.keyPath),
       passwordSet: entry.auth.kind === 'password' && !!entry.auth.password,
+      ...(entry.auth.kind === 'key' ? { keyPath: entry.auth.keyPath } : {}),
       source: entry.source,
     }
   }
@@ -203,17 +209,20 @@ export class HostTable {
     return this.list().map((e) => this.summarize(e))
   }
 
-  addManual(payload: {
-    alias: string
-    host: string
-    port?: number
-    user: string
-    password?: string
-    keyPath?: string
-    passphrase?: string
-  }): HostEntry {
-    if (!ALIAS_RE.test(payload.alias)) {
-      throw new RwError('INVALID_INPUT', `invalid alias: ${JSON.stringify(payload.alias)}`)
+  /** Validate a manual host's connection details and build its entry. */
+  private buildManualEntry(
+    alias: string,
+    payload: {
+      host: string
+      port?: number
+      user: string
+      password?: string
+      keyPath?: string
+      passphrase?: string
+    },
+  ): HostEntry {
+    if (!ALIAS_RE.test(alias)) {
+      throw new RwError('INVALID_INPUT', `invalid alias: ${JSON.stringify(alias)}`)
     }
     if (!payload.host) {
       throw new RwError('INVALID_INPUT', 'host is required')
@@ -227,11 +236,8 @@ export class HostTable {
     if (!hasKey && !hasPassword) {
       throw new RwError('INVALID_INPUT', 'either keyPath or password is required')
     }
-    if (this.manual.some((e) => e.alias === payload.alias)) {
-      throw new RwError('INVALID_INPUT', `manual host already exists: ${payload.alias}`)
-    }
-    const entry: HostEntry = {
-      alias: payload.alias,
+    return {
+      alias,
       host: payload.host,
       port,
       user: payload.user,
@@ -242,7 +248,60 @@ export class HostTable {
         : { kind: 'password', password: payload.password },
       source: 'manual',
     }
+  }
+
+  addManual(payload: {
+    alias: string
+    host: string
+    port?: number
+    user: string
+    password?: string
+    keyPath?: string
+    passphrase?: string
+  }): HostEntry {
+    const entry = this.buildManualEntry(payload.alias, payload)
+    if (this.manual.some((e) => e.alias === payload.alias)) {
+      throw new RwError('INVALID_INPUT', `manual host already exists: ${payload.alias}`)
+    }
     this.manual.push(entry)
+    this.saveStore()
+    return entry
+  }
+
+  /**
+   * Replace one manual host's connection details in place. The alias is the
+   * record key, so it cannot change (a rename is remove + add), and
+   * ssh-config hosts are not editable here — their source of truth is
+   * ~/.ssh/config.
+   */
+  updateManual(
+    alias: string,
+    payload: {
+      host: string
+      port?: number
+      user: string
+      password?: string
+      keyPath?: string
+      passphrase?: string
+    },
+  ): HostEntry {
+    const index = this.manual.findIndex((e) => e.alias === alias)
+    const existing = this.manual[index]
+    if (existing === undefined) throw new RwError('INVALID_INPUT', `no manual host named ${JSON.stringify(alias)}`)
+    // An edit that only moves the address must not wipe the credential: when
+    // neither a password nor a key path is supplied, keep what is stored.
+    const withCredential =
+      payload.password !== undefined || payload.keyPath !== undefined
+        ? payload
+        : existing.auth.kind === 'key'
+          ? {
+              ...payload,
+              keyPath: existing.auth.keyPath,
+              ...(existing.auth.passphrase !== undefined ? { passphrase: existing.auth.passphrase } : {}),
+            }
+          : { ...payload, password: existing.auth.password }
+    const entry = this.buildManualEntry(alias, withCredential)
+    this.manual[index] = entry
     this.saveStore()
     return entry
   }

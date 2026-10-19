@@ -23,6 +23,18 @@ export interface HostTableLike {
         passphrase?: string;
     }): HostEntry;
     removeManual(alias: string): void;
+    /**
+     * Replace one manual host's connection details. Optional so a structural
+     * double stays valid; the route reports 501 when a table cannot edit.
+     */
+    updateManual?(alias: string, payload: {
+        host: string;
+        port?: number;
+        user: string;
+        password?: string;
+        keyPath?: string;
+        passphrase?: string;
+    }): HostEntry;
 }
 /** Structural subset of SshPool (same rationale as HostTableLike). */
 export interface PoolLike {

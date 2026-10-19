@@ -23,6 +23,11 @@ export interface HostSummary {
     keyReady: boolean;
     /** password auth: whether a password is stored. */
     passwordSet: boolean;
+    /**
+     * key auth: the configured private-key path. Not a secret (it is a path),
+     * and the edit form needs it to prefill without forcing a re-entry.
+     */
+    keyPath?: string;
     source: 'ssh-config' | 'manual';
 }
 /** Expand a leading `~` (or `~/...`) against the current user's home. */
@@ -52,8 +57,24 @@ export declare class HostTable {
     find(alias: string): HostEntry | undefined;
     summarize(entry: HostEntry): HostSummary;
     summaries(): HostSummary[];
+    /** Validate a manual host's connection details and build its entry. */
+    private buildManualEntry;
     addManual(payload: {
         alias: string;
+        host: string;
+        port?: number;
+        user: string;
+        password?: string;
+        keyPath?: string;
+        passphrase?: string;
+    }): HostEntry;
+    /**
+     * Replace one manual host's connection details in place. The alias is the
+     * record key, so it cannot change (a rename is remove + add), and
+     * ssh-config hosts are not editable here — their source of truth is
+     * ~/.ssh/config.
+     */
+    updateManual(alias: string, payload: {
         host: string;
         port?: number;
         user: string;

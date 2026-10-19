@@ -410,3 +410,45 @@ describe('GET /api/dsh-rw/ls-local', () => {
     expect(missing.json.code).toBe('NO_SUCH_PATH')
   })
 })
+
+describe('PATCH /api/dsh-rw/hosts (edit a manual host)', () => {
+  it('replaces the connection details and returns the summary (never the secret)', async () => {
+    const created = await call(routes, '/api/dsh-rw/hosts', 'POST', {
+      body: { alias: 'box', host: 'old.example.com', user: 'u', password: 'pw-one' },
+    })
+    expect(created.status).toBe(201)
+
+    const updated = await call(routes, '/api/dsh-rw/hosts', 'PATCH', {
+      body: { alias: 'box', host: 'new.example.com', port: 2222, user: 'v', keyPath: '/tmp/id_ed25519' },
+    })
+    expect(updated.status).toBe(200)
+    expect((updated.json.host as { host: string }).host).toBe('new.example.com')
+    expect((updated.json.host as { port: number }).port).toBe(2222)
+    expect((updated.json.host as { authKind: string }).authKind).toBe('key')
+    expect(JSON.stringify(updated.json)).not.toContain('pw-one')
+
+    const list = await call(routes, '/api/dsh-rw/hosts', 'GET')
+    const box = (list.json.hosts as { alias: string; host: string; port: number }[]).find((h) => h.alias === 'box')
+    expect(box).toMatchObject({ host: 'new.example.com', port: 2222 })
+  })
+
+  it('refuses unknown aliases, ssh-config hosts, and invalid payloads', async () => {
+    const ghost = await call(routes, '/api/dsh-rw/hosts', 'PATCH', { body: { alias: 'ghost', host: 'h', user: 'u', password: 'p' } })
+    expect(ghost.status).toBe(404)
+    // 'dev' comes from ~/.ssh/config in the fake table; 'prod' is manual.
+    const fromConfig = await call(routes, '/api/dsh-rw/hosts', 'PATCH', { body: { alias: 'dev', host: 'h', user: 'u', password: 'p' } })
+    expect(fromConfig.status).toBe(400)
+    expect(fromConfig.json.error).toContain('ssh config')
+
+    const created = await call(routes, '/api/dsh-rw/hosts', 'POST', { body: { alias: 'box2', host: 'a', user: 'u', password: 'p' } })
+    expect(created.status).toBe(201)
+    // An address-only edit keeps the stored credential instead of wiping it.
+    const kept = await call(routes, '/api/dsh-rw/hosts', 'PATCH', { body: { alias: 'box2', host: 'b', user: 'u' } })
+    expect(kept.status).toBe(200)
+    expect(kept.json.host).toMatchObject({ host: 'b', authKind: 'password', passwordSet: true })
+    // A genuinely invalid payload still fails.
+    const noHost = await call(routes, '/api/dsh-rw/hosts', 'PATCH', { body: { alias: 'box2', user: 'u' } })
+    expect(noHost.status).toBe(400)
+    expect(noHost.json.code).toBe('INVALID_INPUT')
+  })
+})

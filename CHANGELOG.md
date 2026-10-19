@@ -3,6 +3,40 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.2.0 — 2026-10-19
+
+### Changed — the SSH host picker is a host list, not a dropdown
+
+The 远程 page listed hosts in a native `<select>` that showed only the alias.
+Everything the host table already knew — `user@host:port`, whether the entry
+came from `~/.ssh/config` or was added by hand, whether its credential is
+ready — was invisible, and an unusable host was silently greyed out with no
+reason. The list is now one row per host:
+
+- provenance and credential pills, plus a red inline reason (private key
+  missing / password not set) instead of a silent grey-out;
+- a status dot that turns green or red once the row has been probed;
+- a per-row **test** action wired to the existing `POST /api/dsh-rw/test`,
+  showing the measured latency or the failure;
+- **edit** and **remove** actions for manual hosts (ssh-config entries stay
+  read-only here — their source of truth is `~/.ssh/config`).
+
+### Added — editing a manual host
+
+`PATCH /api/dsh-rw/hosts` replaces one manual host's connection details in
+place. The alias is the record key and cannot change (rename = remove + add),
+and ssh-config hosts are refused. An edit that only moves the address **keeps
+the stored credential**: `password` and `keyPath` are both optional on edit,
+and the summary now exposes `keyPath` (a path, never a secret) so the form can
+prefill it. The pooled connection is dropped after an edit so the next
+operation redials with the new details.
+
+### Added — the picker remembers the last host
+
+The host last selected (or whose workspace was committed) is restored on the
+next open: live session host first, then the remembered one, then the first
+usable host. Same idea as the remembered local directory from 1.1.0.
+
 ## 1.1.1 — 2026-10-19
 
 ### Fixed — flaky host-key tests made CI red on the v1.1.0 tag

@@ -94,6 +94,40 @@ export class FakeHosts implements HostTableLike {
     const i = this.entries.findIndex((e) => e.alias === alias && e.source === 'manual')
     if (i >= 0) this.entries.splice(i, 1)
   }
+
+  updateManual(
+    alias: string,
+    payload: {
+      host: string
+      port?: number
+      user: string
+      password?: string
+      keyPath?: string
+      passphrase?: string
+    },
+  ): HostEntry {
+    const i = this.entries.findIndex((e) => e.alias === alias && e.source === 'manual')
+    const existing = this.entries[i]
+    if (existing === undefined) throw new RwError('INVALID_INPUT', `no manual host named ${JSON.stringify(alias)}`)
+    if (!payload.host) throw new RwError('INVALID_INPUT', 'host is required')
+    // Same rule as HostTable.updateManual: no credential supplied → keep the stored one.
+    if (!payload.keyPath && !payload.password) {
+      if (existing.auth.kind === 'key') payload = { ...payload, keyPath: existing.auth.keyPath }
+      else payload = { ...payload, password: existing.auth.password }
+    }
+    const entry: HostEntry = {
+      alias,
+      host: payload.host,
+      port: payload.port ?? 22,
+      user: payload.user,
+      auth: payload.keyPath
+        ? { kind: 'key', keyPath: payload.keyPath, ...(payload.passphrase ? { passphrase: payload.passphrase } : {}) }
+        : { kind: 'password', password: payload.password },
+      source: 'manual',
+    }
+    this.entries[i] = entry
+    return entry
+  }
 }
 
 export class FakePool implements PoolLike {

@@ -40,7 +40,16 @@ interface HostSummary {
   authKind: 'key' | 'password'
   keyReady: boolean
   passwordSet: boolean
+  /** key auth: the configured private-key path (a path, not a secret). */
+  keyPath?: string
   source: 'ssh-config' | 'manual'
+}
+
+/** Last probe outcome of one host, kept in the modal's memory only. */
+interface HostHealth {
+  state: 'testing' | 'ok' | 'fail'
+  ms?: number
+  error?: string
 }
 
 /** One entry of a GET /api/dsh-rw/ls listing. */
@@ -67,6 +76,8 @@ interface LsResponse {
 
 /** Remembered local workspace directory, so the本机 page never starts empty. */
 const LOCAL_PATH_KEY = 'dsh-rw:lastLocalPath'
+/** Remembered SSH host alias, so the远程 page opens on the machine last used. */
+const HOST_KEY = 'dsh-rw:lastHost'
 
 interface LocalPickResponse {
   ok?: boolean
@@ -150,6 +161,168 @@ function drillable(it: LsItem): boolean {
 function hostProblem(h: HostSummary, t: Translate): string | null {
   if (h.authKind === 'key') return h.keyReady ? null : t('privateKeyMissing')
   return h.passwordSet ? null : t('passwordNotSet')
+}
+
+/** Tiny pill for one host attribute (provenance, credential readiness). */
+function Pill(props: { tone?: 'ok' | 'warn'; children: unknown }) {
+  const color = props.tone === 'ok' ? T.ok : props.tone === 'warn' ? T.danger : T.muted
+  return (
+    <span
+      style={{
+        fontSize: 11,
+        lineHeight: '16px',
+        padding: '0 6px',
+        borderRadius: 6,
+        border: '1px solid ' + T.border,
+        color,
+        whiteSpace: 'nowrap',
+        flexShrink: 0,
+      }}
+    >
+      {props.children as never}
+    </span>
+  )
+}
+
+/** Compact icon action inside a host row (test / edit / remove). */
+function MiniAction(props: { title: string; danger?: boolean; onClick: () => void; children: unknown }) {
+  const [hov, setHov] = useState(false)
+  return (
+    <button
+      title={props.title}
+      aria-label={props.title}
+      onClick={(e) => {
+        e.stopPropagation()
+        props.onClick()
+      }}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        width: 26,
+        height: 26,
+        flexShrink: 0,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderRadius: 8,
+        border: '1px solid transparent',
+        background: hov ? T.bgHover : 'transparent',
+        color: props.danger ? T.danger : T.muted,
+        cursor: 'pointer',
+        fontSize: 13,
+        fontFamily: 'inherit',
+        transition: 'background .15s',
+      }}
+    >
+      {props.children as never}
+    </button>
+  )
+}
+
+/**
+ * One SSH host row: identity, provenance, credential readiness, last probe
+ * result and its actions. Replaces the bare <select>, which showed only the
+ * alias and greyed unavailable hosts out with no reason.
+ */
+function HostCard(props: {
+  host: HostSummary
+  active: boolean
+  health?: HostHealth
+  t: Translate
+  onPick: () => void
+  onTest: () => void
+  onEdit?: () => void
+  onRemove?: () => void
+}) {
+  const { host, active, health, t } = props
+  const [hov, setHov] = useState(false)
+  const problem = hostProblem(host, t)
+  const exact = host.authKind === 'key' ? host.keyReady : host.passwordSet
+  const dot = health === undefined ? T.muted : health.state === 'ok' ? T.ok : health.state === 'fail' ? T.danger : T.accent
+  const probe =
+    health === undefined
+      ? ''
+      : health.state === 'testing'
+        ? ` · ${t('testing')}`
+        : health.state === 'ok'
+          ? ` · ${t('hostLatency', { latency: health.ms ?? 0 })}`
+          : ` · ${t('hostUnreachable', { error: health.error ?? '' })}`
+  const detail = `${host.user}@${host.host}:${host.port}` + (problem !== null ? ` · ${problem}` : probe)
+  return (
+    <div
+      role="button"
+      tabIndex={problem === null ? 0 : -1}
+      aria-disabled={problem !== null}
+      onClick={() => {
+        if (problem === null) props.onPick()
+      }}
+      onKeyDown={(e) => {
+        if (problem === null && (e.key === 'Enter' || e.key === ' ')) {
+          e.preventDefault()
+          props.onPick()
+        }
+      }}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '8px 8px 8px 12px',
+        borderRadius: T.radius,
+        border: '1px solid ' + (active ? T.accent : hov && problem === null ? T.borderStrong : T.border),
+        background: active ? T.bgHover : 'transparent',
+        cursor: problem === null ? 'pointer' : 'not-allowed',
+        opacity: problem === null ? 1 : 0.62,
+        transition: 'background .15s, border-color .15s',
+      }}
+    >
+      <span style={{ width: 8, height: 8, borderRadius: 4, background: dot, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+          <span
+            style={{
+              fontSize: 14,
+              fontWeight: active ? 600 : 500,
+              color: T.label,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {host.alias}
+          </span>
+          <Pill>{host.source === 'manual' ? t('badgeManual') : t('badgeSshConfig')}</Pill>
+          <Pill tone={exact ? 'ok' : 'warn'}>{host.authKind === 'key' ? t('badgeKey') : t('badgePassword')}</Pill>
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: problem !== null ? T.danger : T.muted,
+            marginTop: 2,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {detail}
+        </div>
+      </div>
+      <MiniAction title={t('testConnection')} onClick={props.onTest}>
+        {health?.state === 'testing' ? '…' : '⟳'}
+      </MiniAction>
+      {props.onEdit !== undefined ? (
+        <MiniAction title={t('editHost')} onClick={props.onEdit}>
+          ✎
+        </MiniAction>
+      ) : null}
+      {props.onRemove !== undefined ? (
+        <MiniAction title={t('remove')} danger onClick={props.onRemove}>
+          ✕
+        </MiniAction>
+      ) : null}
+    </div>
+  )
 }
 
 /** Alias charset, mirroring the host-side HostTable.addManual ALIAS_RE. */
@@ -493,6 +666,9 @@ function DirPicker(props: LocalizedDirPickerProps) {
   const [form, setForm] = useState<AddHostForm>(emptyAddForm)
   const [formErr, setFormErr] = useState('')
   const [testing, setTesting] = useState(false)
+  // 主机列表的健康状态与编辑目标：testHost 写入，HostCard 读取。
+  const [hostHealth, setHostHealth] = useState<Record<string, HostHealth>>({})
+  const [editingAlias, setEditingAlias] = useState('')
   const [saving, setSaving] = useState(false)
   const [testMsg, setTestMsg] = useState('')
   const [testOk, setTestOk] = useState(false)
@@ -509,7 +685,16 @@ function DirPicker(props: LocalizedDirPickerProps) {
         const list = Array.isArray(r.hosts) ? r.hosts : []
         setHosts(list)
         const cur = r.current && typeof r.current.alias === 'string' ? r.current.alias : ''
-        setAlias(cur || (list[0] ? list[0].alias : ''))
+        // Prefer the live session host, then the machine used last time, then
+        // the first host that is actually usable.
+        let remembered = ''
+        try {
+          remembered = window.localStorage.getItem(HOST_KEY) ?? ''
+        } catch {
+          remembered = ''
+        }
+        const lastUsable = list.some((h) => h.alias === remembered && hostProblem(h, t) === null) ? remembered : ''
+        setAlias(cur || lastUsable || (list[0] ? list[0].alias : ''))
       })
       .catch((e) => setErr(t('loadHostsFailed', { error: errText(e) })))
   }, [open, t])
@@ -730,8 +915,12 @@ function DirPicker(props: LocalizedDirPickerProps) {
     const name = wsName.trim()
     api<WorkspaceResponse>('POST', '/api/dsh-rw/workspace', { alias, path: target, ...(name ? { name } : {}) })
       .then((res) => {
-        if (res && res.ok && res.placeholderDir) onPicked(String(res.placeholderDir))
-        else setErr((res && res.error) || t('setRemoteWorkspaceFailed'))
+        if (res && res.ok && res.placeholderDir) {
+          rememberHost(alias)
+          onPicked(String(res.placeholderDir))
+        } else {
+          setErr((res && res.error) || t('setRemoteWorkspaceFailed'))
+        }
       })
       .catch((e) => setErr(errText(e)))
   }
@@ -758,8 +947,11 @@ function DirPicker(props: LocalizedDirPickerProps) {
     if (forSave && !ALIAS_RE.test(form.alias.trim())) return t('aliasInvalid')
     if (!form.host.trim()) return t('hostRequired')
     if (!form.user.trim()) return t('userRequired')
-    if (form.authKind === 'key' && !form.keyPath.trim()) return t('keyPathRequired')
-    if (form.authKind === 'password' && !form.password) return t('passwordRequired')
+    // While editing, a blank credential means "keep the stored one".
+    if (!editingAlias) {
+      if (form.authKind === 'key' && !form.keyPath.trim()) return t('keyPathRequired')
+      if (form.authKind === 'password' && !form.password) return t('passwordRequired')
+    }
     return ''
   }
 
@@ -780,6 +972,64 @@ function DirPicker(props: LocalizedDirPickerProps) {
       setHosts(list)
       return list
     })
+
+  /** Remember the host so the next open lands on it. */
+  const rememberHost = (a: string) => {
+    if (!a) return
+    try {
+      window.localStorage.setItem(HOST_KEY, a)
+    } catch {
+      // storage may be disabled; selection still works for this session
+    }
+  }
+
+  /** Pick a registered host: select it and load its home directory. */
+  const selectHost = (a: string) => {
+    setAlias(a)
+    setErr('')
+    if (!a) {
+      setDirItems([])
+      return
+    }
+    setPath('~/')
+    loadDir(a, '~/', true)
+    rememberHost(a)
+  }
+
+  /** Probe one registered host and keep the outcome for its row. */
+  const testHost = (h: HostSummary) => {
+    setHostHealth((prev) => ({ ...prev, [h.alias]: { state: 'testing' } }))
+    api<TestResponse>('POST', '/api/dsh-rw/test', { alias: h.alias })
+      .then((r) => {
+        setHostHealth((prev) => ({
+          ...prev,
+          [h.alias]:
+            r && r.ok
+              ? { state: 'ok', ...(typeof r.latencyMs === 'number' ? { ms: r.latencyMs } : {}) }
+              : { state: 'fail', error: (r && r.error) || t('connectionFailed') },
+        }))
+      })
+      .catch((e) => setHostHealth((prev) => ({ ...prev, [h.alias]: { state: 'fail', error: errText(e) } })))
+  }
+
+  /** Open the add-host form pre-filled for an existing manual host. */
+  const startEditHost = (h: HostSummary) => {
+    setEditingAlias(h.alias)
+    setForm({
+      alias: h.alias,
+      host: h.host,
+      port: String(h.port),
+      user: h.user,
+      authKind: h.authKind,
+      keyPath: h.keyPath ?? '',
+      passphrase: '',
+      password: '',
+    })
+    setFormErr('')
+    setTestMsg('')
+    setTestOk(false)
+    setView('addHost')
+  }
 
   // 测试连接：完整字段形式 POST /test —— 临时探测，不入库。
   const testNewHost = () => {
@@ -811,26 +1061,32 @@ function DirPicker(props: LocalizedDirPickerProps) {
       .finally(() => setTesting(false))
   }
 
-  // 保存手动主机：成功后清空表单（含密码）、回到远程页、刷新列表并自动选中新主机。
+  // 保存手动主机：编辑模式发 PATCH（别名不可改），否则 POST 新增。成功后清空
+  // 表单（含密码）、回到远程页、刷新列表并选中该主机。
   const saveNewHost = () => {
     const msg = addFormError(true)
     if (msg) {
       setFormErr(msg)
       return
     }
-    const newAlias = form.alias.trim()
+    const targetAlias = editingAlias || form.alias.trim()
     setSaving(true)
     setFormErr('')
-    api<AddHostResponse>('POST', '/api/dsh-rw/hosts', { alias: newAlias, ...addFormPayload() })
+    const request = editingAlias
+      ? api<AddHostResponse>('PATCH', '/api/dsh-rw/hosts', { alias: editingAlias, ...addFormPayload() })
+      : api<AddHostResponse>('POST', '/api/dsh-rw/hosts', { alias: targetAlias, ...addFormPayload() })
+    request
       .then(() => {
         resetAddForm()
+        setEditingAlias('')
         setView('remote')
         refreshHosts()
           .then(() => {
-            setAlias(newAlias)
+            setAlias(targetAlias)
             setErr('')
             setPath('~/')
-            loadDir(newAlias, '~/', true)
+            loadDir(targetAlias, '~/', true)
+            rememberHost(targetAlias)
           })
           .catch((e) => setErr(t('hostSavedRefreshFailed', { error: errText(e) })))
       })
@@ -881,10 +1137,16 @@ function DirPicker(props: LocalizedDirPickerProps) {
     }
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <SingleLine text={t('manualHostHint')} />
+        <SingleLine text={editingAlias ? t('editHostHint') : t('manualHostHint')} />
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 0.9fr) minmax(0, 1.35fr)', gap: 12 }}>
           <FormRow label={t('nameLabel')}>
-            <TextInput value={form.alias} onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })} placeholder={t('aliasPlaceholder')} />
+            <TextInput
+              value={form.alias}
+              onChange={(e: { target: { value: string } }) => updForm({ alias: e.target.value })}
+              placeholder={t('aliasPlaceholder')}
+              disabled={editingAlias !== ''}
+            />
+            {editingAlias ? <SingleLine text={t('aliasFixedHint')} /> : null}
           </FormRow>
           <FormRow label={t('hostLabel')}>
             <TextInput value={form.host} onChange={(e: { target: { value: string } }) => updForm({ host: e.target.value })} placeholder={t('hostPlaceholder')} />
@@ -926,7 +1188,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
             {testing ? t('testing') : t('testConnection')}
           </Btn>
           <Btn primary onClick={saveNewHost} disabled={busyForm}>
-            {saving ? t('saving') : t('save')}
+            {saving ? t('saving') : editingAlias ? t('saveChanges') : t('save')}
           </Btn>
         </div>
       </div>
@@ -949,6 +1211,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
       onClick={() => {
         if (view === 'addHost') {
           resetAddForm()
+          setEditingAlias('')
           setView('remote')
         } else {
           setView('cards')
@@ -1075,35 +1338,20 @@ function DirPicker(props: LocalizedDirPickerProps) {
                       </Btn>
                     ) : null}
                   </div>
-                  <div style={{ position: 'relative' }}>
-                    <span style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', color: T.accent, display: 'flex', pointerEvents: 'none', zIndex: 1 }}>
-                      <SvgGlobe />
-                    </span>
-                    <select
-                      value={alias}
-                      onChange={(e) => {
-                        const a = e.target.value
-                        setAlias(a)
-                        setErr('')
-                        if (a) {
-                          setPath('~/')
-                          loadDir(a, '~/', true)
-                        } else {
-                          setDirItems([])
-                        }
-                      }}
-                      style={{ ...inputS, width: '100%', boxSizing: 'border-box', paddingLeft: 40, paddingRight: 36, appearance: 'none', WebkitAppearance: 'none' }}
-                    >
-                      <option value="">{t('choose')}</option>
-                      {hosts.map((h) => (
-                        <option key={h.alias} value={h.alias} disabled={hostProblem(h, t) !== null}>
-                          {h.alias}
-                        </option>
-                      ))}
-                    </select>
-                    <span style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', color: T.muted, display: 'flex', pointerEvents: 'none' }}>
-                      <SvgChevronDown />
-                    </span>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {hosts.map((h) => (
+                      <HostCard
+                        key={h.alias}
+                        host={h}
+                        active={h.alias === alias}
+                        health={hostHealth[h.alias]}
+                        t={t}
+                        onPick={() => selectHost(h.alias)}
+                        onTest={() => testHost(h)}
+                        onEdit={h.source === 'manual' ? () => startEditHost(h) : undefined}
+                        onRemove={h.source === 'manual' ? () => removeManualHost(h) : undefined}
+                      />
+                    ))}
                   </div>
                 </div>
                 {hosts.length === 0 ? (
