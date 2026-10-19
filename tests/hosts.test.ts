@@ -276,4 +276,41 @@ describe('HostTable', () => {
     const s = t.summarize(e!)
     expect(s).toMatchObject({ alias: 'web', authKind: 'key', keyReady: false, source: 'ssh-config' })
   })
+
+  it('imports only the ssh-config aliases the include globs select', () => {
+    writeFileSync(
+      sshConfigPath(),
+      ['Host build-1', '  HostName a.example.com', '  User u', 'Host build-2', '  HostName b.example.com', '  User u', 'Host prod', '  HostName c.example.com', '  User u', ''].join('\n'),
+    )
+    const only = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath(), sshConfigInclude: ['build-*'] })
+    expect(only.list().map((e) => e.alias).sort()).toEqual(['build-1', 'build-2'])
+
+    const none = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath(), sshConfigInclude: ['nope-*'] })
+    expect(none.list()).toEqual([])
+  })
+
+  it('excludes matching aliases, and exclude wins over include', () => {
+    writeFileSync(
+      sshConfigPath(),
+      ['Host docker', '  HostName d.example.com', '  User u', 'Host ORIN', '  HostName o.example.com', '  User u', 'Host dev', '  HostName v.example.com', '  User u', ''].join('\n'),
+    )
+    const filtered = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath(), sshConfigExclude: ['orin', 'dev'] })
+    expect(filtered.list().map((e) => e.alias)).toEqual(['docker'])
+
+    const both = new HostTable({
+      sshConfigPath: sshConfigPath(),
+      storePath: storePath(),
+      sshConfigInclude: ['*'],
+      sshConfigExclude: ['ORIN'],
+    })
+    expect(both.list().map((e) => e.alias).sort()).toEqual(['dev', 'docker'])
+  })
+
+  it('keeps manual hosts regardless of the ssh-config filter', () => {
+    writeFileSync(sshConfigPath(), ['Host hidden', '  HostName h.example.com', '  User u', ''].join('\n'))
+    const t = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath(), sshConfigExclude: ['*'] })
+    t.addManual({ alias: 'nas', host: 'nas.lan', user: 'admin', password: 'pw' })
+    expect(t.list().map((e) => e.alias)).toEqual(['nas'])
+  })
+
 })

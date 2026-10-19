@@ -169,15 +169,43 @@ interface StoreFile {
   hosts: StoredHost[]
 }
 
+/**
+ * Shell-style match for an SSH alias: `*` (any run), `?` (one character).
+ * Case-insensitive, because `~/.ssh/config` aliases are used case-insensitively
+ * in practice and nobody wants `ORIN` vs `orin` to be a trap.
+ */
+function globMatches(pattern: string, value: string): boolean {
+  const source = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.')
+  return new RegExp(`^${source}$`, 'i').test(value)
+}
+
 export class HostTable {
   private readonly sshConfigPath: string
   private readonly storePath: string
+  /**
+   * Which `~/.ssh/config` aliases are imported. An empty include list means
+   * "every alias" (the historical behaviour); exclude always wins. Matching is
+   * shell-style against the alias (`*` and `?`), because an Alias is a single
+   * path-free token.
+   */
+  private readonly sshConfigInclude: readonly string[]
+  private readonly sshConfigExclude: readonly string[]
   private manual: HostEntry[]
   private sshCache: { mtimeMs: number; entries: HostEntry[] } | undefined
 
-  constructor(opts?: { sshConfigPath?: string; storePath?: string }) {
+  constructor(opts?: {
+    sshConfigPath?: string
+    storePath?: string
+    sshConfigInclude?: readonly string[]
+    sshConfigExclude?: readonly string[]
+  }) {
     this.sshConfigPath = opts?.sshConfigPath ?? join(homedir(), '.ssh', 'config')
     this.storePath = opts?.storePath ?? join(homedir(), '.dsh', 'dsh-rw.json')
+    this.sshConfigInclude = opts?.sshConfigInclude ?? []
+    this.sshConfigExclude = opts?.sshConfigExclude ?? []
     this.manual = this.loadStore()
   }
 
@@ -306,6 +334,13 @@ export class HostTable {
     return entry
   }
 
+  /** Whether one ssh-config alias passes the include/exclude globs. */
+  private importsFromSshConfig(alias: string): boolean {
+    if (this.sshConfigExclude.some((pattern) => globMatches(pattern, alias))) return false
+    if (this.sshConfigInclude.length === 0) return true
+    return this.sshConfigInclude.some((pattern) => globMatches(pattern, alias))
+  }
+
   removeManual(alias: string): void {
     const next = this.manual.filter((e) => e.alias !== alias)
     if (next.length !== this.manual.length) {
@@ -330,8 +365,9 @@ export class HostTable {
         entries = []
       }
     }
-    this.sshCache = { mtimeMs, entries }
-    return entries
+    const filtered = entries.filter((entry) => this.importsFromSshConfig(entry.alias))
+    this.sshCache = { mtimeMs, entries: filtered }
+    return filtered
   }
 
   private loadStore(): HostEntry[] {

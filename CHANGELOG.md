@@ -3,6 +3,26 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.5.0 — 2026-10-19
+
+### Added — `sshConfigInclude` / `sshConfigExclude`
+
+Every alias in `~/.ssh/config` became a host, so a config full of build and
+test entries produced a host list that was mostly noise. Two glob lists now
+decide what is imported:
+
+- `sshConfigExclude` — never import these aliases (an exclude match wins);
+- `sshConfigInclude` — when non-empty, only these are imported.
+
+Matching is shell-style (`*`, `?`) and case-insensitive, because an Alias is a
+single path-free token and `ORIN` vs `orin` should not be a trap. Manual hosts
+are never filtered. Both default to `[]`, so existing behaviour is unchanged
+until you ask for it:
+
+```yaml
+sshConfigExclude: [ORIN, myhfool]
+```
+
 ## 1.4.3 — 2026-10-19
 
 ### Docs — GitHub is the release channel; npm is prepared but unused

@@ -46,11 +46,21 @@ export declare function parseSshConfig(text: string, defaultUser?: string): Host
 export declare class HostTable {
     private readonly sshConfigPath;
     private readonly storePath;
+    /**
+     * Which `~/.ssh/config` aliases are imported. An empty include list means
+     * "every alias" (the historical behaviour); exclude always wins. Matching is
+     * shell-style against the alias (`*` and `?`), because an Alias is a single
+     * path-free token.
+     */
+    private readonly sshConfigInclude;
+    private readonly sshConfigExclude;
     private manual;
     private sshCache;
     constructor(opts?: {
         sshConfigPath?: string;
         storePath?: string;
+        sshConfigInclude?: readonly string[];
+        sshConfigExclude?: readonly string[];
     });
     /** All entries; manual entries shadow ssh-config entries with the same alias. */
     list(): HostEntry[];
@@ -82,6 +92,8 @@ export declare class HostTable {
         keyPath?: string;
         passphrase?: string;
     }): HostEntry;
+    /** Whether one ssh-config alias passes the include/exclude globs. */
+    private importsFromSshConfig;
     removeManual(alias: string): void;
     private sshEntries;
     private loadStore;

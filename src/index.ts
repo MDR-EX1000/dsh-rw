@@ -37,6 +37,14 @@ export const Config = z.object({
   hostKeyPolicy: z.string().default('accept-new'),
   /** known_hosts file path (default ~/.ssh/known_hosts). */
   knownHostsPath: z.string().default(''),
+  /**
+   * Which `~/.ssh/config` aliases become hosts. Empty = every alias (the
+   * historical behaviour); shell-style globs, matched case-insensitively.
+   * Use this to stop a machine full of build/test entries from flooding the
+   * host list — `exclude` always wins over `include`.
+   */
+  sshConfigInclude: z.array(z.string()).default([]),
+  sshConfigExclude: z.array(z.string()).default([]),
   /** Per remote command timeout. */
   commandTimeoutMs: z.number().step(1).min(1000).default(30000),
   /** SSH connection establishment timeout. */
@@ -66,6 +74,8 @@ export const Config = z.object({
 export interface Config {
   hostKeyPolicy: HostKeyPolicy
   knownHostsPath: string
+  sshConfigInclude?: readonly string[]
+  sshConfigExclude?: readonly string[]
   commandTimeoutMs: number
   connectTimeoutMs: number
   channelOpenTimeoutMs: number
@@ -186,7 +196,12 @@ function adaptDirectoryPicker(ctx: Context): () => Promise<string | null> {
 }
 
 export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = {}): void {
-  const hosts = overrides.hosts ?? new HostTable()
+  const hosts =
+    overrides.hosts ??
+    new HostTable({
+      sshConfigInclude: config.sshConfigInclude ?? [],
+      sshConfigExclude: config.sshConfigExclude ?? [],
+    })
   const pool =
     overrides.pool ??
     new SshPool({

@@ -11,6 +11,14 @@ export declare const Config: z<Schemastery.ObjectS<{
     hostKeyPolicy: z<string, string>;
     /** known_hosts file path (default ~/.ssh/known_hosts). */
     knownHostsPath: z<string, string>;
+    /**
+     * Which `~/.ssh/config` aliases become hosts. Empty = every alias (the
+     * historical behaviour); shell-style globs, matched case-insensitively.
+     * Use this to stop a machine full of build/test entries from flooding the
+     * host list — `exclude` always wins over `include`.
+     */
+    sshConfigInclude: z<string[], string[]>;
+    sshConfigExclude: z<string[], string[]>;
     /** Per remote command timeout. */
     commandTimeoutMs: z<number, number>;
     /** SSH connection establishment timeout. */
@@ -40,6 +48,14 @@ export declare const Config: z<Schemastery.ObjectS<{
     hostKeyPolicy: z<string, string>;
     /** known_hosts file path (default ~/.ssh/known_hosts). */
     knownHostsPath: z<string, string>;
+    /**
+     * Which `~/.ssh/config` aliases become hosts. Empty = every alias (the
+     * historical behaviour); shell-style globs, matched case-insensitively.
+     * Use this to stop a machine full of build/test entries from flooding the
+     * host list — `exclude` always wins over `include`.
+     */
+    sshConfigInclude: z<string[], string[]>;
+    sshConfigExclude: z<string[], string[]>;
     /** Per remote command timeout. */
     commandTimeoutMs: z<number, number>;
     /** SSH connection establishment timeout. */
@@ -68,6 +84,8 @@ export declare const Config: z<Schemastery.ObjectS<{
 export interface Config {
     hostKeyPolicy: HostKeyPolicy;
     knownHostsPath: string;
+    sshConfigInclude?: readonly string[];
+    sshConfigExclude?: readonly string[];
     commandTimeoutMs: number;
     connectTimeoutMs: number;
     channelOpenTimeoutMs: number;
