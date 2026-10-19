@@ -3,6 +3,25 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.1.1 — 2026-10-19
+
+### Fixed — flaky host-key tests made CI red on the v1.1.0 tag
+
+`tests/ssh-pool.test.ts` built its host keys with
+`utils.generateKeyPairSync('ed25519')`. That helper intermittently (≈0.3% of
+calls, measured: 13 of 4000) returns a **50-byte** public-key blob instead of
+the valid 51-byte wire form, which ssh2's own `parseKey` then rejects with
+"Unsupported key format" — so `verifyHostKey` correctly failed closed with
+`HOSTKEY_VERIFY_FAILED` and the test asserting `HOSTKEY_UNKNOWN` /
+`HOSTKEY_CHANGED` failed. The v1.1.0 tag's CI run hit it while the same commit
+on `main` passed.
+
+The keys are now **fixed ed25519 fixtures** (two distinct blobs), so the tests
+are deterministic. Verified with 20 consecutive runs of the file: 0 failures.
+
+No product-code change: rejecting an unparseable host key is the intended
+fail-closed behaviour, and real hosts present well-formed keys.
+
 ## 1.1.0 — 2026-10-19
 
 ### Added — in-app local directory browser

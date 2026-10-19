@@ -3,9 +3,6 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Client, ClientChannel, ConnectConfig, SFTPWrapper, Stats } from 'ssh2'
-import ssh2 from 'ssh2'
-
-const { utils } = ssh2
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RwError } from '../src/errors.js'
 import type { RwErrorCode } from '../src/errors.js'
@@ -155,11 +152,22 @@ async function expectRw(p: Promise<unknown>, code: RwErrorCode): Promise<RwError
   throw new Error(`expected rejection with ${code}`)
 }
 
-/** A real ed25519 public key blob, as ssh2 hands it to hostVerifier. */
-function makeHostKey(): { blob: Buffer; base64: string; type: string } {
-  const kp = utils.generateKeyPairSync('ed25519')
-  const [type, base64] = kp.public.split(' ') as [string, string]
-  return { blob: Buffer.from(base64, 'base64'), base64, type }
+/**
+ * Two real ed25519 public-key wire blobs, exactly as ssh2 hands them to
+ * hostVerifier. Fixed fixtures on purpose: `utils.generateKeyPairSync('ed25519')`
+ * intermittently (≈0.3%) emits a 50-byte blob that ssh2's own `parseKey`
+ * rejects as "Unsupported key format", which made the host-key tests flaky in
+ * CI (and produced a red CI run on an already-published tag).
+ */
+const HOST_KEY_FIXTURES = [
+  'AAAAC3NzaC1lZDI1NTE5AAAAIK8Pee//L46AKXVXzSAIE/JxEGrsvbWduFfSbWFmywx8',
+  'AAAAC3NzaC1lZDI1NTE5AAAAIK/di2unb9lhDDD/vhb3qdVviiBfuX/+unFUTM4oYh4N',
+] as const
+
+/** `index: 1` is a distinct key — use it wherever a *different* key must appear. */
+function makeHostKey(index = 0): { blob: Buffer; base64: string; type: string } {
+  const base64 = HOST_KEY_FIXTURES[index] ?? HOST_KEY_FIXTURES[0]
+  return { blob: Buffer.from(base64, 'base64'), base64, type: 'ssh-ed25519' }
 }
 
 describe('connection lifecycle', () => {
@@ -319,7 +327,7 @@ describe('host key verification', () => {
     knownHosts.accept('example.com', 22, 'ssh-ed25519', old.base64)
     const before = readFileSync(knownHosts.path, 'utf8')
 
-    pushFake({ hostKey: makeHostKey().blob }) // different key
+    pushFake({ hostKey: makeHostKey(1).blob }) // a different key
     const pool = makePool({ hostKeyPolicy: 'accept-new' })
     const err = await expectRw(pool.exec(entry(), 'true'), 'HOSTKEY_CHANGED')
     expect(err.message).toContain(knownHosts.path)
