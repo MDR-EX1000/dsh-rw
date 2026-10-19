@@ -452,15 +452,28 @@ describe('exec', () => {
     pool.dispose()
   })
 
-  it('rejects exec callback errors via mapConnectError', async () => {
+  it('rejects exec callback errors via mapConnectError after one redial', async () => {
     class ExecFailClient extends FakeClient {
       override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
         queueMicrotask(() => cb(new Error('Timed out while opening channel')))
       }
     }
-    fakes.push(new ExecFailClient())
-    const pool = makePool()
+    // A refused channel means "this connection is unusable", so the pool
+    // redials once before surfacing the error; both dials fail the same way.
+    let dials = 0
+    const pool = new SshPool({
+      hostKeyPolicy: 'accept-new',
+      knownHosts,
+      connectTimeoutMs: 1000,
+      commandTimeoutMs: 1000,
+      maxOutputChars: 200000,
+      clientFactory: () => {
+        dials += 1
+        return new ExecFailClient() as unknown as Client
+      },
+    })
     await expectRw(pool.exec(entry(), 'x'), 'CONN_TIMEOUT')
+    expect(dials).toBe(2)
     pool.dispose()
   })
 })
@@ -540,10 +553,22 @@ describe('sftp', () => {
     pool.dispose()
   })
 
-  it('rejects when the SFTP subsystem is unavailable', async () => {
-    pushFake({ onSftp: (cb) => cb(new Error('Unable to start SFTP subsystem')) })
-    const pool = makePool()
+  it('rejects when the SFTP subsystem is unavailable, after one redial', async () => {
+    let dials = 0
+    const pool = new SshPool({
+      hostKeyPolicy: 'accept-new',
+      knownHosts,
+      connectTimeoutMs: 1000,
+      commandTimeoutMs: 1000,
+      maxOutputChars: 200000,
+      clientFactory: () => {
+        dials += 1
+        const fake = new FakeClient({ onSftp: (cb) => cb(new Error('Unable to start SFTP subsystem')) })
+        return fake as unknown as Client
+      },
+    })
     await expectRw(pool.sftp(entry()), 'REMOTE_ERROR')
+    expect(dials).toBe(2)
     pool.dispose()
   })
 })
@@ -614,16 +639,19 @@ describe('reconnect retry', () => {
     pool.dispose()
   })
 
-  it('does not retry a channel-open failure on a live connection', async () => {
+  it('redials when the server refuses a channel on a still-live connection', async () => {
+    // The shape that broke real sessions: a proxy whose backend expired while
+    // TCP stayed healthy. The old rule ("only retry if the connection already
+    // dropped") reused the dead connection until the process restarted.
     class LiveExecFailClient extends FakeClient {
       override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
-        queueMicrotask(() => cb(new Error('Timed out while opening channel')))
+        queueMicrotask(() => cb(new Error('(SSH) Channel open failure: ssh: rejected: connect failed (open failed)')))
       }
     }
-    const pool = makeQueuedPool([new LiveExecFailClient()])
-    await expectRw(pool.exec(entry(), 'x'), 'CONN_TIMEOUT')
-    expect(factoryCalls).toBe(1)
-    expect(pool.connected()).toEqual(['h']) // the connection itself is fine
+    const pool = makeQueuedPool([new LiveExecFailClient(), new FakeClient()])
+    const res = await pool.exec(entry(), 'x')
+    expect(res.code).toBe(0)
+    expect(factoryCalls).toBe(2) // refused channel → one redial, then success
     pool.dispose()
   })
 

@@ -3,6 +3,32 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.6.1 — 2026-10-19
+
+### Fixed — a refused channel left later operations stuck on a dead connection
+
+`SshPool.exec` / `sftp` retried a channel-open failure **only when the
+connection had already dropped out of the pool**. That mis-modelled the shape
+seen against proxy SSH frontends: the frontend keeps the TCP connection
+perfectly healthy while its backend expires, so every later channel open is
+refused with
+
+```
+(SSH) Channel open failure: ssh: rejected: connect failed (open failed)
+```
+
+and the pool kept reusing that connection until the process restarted — while
+the very same host answered instantly from a fresh process and from plain
+`ssh`. A refused channel cannot have side effects, so it is now treated as
+"this connection is unusable": drop it and redial once, exactly like an open
+timeout. A systemic refusal still surfaces, just one dial later.
+
+Verified on the real host: the alias answered
+`(SSH) Channel open failure ... (open failed)` before, `rw_disconnect` (drop the
+pooled client) made it answer in 1.6 s / 0.6 s again, and a fresh pool never
+reproduced the failure. Tests updated: the retry contract is now asserted
+directly (refused channel → exactly two dials, then success).
+
 ## 1.6.0 — 2026-10-19
 
 ### Added — remove a host from the list without touching `~/.ssh/config`

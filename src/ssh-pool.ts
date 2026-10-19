@@ -206,17 +206,25 @@ export class SshPool {
       try {
         return await this.execOn(client, cmd, timeoutMs, openTimeoutMs, max)
       } catch (err) {
-        // A silently dead connection is dropped on open timeout (we kill it
-        // ourselves below), so both failure kinds converge: not-yet-retried +
-        // known-dead connection → one redial + retry. Anything else surfaces
-        // exactly as before (business errors, post-open stream failures).
+        // Both open-phase failures mean "this connection is not usable", and
+        // nothing ran yet, so each is worth exactly one redial:
+        //
+        //  - open timeout: the connection is silently dead (half-open TCP);
+        //  - channel-open rejection: the server refused to open a channel. The
+        //    shape that matters is a proxy whose backend expired while the TCP
+        //    connection stayed perfectly healthy — no error, no close, so the
+        //    old "did it drop out of the pool?" test never fired and every
+        //    later operation reused the dead connection until the app
+        //    restarted. A refused channel cannot have side effects, so
+        //    redialing is always safe; a genuinely systemic refusal just costs
+        //    one extra connect before surfacing.
         if (err instanceof OpenTimeoutError) {
           if (retried) throw new RwError('CONN_TIMEOUT', `channel open timed out after ${openTimeoutMs}ms (connection to ${entry.alias} is unresponsive)`)
           this.disconnect(entry.alias)
           continue
         }
         if (!(err instanceof ChannelOpenError)) throw err
-        if (retried || !this.dropped(entry.alias, client)) throw err.error
+        if (retried) throw err.error
         this.disconnect(entry.alias)
       }
     }
@@ -352,7 +360,9 @@ export class SshPool {
             this.disconnect(alias)
             continue
           }
-          if (retried || !this.dropped(alias, client)) throw err
+          // Same rule as exec: if the server refuses the subsystem channel the
+          // connection is unusable even when TCP still looks healthy.
+          if (retried) throw err
           this.disconnect(alias)
         }
       }
