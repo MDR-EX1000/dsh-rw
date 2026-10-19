@@ -37,11 +37,11 @@ export class FakeHosts implements HostTableLike {
   }
 
   list(): HostEntry[] {
-    return [...this.entries]
+    return this.entries.filter((e) => !this.hiddenSet.has(e.alias))
   }
 
   find(alias: string): HostEntry | undefined {
-    return this.entries.find((e) => e.alias === alias)
+    return this.list().find((e) => e.alias === alias)
   }
 
   summarize(entry: HostEntry): HostSummary {
@@ -58,7 +58,7 @@ export class FakeHosts implements HostTableLike {
   }
 
   summaries(): HostSummary[] {
-    return this.entries.map((e) => this.summarize(e))
+    return this.list().map((e) => this.summarize(e))
   }
 
   addManual(payload: {
@@ -93,6 +93,23 @@ export class FakeHosts implements HostTableLike {
   removeManual(alias: string): void {
     const i = this.entries.findIndex((e) => e.alias === alias && e.source === 'manual')
     if (i >= 0) this.entries.splice(i, 1)
+  }
+
+  private readonly hiddenSet = new Set<string>()
+
+  hide(alias: string): void {
+    const entry = this.entries.find((e) => e.alias === alias)
+    if (entry === undefined) throw new RwError('INVALID_INPUT', `unknown host alias: ${JSON.stringify(alias)}`)
+    if (entry.source !== 'ssh-config') throw new RwError('INVALID_INPUT', 'manual entry — remove it instead')
+    this.hiddenSet.add(alias)
+  }
+
+  unhide(alias: string): void {
+    this.hiddenSet.delete(alias)
+  }
+
+  hiddenAliases(): string[] {
+    return [...this.hiddenSet].sort()
   }
 
   updateManual(

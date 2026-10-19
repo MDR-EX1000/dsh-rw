@@ -158,7 +158,7 @@ async function callLocalPick(routes: CapturedRoute[]): Promise<{ status: number;
 }
 
 describe('apply', () => {
-  it('registers the sixteen rw_* tools, the seven routes, and the /rw command', () => {
+  it('registers the sixteen rw_* tools, the eight routes, and the /rw command', () => {
     const { ctx, tools, routes, commands, effectLabels } = makeCtx()
     apply(ctx as unknown as Context, CONFIG, makeOverrides())
 
@@ -186,6 +186,7 @@ describe('apply', () => {
       '/api/dsh-rw/test',
       '/api/dsh-rw/ls',
       '/api/dsh-rw/ls-local',
+      '/api/dsh-rw/hosts/hide',
       '/api/dsh-rw/workspace',
       '/api/dsh-rw/local-pick',
     ])
@@ -302,7 +303,7 @@ describe('apply', () => {
     const overrides = makeOverrides()
     apply(ctx as unknown as Context, CONFIG, overrides)
     expect(tools.length).toBe(16)
-    expect(routes.length).toBe(7)
+    expect(routes.length).toBe(8)
 
     for (const dispose of effectDisposers) dispose()
     expect(tools).toEqual([])

@@ -60,6 +60,8 @@ interface LsItem {
 
 interface StatusResponse {
   hosts?: HostSummary[]
+  /** ssh-config aliases hidden from the list (restorable). */
+  hiddenAliases?: string[]
   current?: { alias?: string | null } | null
 }
 
@@ -233,6 +235,7 @@ function HostCard(props: {
   onTest: () => void
   onEdit?: () => void
   onRemove?: () => void
+  onHide?: () => void
 }) {
   const { host, active, health, t } = props
   const [hov, setHov] = useState(false)
@@ -318,6 +321,11 @@ function HostCard(props: {
       ) : null}
       {props.onRemove !== undefined ? (
         <MiniAction title={t('remove')} danger onClick={props.onRemove}>
+          ✕
+        </MiniAction>
+      ) : null}
+      {props.onHide !== undefined ? (
+        <MiniAction title={t('hideHost')} danger onClick={props.onHide}>
           ✕
         </MiniAction>
       ) : null}
@@ -668,6 +676,8 @@ function DirPicker(props: LocalizedDirPickerProps) {
   const [testing, setTesting] = useState(false)
   // 主机列表的健康状态与编辑目标：testHost 写入，HostCard 读取。
   const [hostHealth, setHostHealth] = useState<Record<string, HostHealth>>({})
+  // ssh-config aliases removed from the list (they stay in ~/.ssh/config).
+  const [hiddenAliases, setHiddenAliases] = useState<string[]>([])
   const [editingAlias, setEditingAlias] = useState('')
   const [saving, setSaving] = useState(false)
   const [testMsg, setTestMsg] = useState('')
@@ -684,6 +694,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
       .then((r) => {
         const list = Array.isArray(r.hosts) ? r.hosts : []
         setHosts(list)
+        setHiddenAliases(Array.isArray(r.hiddenAliases) ? r.hiddenAliases : [])
         const cur = r.current && typeof r.current.alias === 'string' ? r.current.alias : ''
         // Prefer the live session host, then the machine used last time, then
         // the first host that is actually usable.
@@ -970,8 +981,42 @@ function DirPicker(props: LocalizedDirPickerProps) {
     api<StatusResponse>('GET', '/api/dsh-rw/status').then((r) => {
       const list = Array.isArray(r.hosts) ? r.hosts : []
       setHosts(list)
+      setHiddenAliases(Array.isArray(r.hiddenAliases) ? r.hiddenAliases : [])
       return list
     })
+
+  /**
+   * Drop one ssh-config host from the list. The file is NOT touched: the plugin
+   * remembers the alias, and "显示全部" puts it back.
+   */
+  const hideHost = (h: HostSummary) => {
+    setErr('')
+    api<{ ok?: boolean; hiddenAliases?: string[] }>('POST', '/api/dsh-rw/hosts/hide', { alias: h.alias })
+      .then((r) => {
+        setHiddenAliases(Array.isArray(r.hiddenAliases) ? r.hiddenAliases : [])
+        return refreshHosts()
+      })
+      .then((list) => {
+        if (alias !== h.alias) return
+        // The selected host just disappeared: fall back to the first remaining.
+        const next = list[0] ? list[0].alias : ''
+        setAlias(next)
+        setDirItems([])
+        if (next) {
+          setPath('~/')
+          loadDir(next, '~/', true)
+        }
+      })
+      .catch((e) => setErr(errText(e)))
+  }
+
+  /** Put every hidden alias back. */
+  const unhideAll = () => {
+    setErr('')
+    Promise.all(hiddenAliases.map((a) => api<{ ok?: boolean }>('POST', '/api/dsh-rw/hosts/hide', { alias: a, hidden: false })))
+      .then(() => refreshHosts())
+      .catch((e) => setErr(errText(e)))
+  }
 
   /** Remember the host so the next open lands on it. */
   const rememberHost = (a: string) => {
@@ -1350,12 +1395,21 @@ function DirPicker(props: LocalizedDirPickerProps) {
                         onTest={() => testHost(h)}
                         onEdit={h.source === 'manual' ? () => startEditHost(h) : undefined}
                         onRemove={h.source === 'manual' ? () => removeManualHost(h) : undefined}
+                        onHide={h.source === 'manual' ? undefined : () => hideHost(h)}
                       />
                     ))}
                   </div>
                 </div>
                 {hosts.length === 0 ? (
                   <SingleLine text={t('noHosts')} />
+                ) : null}
+                {hiddenAliases.length > 0 ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <SingleLine text={t('hiddenHosts', { count: hiddenAliases.length, aliases: hiddenAliases.join(', ') })} />
+                    <Btn style={{ padding: '2px 9px', fontSize: 12, border: '1px solid transparent', background: 'transparent', color: T.accent }} onClick={unhideAll}>
+                      {t('showAllHidden')}
+                    </Btn>
+                  </div>
                 ) : null}
                 {/* 远程路径：↑ 上一级 + 输入框，下方行内目录列表实时跟随 */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

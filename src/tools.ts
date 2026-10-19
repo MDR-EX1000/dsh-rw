@@ -47,6 +47,12 @@ export interface HostTableLike {
     passphrase?: string
   }): HostEntry
   removeManual(alias: string): void
+  /** Drop an ssh-config alias from the list (never edits ~/.ssh/config). */
+  hide?(alias: string): void
+  /** Put a hidden alias back. */
+  unhide?(alias: string): void
+  /** Aliases currently hidden from the list. */
+  hiddenAliases?(): string[]
   /**
    * Replace one manual host's connection details. Optional so a structural
    * double stays valid; the route reports 501 when a table cannot edit.
@@ -293,7 +299,8 @@ export function statusText(deps: ToolsDeps, exec?: ExecLike): string {
   const connected = alias !== null && pool.connected().includes(alias)
   const workspace = resolved !== null ? resolved.workspace : session.workspace
   const lines: string[] = []
-  lines.push(`Hosts configured: ${summaries.length}`)
+  const hidden = deps.hosts.hiddenAliases?.() ?? []
+  lines.push(`Hosts configured: ${summaries.length}${hidden.length > 0 ? ` (${hidden.length} hidden: ${hidden.join(', ')})` : ''}`)
   if (alias !== null && entry) {
     lines.push(`Current host: ${entry.user}@${entry.host}:${entry.port} (alias: ${alias})`)
   } else if (alias !== null) {

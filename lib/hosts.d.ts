@@ -55,6 +55,7 @@ export declare class HostTable {
     private readonly sshConfigInclude;
     private readonly sshConfigExclude;
     private manual;
+    private hidden;
     private sshCache;
     constructor(opts?: {
         sshConfigPath?: string;
@@ -94,6 +95,16 @@ export declare class HostTable {
     }): HostEntry;
     /** Whether one ssh-config alias passes the include/exclude globs. */
     private importsFromSshConfig;
+    /**
+     * Drop one ssh-config alias from the list without touching ~/.ssh/config.
+     * Manual hosts are deleted instead (they exist only here), so hiding one is
+     * rejected rather than silently doing nothing.
+     */
+    hide(alias: string): void;
+    /** Put a hidden alias back in the list. */
+    unhide(alias: string): void;
+    /** Aliases currently hidden from the host list (sorted, for display). */
+    hiddenAliases(): string[];
     removeManual(alias: string): void;
     private sshEntries;
     private loadStore;

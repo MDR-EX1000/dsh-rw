@@ -3,6 +3,25 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.6.0 — 2026-10-19
+
+### Added — remove a host from the list without touching `~/.ssh/config`
+
+Hosts imported from `~/.ssh/config` can now be dropped from the list with the
+per-row **✕**. The plugin remembers the alias in its own store
+(`~/.dsh/dsh-rw.json` → `hidden`); `~/.ssh/config` is **never edited**, so the
+entry keeps working for plain `ssh`.
+
+- a muted line under the list shows what is hidden, with **显示全部** to put it
+  back (`POST /api/dsh-rw/hosts/hide` with `hidden: false`);
+- `rw_info` reports `Hosts configured: N (M hidden: …)`;
+- manual hosts keep the old ✕ (delete from the store); hiding one is rejected
+  because that entry exists only here;
+- the declarative `sshConfigInclude` / `sshConfigExclude` from 1.5.0 remain
+  available — the button is the day-to-day path.
+
+Tests: 519 (+4: hide persistence, manual-host rejection, route hide/unhide).
+
 ## 1.5.0 — 2026-10-19
 
 ### Added — `sshConfigInclude` / `sshConfigExclude`

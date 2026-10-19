@@ -167,6 +167,12 @@ interface StoredHost {
 interface StoreFile {
   version: 1
   hosts: StoredHost[]
+  /**
+   * ssh-config aliases the operator removed from the host list. They stay in
+   * ~/.ssh/config untouched — this is a local display choice, not an edit of
+   * someone else's file.
+   */
+  hidden?: string[]
 }
 
 /**
@@ -194,6 +200,7 @@ export class HostTable {
   private readonly sshConfigInclude: readonly string[]
   private readonly sshConfigExclude: readonly string[]
   private manual: HostEntry[]
+  private hidden: Set<string>
   private sshCache: { mtimeMs: number; entries: HostEntry[] } | undefined
 
   constructor(opts?: {
@@ -206,7 +213,9 @@ export class HostTable {
     this.storePath = opts?.storePath ?? join(homedir(), '.dsh', 'dsh-rw.json')
     this.sshConfigInclude = opts?.sshConfigInclude ?? []
     this.sshConfigExclude = opts?.sshConfigExclude ?? []
-    this.manual = this.loadStore()
+    const stored = this.loadStore()
+    this.manual = stored.hosts
+    this.hidden = new Set(stored.hidden)
   }
 
   /** All entries; manual entries shadow ssh-config entries with the same alias. */
@@ -336,9 +345,38 @@ export class HostTable {
 
   /** Whether one ssh-config alias passes the include/exclude globs. */
   private importsFromSshConfig(alias: string): boolean {
+    if (this.hidden.has(alias)) return false
     if (this.sshConfigExclude.some((pattern) => globMatches(pattern, alias))) return false
     if (this.sshConfigInclude.length === 0) return true
     return this.sshConfigInclude.some((pattern) => globMatches(pattern, alias))
+  }
+
+  /**
+   * Drop one ssh-config alias from the list without touching ~/.ssh/config.
+   * Manual hosts are deleted instead (they exist only here), so hiding one is
+   * rejected rather than silently doing nothing.
+   */
+  hide(alias: string): void {
+    const entry = this.find(alias)
+    if (entry === undefined) throw new RwError('INVALID_INPUT', `unknown host alias: ${JSON.stringify(alias)}`)
+    if (entry.source !== 'ssh-config') {
+      throw new RwError('INVALID_INPUT', `host ${JSON.stringify(alias)} is a manual entry — remove it instead of hiding it`)
+    }
+    this.hidden.add(alias)
+    this.sshCache = undefined
+    this.saveStore()
+  }
+
+  /** Put a hidden alias back in the list. */
+  unhide(alias: string): void {
+    if (!this.hidden.delete(alias)) return
+    this.sshCache = undefined
+    this.saveStore()
+  }
+
+  /** Aliases currently hidden from the host list (sorted, for display). */
+  hiddenAliases(): string[] {
+    return [...this.hidden].sort()
   }
 
   removeManual(alias: string): void {
@@ -370,17 +408,18 @@ export class HostTable {
     return filtered
   }
 
-  private loadStore(): HostEntry[] {
+  private loadStore(): { hosts: HostEntry[]; hidden: string[] } {
     let raw: string
     try {
       raw = readFileSync(this.storePath, 'utf8')
     } catch {
-      return []
+      return { hosts: [], hidden: [] }
     }
     try {
       const data = JSON.parse(raw) as StoreFile
       if (data?.version !== 1 || !Array.isArray(data.hosts)) throw new Error('bad shape')
-      return data.hosts.map((h) => ({ ...h, source: 'manual' as const }))
+      const hidden = Array.isArray(data.hidden) ? data.hidden.filter((a): a is string => typeof a === 'string') : []
+      return { hosts: data.hosts.map((h) => ({ ...h, source: 'manual' as const })), hidden }
     } catch {
       // Never overwrite a corrupt store: move it aside for manual inspection.
       try {
@@ -388,7 +427,7 @@ export class HostTable {
       } catch {
         // best effort; an unmoved corrupt file is still not loaded
       }
-      return []
+      return { hosts: [], hidden: [] }
     }
   }
 
@@ -400,6 +439,7 @@ export class HostTable {
     const data: StoreFile = {
       version: 1,
       hosts: this.manual.map(({ alias, host, port, user, auth }) => ({ alias, host, port, user, auth })),
+      ...(this.hidden.size > 0 ? { hidden: [...this.hidden].sort() } : {}),
     }
     const tmp = `${this.storePath}.tmp-${process.pid}`
     writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })

@@ -313,4 +313,37 @@ describe('HostTable', () => {
     expect(t.list().map((e) => e.alias)).toEqual(['nas'])
   })
 
+
+  it('hides an ssh-config alias without touching the file, and restores it', () => {
+    const config = ['Host docker', '  HostName d.example.com', '  User u', 'Host dev', '  HostName v.example.com', '  User u', ''].join('\n')
+    writeFileSync(sshConfigPath(), config)
+    const before = readFileSync(sshConfigPath(), 'utf8')
+
+    const t = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath() })
+    expect(t.list().map((e) => e.alias)).toEqual(['docker', 'dev'])
+    t.hide('dev')
+    expect(t.list().map((e) => e.alias)).toEqual(['docker'])
+    expect(t.hiddenAliases()).toEqual(['dev'])
+    // The operator's ssh config is untouched.
+    expect(readFileSync(sshConfigPath(), 'utf8')).toBe(before)
+
+    // Persisted: a fresh instance still hides it.
+    const t2 = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath() })
+    expect(t2.list().map((e) => e.alias)).toEqual(['docker'])
+    expect(t2.hiddenAliases()).toEqual(['dev'])
+
+    t2.unhide('dev')
+    expect(t2.list().map((e) => e.alias)).toEqual(['docker', 'dev'])
+    expect(new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath() }).hiddenAliases()).toEqual([])
+  })
+
+  it('refuses to hide a manual host (they are removed instead) and an unknown alias', () => {
+    writeFileSync(sshConfigPath(), ['Host dev', '  HostName v.example.com', '  User u', ''].join('\n'))
+    const t = new HostTable({ sshConfigPath: sshConfigPath(), storePath: storePath() })
+    t.addManual({ alias: 'nas', host: 'nas.lan', user: 'admin', password: 'pw' })
+    expect(() => t.hide('nas')).toThrow(RwError)
+    expect(() => t.hide('ghost')).toThrow(RwError)
+    expect(t.find('nas')).toBeDefined()
+  })
+
 })

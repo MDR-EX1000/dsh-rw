@@ -171,6 +171,8 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
         const workspace = session.workspace
         writeJson(res, 200, {
           hosts: hosts.summaries(),
+          // Hidden ssh-config aliases: the picker offers a "show all" restore.
+          hiddenAliases: hosts.hiddenAliases?.() ?? [],
           current: {
             alias,
             workspace,
@@ -487,6 +489,34 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
               ? new RwError('PERMISSION_DENIED', `permission denied: ${dir}`)
               : new RwError('REMOTE_ERROR', `cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`),
           )
+        }
+      },
+    },
+
+    // --------------------------------------- POST /api/dsh-rw/hosts/hide
+    {
+      kind: 'exact',
+      path: '/api/dsh-rw/hosts/hide',
+      handler: async (req, res) => {
+        if (!guard(req, res, 'POST')) return
+        const body = await readJsonBody(req)
+        const alias = typeof body?.alias === 'string' ? body.alias : ''
+        if (alias === '') {
+          writeJson(res, 400, { error: 'alias is required', code: 'INVALID_INPUT' })
+          return
+        }
+        // `hidden: false` puts the host back; anything else hides it.
+        const shouldHide = body?.hidden !== false
+        if (shouldHide ? hosts.hide === undefined : hosts.unhide === undefined) {
+          writeJson(res, 501, { error: 'this host table cannot hide hosts', code: 'INVALID_INPUT' })
+          return
+        }
+        try {
+          if (shouldHide) hosts.hide?.(alias)
+          else hosts.unhide?.(alias)
+          writeJson(res, 200, { ok: true, hiddenAliases: hosts.hiddenAliases?.() ?? [] })
+        } catch (err) {
+          writeError(res, err)
         }
       },
     },

@@ -452,3 +452,27 @@ describe('PATCH /api/dsh-rw/hosts (edit a manual host)', () => {
     expect(noHost.json.code).toBe('INVALID_INPUT')
   })
 })
+
+describe('POST /api/dsh-rw/hosts/hide', () => {
+  it('hides an ssh-config host, reports it in status, and puts it back', async () => {
+    const hidden = await call(routes, '/api/dsh-rw/hosts/hide', 'POST', { body: { alias: 'dev' } })
+    expect(hidden.status).toBe(200)
+    expect(hidden.json.hiddenAliases).toEqual(['dev'])
+
+    const status = await call(routes, '/api/dsh-rw/status', 'GET')
+    expect((status.json.hosts as { alias: string }[]).map((h) => h.alias)).not.toContain('dev')
+    expect(status.json.hiddenAliases).toEqual(['dev'])
+
+    const back = await call(routes, '/api/dsh-rw/hosts/hide', 'POST', { body: { alias: 'dev', hidden: false } })
+    expect(back.status).toBe(200)
+    expect(back.json.hiddenAliases).toEqual([])
+  })
+
+  it('rejects a manual host and a missing alias', async () => {
+    const manual = await call(routes, '/api/dsh-rw/hosts/hide', 'POST', { body: { alias: 'prod' } })
+    expect(manual.status).toBe(400)
+    const missing = await call(routes, '/api/dsh-rw/hosts/hide', 'POST', { body: { alias: 'ghost' } })
+    expect(missing.status).toBe(400)
+    expect(missing.json.code).toBe('INVALID_INPUT')
+  })
+})

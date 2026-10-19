@@ -23,6 +23,12 @@ export interface HostTableLike {
         passphrase?: string;
     }): HostEntry;
     removeManual(alias: string): void;
+    /** Drop an ssh-config alias from the list (never edits ~/.ssh/config). */
+    hide?(alias: string): void;
+    /** Put a hidden alias back. */
+    unhide?(alias: string): void;
+    /** Aliases currently hidden from the list. */
+    hiddenAliases?(): string[];
     /**
      * Replace one manual host's connection details. Optional so a structural
      * double stays valid; the route reports 501 when a table cannot edit.
