@@ -38,20 +38,12 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Install
 
-### npm (recommended)
+### GitHub source (current channel)
 
-```bash
-dsh plugin --profile web add dsh-rw
-dsh plugin --profile web add dsh-rw@1.4.2    # pin an exact release
-```
-
-Installing from npm gives you a versioned, reproducible artifact: the plugin
-catalogue can compare the installed version against the published one, `dsh
-plugin update` moves between releases, and nothing follows a moving branch. The
-published tarball is the same `lib/` output as the matching GitHub release, and
-contains no build step to run.
-
-### GitHub source
+Releases are published to GitHub only; the package is prepared for npm
+(`prepublishOnly` runs typecheck + test + build, `publishConfig` pins the npmjs
+registry) but is **not published there yet**, so `dsh plugin add dsh-rw` would
+not resolve.
 
 GitHub source, using the compact repository basename shown by DSH Market:
 

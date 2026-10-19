@@ -3,6 +3,19 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.4.3 — 2026-10-19
+
+### Docs — GitHub is the release channel; npm is prepared but unused
+
+1.4.2 documented npm as the recommended install path before anything was
+published there, so `dsh plugin add dsh-rw` would have failed to resolve. The
+README leads with the GitHub source again and states plainly that the package is
+*prepared* for npm (`prepublishOnly`, `publishConfig` remain in place) but not
+published; CONTRIBUTING marks `npm publish` as the optional step it is.
+
+No runtime change and no packaging change: the artifact is the same code as
+1.4.2.
+
 ## 1.4.2 — 2026-10-19
 
 ### Packaging — npm is now the primary distribution channel
