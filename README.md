@@ -38,6 +38,21 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 
 ## Install
 
+### npm (recommended)
+
+```bash
+dsh plugin --profile web add dsh-rw
+dsh plugin --profile web add dsh-rw@1.4.2    # pin an exact release
+```
+
+Installing from npm gives you a versioned, reproducible artifact: the plugin
+catalogue can compare the installed version against the published one, `dsh
+plugin update` moves between releases, and nothing follows a moving branch. The
+published tarball is the same `lib/` output as the matching GitHub release, and
+contains no build step to run.
+
+### GitHub source
+
 GitHub source, using the compact repository basename shown by DSH Market:
 
 ```bash
@@ -73,6 +88,9 @@ The plugin itself currently has no `prepare`, `prepack`, or `postinstall` build 
 dependency may still request pnpm permission for optional native modules (`ssh2` and
 `cpu-features`); profiles using pnpm's build-script allowlist must allow those dependencies. This
 is dependency setup, not a rebuild of `dsh-rw`.
+
+`prepublishOnly` runs `typecheck`, `test`, and `build` before any `npm publish`,
+so the npm artifact is always the tested one.
 
 For each release, build and commit `lib/` before pushing the version commit and tag. Existing
 basename installations then stay on the same concise GitHub source through future Market updates.

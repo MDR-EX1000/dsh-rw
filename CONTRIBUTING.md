@@ -43,4 +43,15 @@ Writes only inside the given `/tmp/dsh-rw-acceptance.*` dir. See ACCEPTANCE.md f
    filename is what the catalog entry points at, so later releases replace the download
    without requiring another URL change.
 3. `git tag vX.Y.Z && git push --tags`; `gh release create vX.Y.Z dsh-rw.tgz`.
-4. Optional: `npm publish --access public` (registry account requires 2FA for writes).
+4. `npm publish` — the primary distribution channel. `prepublishOnly` runs
+   typecheck + test + build first, and `publishConfig.registry` pins npmjs.org
+   so a machine-level mirror setting cannot misroute a release. The account
+   requires a 2FA one-time code:
+
+   ```bash
+   npm login                       # once per machine
+   npm publish --otp=<6 digits>    # or let npm prompt
+   ```
+
+   Publish the same version that carries the Git tag: npm and the GitHub
+   Release then hold the identical artifact.

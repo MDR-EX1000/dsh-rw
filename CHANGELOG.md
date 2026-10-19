@@ -3,6 +3,24 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.4.2 — 2026-10-19
+
+### Packaging — npm is now the primary distribution channel
+
+Installing from a `github:` spec is version-blind: the plugin catalogue can only
+echo the dependency spec back (`github:MDR-EX1000/dsh-rw`), cannot compare an
+installed version against a published one, and every install follows a moving
+default branch. The package is now prepared for npm:
+
+- `prepublishOnly` runs `typecheck`, `test`, and `build`, so a published tarball
+  is always the tested one and never a stale `lib/` snapshot;
+- `publishConfig.registry` pins `https://registry.npmjs.org/`, so a machine-level
+  mirror setting (npmmirror) cannot misroute a release;
+- the tarball carries only `lib/`, `cordis.patch.yml`, `README`, and `LICENSE`
+  (verified with `npm pack --dry-run`), and needs no build step at install time.
+
+No runtime change: the code is identical to 1.4.1.
+
 ## 1.4.1 — 2026-10-19
 
 ### Added — `rw_info` reports the version of the code that is LOADED
