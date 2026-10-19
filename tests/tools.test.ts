@@ -129,6 +129,13 @@ describe('makeTools shape', () => {
 })
 
 describe('rw_info / rw_hosts', () => {
+  it('reports the version of the code that is loaded', async () => {
+    const { text } = await tool('rw_info').execute({})
+    // Guards the "installed 1.4.x but the host still runs an older module"
+    // confusion: the line must resolve from this module, not from disk state.
+    expect(text).toMatch(/Plugin version: \d+\.\d+\.\d+ \(the code currently loaded by the host\)/)
+  })
+
   it('rw_info reports the empty state before connecting', async () => {
     const { text } = await tool('rw_info').execute({})
     expect(text).toContain('Hosts configured: 2')

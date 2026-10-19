@@ -22,6 +22,7 @@ import type { Session } from './session.js'
 import type { NativeRouting } from './shim.js'
 import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js'
 import { applyUnifiedDiff, looksBinary, patchTargets, unifiedDiff } from './patch.js'
+import { PLUGIN_VERSION } from './version.js'
 import { WatchManager } from './watch.js'
 import type { WatchFs, WatchSnapshotResult } from './watch.js'
 
@@ -320,6 +321,9 @@ export function statusText(deps: ToolsDeps, exec?: ExecLike): string {
   lines.push(
     `Host key policy: ${deps.config.hostKeyPolicy ?? 'accept-new'} (plugin config hostKeyPolicy; keys verified against known_hosts)`,
   )
+  // The loaded module's version — not what the manifest on disk says, which can
+  // differ until the host restarts.
+  lines.push(`Plugin version: ${PLUGIN_VERSION} (the code currently loaded by the host)`)
   return lines.join('\n')
 }
 

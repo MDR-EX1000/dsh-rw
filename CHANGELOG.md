@@ -3,6 +3,23 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.4.1 — 2026-10-19
+
+### Added — `rw_info` reports the version of the code that is LOADED
+
+The plugin page shows the version read from `node_modules/dsh-rw/package.json`
+**on disk**, while the host keeps running the module it loaded at boot. The two
+can disagree for as long as the app stays open (this session shipped four
+releases without a restart), and they disagree in the other direction while the
+package directory is being reinstalled — during which the bundle row has no
+manifest to read and therefore no version to show.
+
+`rw_info` (and the `/rw` command) now ends with
+`Plugin version: <x.y.z> (the code currently loaded by the host)`, resolved from
+the plugin's own module location — so "which version is actually running?" is
+answerable from inside the session, and a blank version in the UI is
+distinguishable from a stale process.
+
 ## 1.4.0 — 2026-10-19
 
 ### Changed — rw_* target the workspace the session is ACTUALLY in
