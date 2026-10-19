@@ -57,7 +57,16 @@ interface StatusResponse {
 interface LsResponse {
   path?: string
   items?: LsItem[]
+  /** Local listing only: parent directory (null at the filesystem root). */
+  parent?: string | null
+  /** Local listing only: the host user's home directory. */
+  home?: string
+  /** Local listing only: the level was capped. */
+  truncated?: boolean
 }
+
+/** Remembered local workspace directory, so the本机 page never starts empty. */
+const LOCAL_PATH_KEY = 'dsh-rw:lastLocalPath'
 
 interface LocalPickResponse {
   ok?: boolean
@@ -474,7 +483,12 @@ function DirPicker(props: LocalizedDirPickerProps) {
   // 可下钻的条目（仅目录/符号链接；点行下钻，↑ 回上一级）。
   const [dirItems, setDirItems] = useState<LsItem[]>([])
   const [dirBase, setDirBase] = useState('')
+  // 本机页有自己的行内列表：与远程列表分开，两个页面互不干扰。
+  const [localItems, setLocalItems] = useState<LsItem[]>([])
+  const [localBase, setLocalBase] = useState('')
+  const [localParent, setLocalParent] = useState<string | null>(null)
   const suggestTimer = useRef<number | null>(null)
+  const localTimer = useRef<number | null>(null)
   // 「添加主机」子页表单状态（view === 'addHost' 时独占整页）。
   const [form, setForm] = useState<AddHostForm>(emptyAddForm)
   const [formErr, setFormErr] = useState('')
@@ -503,6 +517,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
   useEffect(
     () => () => {
       if (suggestTimer.current !== null) window.clearTimeout(suggestTimer.current)
+      if (localTimer.current !== null) window.clearTimeout(localTimer.current)
     },
     [],
   )
@@ -578,12 +593,94 @@ function DirPicker(props: LocalizedDirPickerProps) {
     loadDir(alias, parent)
   }
 
+  // 本机目录列表的数据源（GET /api/dsh-rw/ls-local）。sync=true 时把服务端
+  // 展开后的绝对路径回填输入框（~ 与服务端 home 保持一致）。
+  const loadLocalDir = (dir: string, sync?: boolean) => {
+    setLoading(true)
+    setErr('')
+    api<LsResponse>('GET', `/api/dsh-rw/ls-local?path=${encodeURIComponent(dir || '~')}`)
+      .then((res) => {
+        const real = res.path || dir || '~'
+        setLocalBase(real)
+        setLocalParent(res.parent === undefined ? null : res.parent)
+        if (sync) setLocalPath(real)
+        setLocalItems((Array.isArray(res.items) ? res.items : []).filter(drillable).slice(0, 400))
+      })
+      .catch((e) => {
+        setLocalItems([])
+        setErr(errText(e))
+      })
+      .finally(() => setLoading(false))
+  }
+
+  const selectLocalDir = (name: string) => {
+    const base = localBase || '~'
+    const next = base === '/' ? '/' + name : base + '/' + name
+    setLocalPath(next)
+    setErr('')
+    loadLocalDir(next)
+  }
+
+  const goLocalUp = () => {
+    const target = localParent ?? (() => {
+      const norm = String(localPath || '').replace(/\/+$/, '')
+      const idx = norm.lastIndexOf('/')
+      return idx <= 0 ? '/' : norm.slice(0, idx)
+    })()
+    setLocalPath(target)
+    setErr('')
+    loadLocalDir(target)
+  }
+
+  // 输入过滤：对本机路径的父目录做一次 ls，按末段前缀筛选。
+  const completeLocalPath = (raw: string) => {
+    const value = String(raw || '').trim()
+    if (!value) {
+      setLocalItems([])
+      return
+    }
+    const slash = value.lastIndexOf('/')
+    const parent = slash <= 0 ? '/' : value.slice(0, slash)
+    const lastSeg = slash < 0 ? value : value.slice(slash + 1)
+    api<LsResponse>('GET', `/api/dsh-rw/ls-local?path=${encodeURIComponent(parent || '/')}`)
+      .then((res) => {
+        const list = Array.isArray(res.items) ? res.items : []
+        setLocalBase(res.path || parent || '/')
+        setLocalParent(res.parent === undefined ? null : res.parent)
+        setLocalItems(
+          list
+            .filter((it) => drillable(it) && it.name.toLowerCase().startsWith(lastSeg.toLowerCase()))
+            .slice(0, 400),
+        )
+      })
+      .catch(() => setLocalItems([]))
+  }
+
+  const onLocalPathChange = (raw: string) => {
+    setLocalPath(raw)
+    setErr('')
+    if (localTimer.current !== null) window.clearTimeout(localTimer.current)
+    localTimer.current = window.setTimeout(() => completeLocalPath(raw), 220)
+  }
+
+  // 选用本机目录：记住它，下次打开本机页直接从这里开始。
+  const pickLocal = (value: string) => {
+    const target = String(value || '').trim()
+    if (!target) return
+    try {
+      window.localStorage.setItem(LOCAL_PATH_KEY, target)
+    } catch {
+      // storage may be disabled; picking still works
+    }
+    onPicked(target)
+  }
+
   const chooseLocal = () => {
     setLoading(true)
     setErr('')
     api<LocalPickResponse>('POST', '/api/dsh-rw/local-pick')
       .then((r) => {
-        if (r && r.path) onPicked(String(r.path))
+        if (r && r.path) pickLocal(String(r.path))
         else if (r && r.cancelled) setErr(t('selectionCancelled'))
         else setErr((r && r.error) || t('localPickerUnavailable'))
       })
@@ -595,6 +692,23 @@ function DirPicker(props: LocalizedDirPickerProps) {
   const openFlow = (t: 'local' | 'remote') => {
     setView(t)
     setErr('')
+    if (t === 'local') {
+      // Start where the operator last chose, so the common case is one click.
+      let remembered = ''
+      try {
+        remembered = window.localStorage.getItem(LOCAL_PATH_KEY) ?? ''
+      } catch {
+        remembered = ''
+      }
+      const start = localPath.trim() || remembered
+      if (start) {
+        setLocalPath(start)
+        loadLocalDir(start)
+      } else {
+        loadLocalDir('~', true)
+      }
+      return
+    }
     if (t === 'remote' && alias) {
       // 已输入过路径则保留（列表跟随其内容），否则默认落在远端 home（~/）。
       const start = path.trim()
@@ -891,10 +1005,41 @@ function DirPicker(props: LocalizedDirPickerProps) {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={labelS}>{t('localPathLabel')}</div>
               <div style={{ display: 'flex', gap: 8 }}>
-                <TextInput value={localPath} onChange={(e) => setLocalPath(e.target.value)} placeholder={t('localPathPlaceholder')} />
-                <Btn primary onClick={() => (localPath.trim() ? onPicked(localPath.trim()) : undefined)} disabled={!localPath.trim()}>
+                <TextInput
+                  value={localPath}
+                  onChange={(e) => onLocalPathChange(e.target.value)}
+                  onFocus={() => (localPath.trim() ? completeLocalPath(localPath) : loadLocalDir('~', true))}
+                  placeholder={t('localPathPlaceholder')}
+                  style={{ flex: 1, minWidth: 120 }}
+                />
+                <Btn primary onClick={() => pickLocal(localPath)} disabled={!localPath.trim()}>
                   {t('useDirectory')}
                 </Btn>
+              </div>
+              {/* 行内本机目录浏览器：与远程页同一套交互，不必再打开系统选择器。 */}
+              <div style={{ border: '1px solid ' + T.border, borderRadius: 10, background: T.bg, maxHeight: 240, overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
+                {loading ? (
+                  <SingleLine text={t('loading')} style={{ padding: 12 }} />
+                ) : (
+                  <>
+                    {localParent !== null ? (
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={goLocalUp}
+                        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ' ? goLocalUp() : undefined)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, cursor: 'pointer', color: T.muted, fontSize: 13 }}
+                      >
+                        <SvgFolder /> .. {t('goUp')}
+                      </div>
+                    ) : null}
+                    {localItems.length ? (
+                      localItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectLocalDir(it.name)} t={t} />)
+                    ) : (
+                      <SingleLine text={t('noMatchingDirectories')} style={{ padding: 12 }} />
+                    )}
+                  </>
+                )}
               </div>
             </div>
             <Btn style={{ alignSelf: 'flex-start' }} onClick={chooseLocal} disabled={loading}>

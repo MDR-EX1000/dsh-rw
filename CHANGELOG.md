@@ -3,6 +3,28 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.1.0 — 2026-10-19
+
+### Added — in-app local directory browser
+
+- The 本机 page no longer depends on the OS chooser. It browses local
+  directories in place — one level at a time, `..` to go up, type-to-filter —
+  the same interaction the 远程 page already had, backed by a new loopback-only
+  `GET /api/dsh-rw/ls-local` route (directories only, capped at 500 with an
+  explicit truncation flag, `~` expanded against the host home, structured
+  `NO_SUCH_PATH` / `NOT_A_DIRECTORY` / `PERMISSION_DENIED` answers).
+- The last local workspace directory is remembered (`localStorage`) and
+  restored when the page opens, so the common case is one click instead of a
+  fresh Finder dialog. The OS chooser stays available as a secondary button and
+  its result is remembered too.
+
+### Fixed — a Finder dialog on every visit
+
+The native picker seam is `pick(signal)` with no start directory, so every
+visit began wherever the OS chooser last defaulted. The in-app browser removes
+that dependency entirely; the system-picker failure messages now point at it
+instead of telling the operator to type the path by hand.
+
 ## 1.0.0 — 2026-10-19
 
 The first release where remote work stops being a second-class citizen: native

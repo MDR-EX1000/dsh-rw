@@ -158,7 +158,7 @@ async function callLocalPick(routes: CapturedRoute[]): Promise<{ status: number;
 }
 
 describe('apply', () => {
-  it('registers the sixteen rw_* tools, the six routes, and the /rw command', () => {
+  it('registers the sixteen rw_* tools, the seven routes, and the /rw command', () => {
     const { ctx, tools, routes, commands, effectLabels } = makeCtx()
     apply(ctx as unknown as Context, CONFIG, makeOverrides())
 
@@ -185,6 +185,7 @@ describe('apply', () => {
       '/api/dsh-rw/hosts',
       '/api/dsh-rw/test',
       '/api/dsh-rw/ls',
+      '/api/dsh-rw/ls-local',
       '/api/dsh-rw/workspace',
       '/api/dsh-rw/local-pick',
     ])
@@ -276,7 +277,7 @@ describe('apply', () => {
     mountDirectoryPicker({ capability: () => Promise.resolve({ kind: 'browser' }) })
     const nonNative = await callLocalPick(routes)
     expect(nonNative.status).toBe(400)
-    expect(nonNative.json.error).toContain('non-native backend')
+    expect(nonNative.json.error).toContain('needs the native backend')
 
     // Simulate the late mount (the web app's nested loader.create) …
     mountDirectoryPicker({
@@ -301,7 +302,7 @@ describe('apply', () => {
     const overrides = makeOverrides()
     apply(ctx as unknown as Context, CONFIG, overrides)
     expect(tools.length).toBe(16)
-    expect(routes.length).toBe(6)
+    expect(routes.length).toBe(7)
 
     for (const dispose of effectDisposers) dispose()
     expect(tools).toEqual([])

@@ -7,7 +7,10 @@
 // serve them. Responses are JSON UTF-8; failures carry { error, code } with
 // the RwError code — and never passwords or key material (host payloads are
 // only ever echoed back through HostTable.summarize).
+import { readdirSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { mapSftpError, RwError, toRwError } from './errors.js'
 import type { RwErrorCode } from './errors.js'
@@ -373,6 +376,76 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
       },
     },
 
+    // ------------------------------------- GET /api/dsh-rw/ls-local
+    {
+      kind: 'exact',
+      path: '/api/dsh-rw/ls-local',
+      handler: async (req, res) => {
+        if (!guard(req, res, 'GET')) return
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const rawPath = queryParam(url, 'path') ?? '~'
+        if (rawPath !== '~' && !rawPath.startsWith('/') && !rawPath.startsWith('~/')) {
+          writeJson(res, 400, { error: `path must be absolute (or ~/…): ${JSON.stringify(rawPath)}`, code: 'INVALID_INPUT' })
+          return
+        }
+        const home = homedir()
+        const dir = rawPath === '~' ? home : rawPath.startsWith('~/') ? resolve(home, rawPath.slice(2)) : resolve(rawPath)
+        let isDir: boolean
+        try {
+          isDir = statSync(dir).isDirectory()
+        } catch (err) {
+          const code = (err as { code?: string }).code
+          const failure =
+            code === 'ENOENT'
+              ? new RwError('NO_SUCH_PATH', `no such directory: ${dir}`)
+              : code === 'EACCES' || code === 'EPERM'
+                ? new RwError('PERMISSION_DENIED', `permission denied: ${dir}`)
+                : new RwError('REMOTE_ERROR', `cannot stat ${dir}: ${err instanceof Error ? err.message : String(err)}`)
+          writeError(res, failure)
+          return
+        }
+        if (!isDir) {
+          writeError(res, new RwError('NOT_A_DIRECTORY', `not a directory: ${dir}`))
+          return
+        }
+        try {
+          const names = readdirSync(dir, { withFileTypes: true })
+          const entries = names
+            .filter((entry) => {
+              if (entry.isDirectory()) return true
+              if (!entry.isSymbolicLink()) return false
+              // A symlinked directory is drillable; a dangling link is not.
+              try {
+                return statSync(join(dir, entry.name)).isDirectory()
+              } catch {
+                return false
+              }
+            })
+            .map((entry) => ({ name: entry.name, type: 'dir' as const }))
+            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+          // The picker shows one level; a huge directory must not bloat the
+          // response or the render, and truncation is reported explicitly.
+          const capped = entries.slice(0, 500)
+          const parent = dir === '/' ? null : resolve(dir, '..')
+          writeJson(res, 200, {
+            path: dir,
+            parent,
+            home,
+            items: capped,
+            truncated: entries.length > capped.length,
+          })
+        } catch (err) {
+          const code = (err as { code?: string }).code
+          writeError(
+            res,
+            code === 'EACCES' || code === 'EPERM'
+              ? new RwError('PERMISSION_DENIED', `permission denied: ${dir}`)
+              : new RwError('REMOTE_ERROR', `cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`),
+          )
+        }
+      },
+    },
+
     // -------------------------------------------- POST /api/dsh-rw/workspace
     {
       kind: 'exact',
@@ -408,7 +481,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
         if (deps.pickDirectory === undefined) {
           writeJson(res, 400, {
             ok: false,
-            error: 'local directory picker service is unavailable (no DSH directory-picker backend) — enter the path manually',
+            error: 'local directory picker service is unavailable (no DSH directory-picker backend) — use the in-app local browser',
             code: 'INVALID_INPUT',
           })
           return

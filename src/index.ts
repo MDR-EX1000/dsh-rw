@@ -158,12 +158,12 @@ function adaptDirectoryPicker(ctx: Context): () => Promise<string | null> {
       | undefined
     if (!dp || typeof dp.capability !== 'function') {
       throw new Error(
-        'local directory picker service is unavailable (no DSH directory-picker backend) — enter the path manually',
+        'local directory picker service is unavailable (no DSH directory-picker backend) — use the in-app local browser',
       )
     }
     const cap = await dp.capability()
     if (!cap || cap.kind !== 'native' || typeof cap.pick !== 'function') {
-      throw new Error('local directory picker is unavailable (non-native backend) — enter the local path manually')
+      throw new Error('local directory picker needs the native backend (this DSH composes a different one) — use the in-app local browser')
     }
     const pickAbort = new AbortController()
     try {

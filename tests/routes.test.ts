@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RwError } from '../src/errors.js'
@@ -87,6 +87,7 @@ describe('loopback fence', () => {
       ['/api/dsh-rw/hosts', 'POST'],
       ['/api/dsh-rw/test', 'POST'],
       ['/api/dsh-rw/ls', 'GET'],
+      ['/api/dsh-rw/ls-local', 'GET'],
       ['/api/dsh-rw/workspace', 'POST'],
       ['/api/dsh-rw/local-pick', 'POST'],
     ]
@@ -351,5 +352,61 @@ describe('workspace / local-pick', () => {
     const res = await call(failed, '/api/dsh-rw/local-pick', 'POST', { body: {} })
     expect(res.status).toBe(400)
     expect(res.json).toMatchObject({ ok: false, error: 'non-native backend' })
+  })
+})
+
+describe('GET /api/dsh-rw/ls-local', () => {
+  let tree: string
+
+  beforeEach(() => {
+    tree = mkdtempSync(join(tmpdir(), 'dsh-rw-lslocal-'))
+    mkdirSync(join(tree, 'alpha'))
+    mkdirSync(join(tree, 'beta'))
+    writeFileSync(join(tree, 'plain.txt'), 'x')
+  })
+
+  afterEach(() => {
+    rmSync(tree, { recursive: true, force: true })
+  })
+
+  it('lists only drillable directories, sorted, with parent and home', async () => {
+    const { status, json } = await call(routes, '/api/dsh-rw/ls-local', 'GET', {
+      url: `/api/dsh-rw/ls-local?path=${encodeURIComponent(tree)}`,
+    })
+    expect(status).toBe(200)
+    expect(json.path).toBe(tree)
+    expect(json.parent).toBe(join(tree, '..'))
+    expect(typeof json.home).toBe('string')
+    const names = (json.items as { name: string }[]).map((i) => i.name)
+    expect(names).toEqual(['alpha', 'beta'])
+  })
+
+  it('resolves ~ and ~/… against the home directory', async () => {
+    const home = homedir()
+    const bare = await call(routes, '/api/dsh-rw/ls-local', 'GET', { url: '/api/dsh-rw/ls-local?path=~' })
+    expect(bare.status).toBe(200)
+    expect(bare.json.path).toBe(home)
+    const nested = await call(routes, '/api/dsh-rw/ls-local', 'GET', { url: '/api/dsh-rw/ls-local?path=~/' })
+    expect(nested.json.path).toBe(home)
+  })
+
+  it('defaults to the home directory when path is absent', async () => {
+    const { status, json } = await call(routes, '/api/dsh-rw/ls-local', 'GET')
+    expect(status).toBe(200)
+    expect(json.path).toBe(homedir())
+  })
+
+  it('rejects relative paths and non-directories with structured codes', async () => {
+    const relative = await call(routes, '/api/dsh-rw/ls-local', 'GET', { url: '/api/dsh-rw/ls-local?path=nope' })
+    expect(relative.status).toBe(400)
+    expect(relative.json.code).toBe('INVALID_INPUT')
+    const file = await call(routes, '/api/dsh-rw/ls-local', 'GET', {
+      url: `/api/dsh-rw/ls-local?path=${encodeURIComponent(join(tree, 'plain.txt'))}`,
+    })
+    expect(file.status).toBe(400)
+    expect(file.json.code).toBe('NOT_A_DIRECTORY')
+    const missing = await call(routes, '/api/dsh-rw/ls-local', 'GET', { url: '/api/dsh-rw/ls-local?path=/no/such/dir' })
+    expect(missing.status).toBe(404)
+    expect(missing.json.code).toBe('NO_SUCH_PATH')
   })
 })
