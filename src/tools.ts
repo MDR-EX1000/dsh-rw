@@ -16,7 +16,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError, toRwError } from './errors.js'
 import { normalizeRemote, expandRemoteHome, resolveInWorkspace, assertRealpathInside, shq } from './guard.js'
 import type { HostEntry, HostSummary } from './hosts.js'
-import { ensurePlaceholder, resolvePlaceholderDir } from './placeholder.js'
+import { ensurePlaceholder, findPlaceholderByPath, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
 import type { Session } from './session.js'
 import type { NativeRouting } from './shim.js'
@@ -117,28 +117,91 @@ function unknownAliasError(deps: ToolsDeps, alias: string): RwError {
   )
 }
 
-/** The connected host entry, or a thrown NOT_CONNECTED / INVALID_INPUT. */
-function requireEntry(deps: ToolsDeps): HostEntry {
-  const alias = deps.session.alias
-  if (alias === null) {
-    throw new RwError('NOT_CONNECTED', 'no host connected — call rw_connect(alias) first (rw_hosts lists aliases)')
-  }
-  const entry = deps.hosts.find(alias)
-  if (!entry) {
-    throw new RwError('NOT_CONNECTED', `session host ${JSON.stringify(alias)} is no longer configured — rw_connect again`)
-  }
-  return entry
+/**
+ * The slice of the tool execution context this module reads. Structural on
+ * purpose: the real value is a `ToolRunContext`, and tests drive plain objects.
+ */
+interface ExecLike {
+  agent?: { session?: { header?: { cwd?: string } } }
 }
 
-/** A RemoteFs bound to the current workspace, or a thrown NO_WORKSPACE. */
-async function requireWorkspaceFs(deps: ToolsDeps): Promise<RemoteFs> {
-  const entry = requireEntry(deps)
+/** The calling agent's session cwd — where the agent is ACTUALLY working. */
+function agentCwdOf(exec: ExecLike | undefined): string | undefined {
+  const cwd: unknown = exec?.agent?.session?.header?.cwd
+  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+}
+
+/**
+ * Where this session actually works, resolved from the AGENT CWD first.
+ *
+ * The session record (`alias` + `workspace`) is only a fallback. If the agent
+ * is working inside a dsh-rw placeholder, that placeholder's host and remote
+ * root are the truth — the record can be stale, can point at another machine
+ * after a reconnect, or can be a leftover from a previous pick. Making the
+ * actual workspace win is what keeps `rw_*` and the shimmed native tools from
+ * disagreeing about which machine is in play.
+ *
+ * `broken` means the cwd is placeholder-backed but its host is no longer
+ * configured: the caller must fail loudly, never silently use the record.
+ */
+type WorkspaceTarget =
+  | { kind: 'ok'; entry: HostEntry; workspace: string; source: 'cwd' | 'session' }
+  /** Connected, but no remote directory picked yet — host tools work, file tools do not. */
+  | { kind: 'no-workspace'; entry: HostEntry }
+  | { kind: 'broken'; alias: string; workspace: string; dir: string }
+
+function activeWorkspace(deps: ToolsDeps, exec?: ExecLike): WorkspaceTarget | null {
+  const cwd = agentCwdOf(exec)
+  if (cwd !== undefined) {
+    const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
+    if (found !== null) {
+      const entry = deps.hosts.find(found.meta.alias)
+      if (entry === undefined) {
+        return { kind: 'broken', alias: found.meta.alias, workspace: found.meta.remotePath, dir: found.dir }
+      }
+      return { kind: 'ok', entry, workspace: found.meta.remotePath, source: 'cwd' }
+    }
+  }
+  const alias = deps.session.alias
+  if (alias === null) return null
+  const entry = deps.hosts.find(alias)
+  if (!entry) return null
   const workspace = deps.session.workspace
-  if (workspace === null) {
+  // Connected but unpicked is its own state: rw_exec legitimately runs in the
+  // SSH default directory, while every file tool must say NO_WORKSPACE.
+  if (workspace === null) return { kind: 'no-workspace', entry }
+  return { kind: 'ok', entry, workspace, source: 'session' }
+}
+
+/** The host this call must target, or a thrown NOT_CONNECTED / INVALID_INPUT. */
+function requireEntry(deps: ToolsDeps, exec?: ExecLike): HostEntry {
+  const target = activeWorkspace(deps, exec)
+  if (target === null) {
+    throw new RwError('NOT_CONNECTED', 'no host connected — call rw_connect(alias) first (rw_hosts lists aliases)')
+  }
+  if (target.kind === 'broken') {
+    throw new RwError(
+      'NOT_CONNECTED',
+      `this session works in ${target.dir} (host alias '${target.alias}', remote ${target.workspace}) but that ` +
+        'host is no longer configured — re-add it (rw_hosts) and rw_connect again',
+    )
+  }
+  return target.entry
+}
+
+/** A RemoteFs bound to the ACTUAL workspace, or a thrown NO_WORKSPACE. */
+async function requireWorkspaceFs(deps: ToolsDeps, exec?: ExecLike): Promise<RemoteFs> {
+  const target = activeWorkspace(deps, exec)
+  const entry = requireEntry(deps, exec)
+  if (target === null || target.kind === 'broken') {
+    // requireEntry already threw for both cases; this keeps the type honest.
+    throw new RwError('NO_WORKSPACE', 'no remote workspace picked — call rw_pick_workspace(path) first')
+  }
+  if (target.kind === 'no-workspace') {
     throw new RwError('NO_WORKSPACE', 'no remote workspace picked — call rw_pick_workspace(path) first')
   }
   const sftp = await deps.pool.sftp(entry)
-  return new RemoteFs(sftp, workspace)
+  return new RemoteFs(sftp, target.workspace)
 }
 
 /**
@@ -216,13 +279,18 @@ function nativeRoutingLine(deps: ToolsDeps, placeholderDir: string | null): stri
 }
 
 /** Sync status lines shared by rw_info and the /rw slash command. */
-export function statusText(deps: ToolsDeps): string {
+export function statusText(deps: ToolsDeps, exec?: ExecLike): string {
   const { hosts, pool, session } = deps
   const summaries = hosts.summaries()
-  const alias = session.alias
-  const entry = alias !== null ? hosts.find(alias) : undefined
+  // The ACTUAL workspace wins: when the agent cwd is inside a placeholder, that
+  // placeholder's host/root are what every rw_* call will use — the session
+  // record is only a fallback and is reported as such.
+  const target = activeWorkspace(deps, exec)
+  const resolved = target !== null && target.kind === 'ok' ? target : null
+  const alias = resolved !== null ? resolved.entry.alias : session.alias
+  const entry = resolved !== null ? resolved.entry : alias !== null ? hosts.find(alias) : undefined
   const connected = alias !== null && pool.connected().includes(alias)
-  const workspace = session.workspace
+  const workspace = resolved !== null ? resolved.workspace : session.workspace
   const lines: string[] = []
   lines.push(`Hosts configured: ${summaries.length}`)
   if (alias !== null && entry) {
@@ -233,7 +301,13 @@ export function statusText(deps: ToolsDeps): string {
     lines.push('Current host: (none — call rw_connect with an alias from rw_hosts)')
   }
   lines.push(`Connected: ${connected ? 'yes' : 'no'}`)
-  lines.push(`Current workspace: ${workspace ?? '(none — call rw_pick_workspace to set one)'}`)
+  const source =
+    resolved === null
+      ? ''
+      : resolved.source === 'cwd'
+        ? ' (from this session\'s working directory)'
+        : ' (from the plugin session record)'
+  lines.push(`Current workspace: ${workspace ?? '(none — call rw_pick_workspace to set one)'}${source}`)
   if (alias !== null && workspace !== null) {
     const placeholderDir = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
     lines.push(
@@ -419,9 +493,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         'Triggers: remote workspace, SSH host, server status, where am I working, are my tools remote.',
       parameters: {},
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute() {
+      async execute(_args, exec) {
         try {
-          return { text: statusText(deps) }
+          return { text: statusText(deps, exec) }
         } catch (err) {
           throw toToolError(err)
         }
@@ -437,7 +511,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         'Triggers: list servers/hosts, which machines can I reach, SSH config.',
       parameters: {},
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute() {
+      async execute(_args, exec) {
         try {
           return { text: renderHostsTable(hosts.summaries()) }
         } catch (err) {
@@ -457,7 +531,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         alias: { type: 'string', required: true, description: 'Host alias from rw_hosts.' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           const entry = hosts.find(args.alias)
           if (!entry) throw unknownAliasError(deps, args.alias)
@@ -489,7 +563,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         path: { type: 'string', required: true, description: 'Absolute remote directory path, e.g. /home/dev/project.' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           const alias = session.alias
           if (alias === null) {
@@ -521,9 +595,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         path: { type: 'string', description: 'Directory path (absolute, or relative to the workspace root; default: the root).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           const entries = await fs.list(args.path)
           if (entries.length === 0) return { text: `(empty directory: ${args.path ?? fs.root})` }
           const rows = entries.map((e) => [e.type, String(e.size), formatMtime(e.mtime), e.name].join(' | '))
@@ -547,9 +621,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         maxLines: { type: 'integer', description: 'Max lines to return (default 2000, cap 10000).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           const res = await fs.read(args.path, {
             startLine: args.startLine,
             maxLines: args.maxLines,
@@ -587,9 +661,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           if (args.ifHash !== undefined) {
             // Read the raw bytes: the guard is about content identity, so the
             // trailing newline must be part of the hash.
@@ -627,9 +701,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         path: { type: 'string', required: true, description: 'Directory path (absolute, or relative to the workspace root).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           await fs.mkdir(args.path)
           return { text: `created directory ${args.path}` }
         } catch (err) {
@@ -651,9 +725,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         overwrite: { type: 'boolean', description: 'Replace an existing destination (default false).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           await fs.move(args.src, args.dst, { overwrite: args.overwrite })
           return { text: `moved ${args.src} -> ${args.dst}` }
         } catch (err) {
@@ -674,9 +748,9 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         recursive: { type: 'boolean', description: 'Required to delete a directory: deletes its children first (default false).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           await fs.delete(args.path, { recursive: args.recursive })
           return { text: `deleted ${args.path}` }
         } catch (err) {
@@ -698,10 +772,10 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         timeoutMs: { type: 'integer', description: `Timeout in milliseconds (default ${config.commandTimeoutMs}).` },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           if (args.command.trim() === '') throw new RwError('INVALID_INPUT', 'command must not be empty')
-          const entry = requireEntry(deps)
+          const entry = requireEntry(deps, exec)
           const cwd = session.workspace ?? undefined
           const timeoutMs = args.timeoutMs ?? config.commandTimeoutMs
           const res = await pool.exec(entry, args.command, { cwd, timeoutMs })
@@ -749,7 +823,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           const callsArg = args.calls
           const hasCalls = callsArg !== undefined
@@ -867,7 +941,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         maxEntries: { type: 'integer', description: 'Cap on tracked entries (default 20000).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           const name = args.name ?? 'default'
           if (args.action === 'list') {
@@ -888,7 +962,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
           if (args.action === 'stop') {
             return { text: managers.stop(name) ? `stopped watcher '${name}'` : `no watcher named '${name}'` }
           }
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           if (args.action === 'start') {
             const root = resolveInWorkspace(fs.root, args.path)
             const real = await assertRealpathInside(fs.sftp, fs.root, root)
@@ -923,14 +997,14 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         context: { type: 'integer', description: 'Context lines per hunk (default 3).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           const hasContent = args.content !== undefined
           const hasAgainst = args.against !== undefined
           if (hasContent === hasAgainst) {
             throw new RwError('INVALID_INPUT', 'give exactly one of `content` or `against` as the after side')
           }
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           const before = await readWorkspaceText(fs, args.path)
           const after = hasContent ? (args.content ?? '') : await readWorkspaceText(fs, args.against!)
           if (looksBinary(before) || looksBinary(after)) {
@@ -966,12 +1040,12 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         dryRun: { type: 'boolean', description: 'Only check that the patch applies (default false).' },
       },
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute(args) {
+      async execute(args, exec) {
         try {
           if (args.patch.trim() === '') throw new RwError('INVALID_INPUT', 'patch must not be empty')
           const strip = args.strip ?? 1
           if (!Number.isInteger(strip) || strip < 0) throw new RwError('INVALID_INPUT', 'strip must be an integer >= 0')
-          const fs = await requireWorkspaceFs(deps)
+          const fs = await requireWorkspaceFs(deps, exec)
           // Confinement is decided here, before anything runs on the host.
           let targets: string[]
           try {
@@ -981,7 +1055,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
             // internal errors: report them as actionable input problems.
             throw new RwError('INVALID_INPUT', err instanceof Error ? err.message : String(err))
           }
-          const entry = requireEntry(deps)
+          const entry = requireEntry(deps, exec)
           const staged = `${fs.root}/.dsh-rw-patch-${randomBytes(6).toString('hex')}`
           await fs.sftp.writeFile(staged, Buffer.from(args.patch, 'utf8'))
           const runPatch = async (dryRun: boolean): Promise<ExecResult> =>
@@ -1032,7 +1106,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         'SSH session, switch servers.',
       parameters: {},
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
-      async execute() {
+      async execute(_args, exec) {
         try {
           const alias = session.alias
           if (alias === null) return { text: 'not connected — nothing to disconnect' }

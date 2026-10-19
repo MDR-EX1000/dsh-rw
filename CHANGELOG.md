@@ -3,6 +3,33 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 1.4.0 — 2026-10-19
+
+### Changed — rw_* target the workspace the session is ACTUALLY in
+
+`rw_*` resolved its host and workspace from the plugin's session record
+(`alias` + `workspace`). That record can be stale, can name a different machine
+after a reconnect, or can be a leftover from a previous pick — while the agent
+is working in a completely different placeholder. The shim had already moved to
+"anchor on the actual working directory, never on the record"; `rw_*` had not,
+so the two tool families could disagree about which machine was in play.
+
+Resolution is now `activeWorkspace(deps, exec)`, in this order:
+
+1. the agent's working directory, when it sits inside a dsh-rw placeholder —
+   that placeholder's host and remote root are the truth (`source: 'cwd'`);
+2. otherwise the plugin session record (`source: 'session'`);
+3. a working directory whose placeholder host is no longer configured is a
+   hard `NOT_CONNECTED` — it never silently falls back to the record.
+
+`rw_info` reports which of the two is in effect ("from this session's working
+directory" / "from the plugin session record"), and the prompt section states
+the precedence (it cannot read the cwd itself — `AssembleContext` carries only
+a scope).
+
+`rw_exec` still works when a host is connected but no workspace is picked (the
+SSH default directory); every file tool keeps saying `NO_WORKSPACE`.
+
 ## 1.3.0 — 2026-10-19
 
 ### Fixed — a background bash call inside a remote workspace ran on the LOCAL machine

@@ -16,7 +16,10 @@ import type { FakeHarness } from './p4-fakes.js'
 interface TestTool {
   name: string
   description: string
-  execute(args?: Record<string, unknown>): Promise<{ text: string }>
+  execute(
+    args?: Record<string, unknown>,
+    exec?: { agent?: { session?: { header?: { cwd?: string } } } },
+  ): Promise<{ text: string; isError?: boolean }>
 }
 
 /**
@@ -666,5 +669,41 @@ describe('rw_disconnect', () => {
   it('is a no-op when not connected', async () => {
     const { text } = await tool('rw_disconnect').execute({})
     expect(text).toContain('not connected')
+  })
+})
+
+describe('workspace resolution follows the session working directory', () => {
+  /** A tool-execution context whose agent works in `cwd`. */
+  const ctxAt = (cwd: string): { agent: { session: { header: { cwd: string } } } } => ({
+    agent: { session: { header: { cwd } } },
+  })
+
+  it('uses the placeholder the agent works in, even when the session record points elsewhere', async () => {
+    harness.connect() // record: prod:/srv/app
+    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    harness.pool.fs.addFile('/srv/app/from-cwd.txt', 'cwd wins\n')
+    // The record now names another host entirely (what a reconnect leaves behind).
+    harness.session.set({ alias: 'dev', workspace: '/srv/other' })
+
+    const { text } = await tool('rw_read_file').execute({ path: 'from-cwd.txt' }, ctxAt(root))
+    expect(text).toContain('cwd wins')
+    expect(harness.pool.connectedAliases.has('prod')).toBe(true)
+  })
+
+  it('reports where the workspace came from', async () => {
+    harness.connect()
+    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    const fromCwd = await tool('rw_info').execute({}, ctxAt(root))
+    expect(fromCwd.text).toContain("from this session's working directory")
+    const fromRecord = await tool('rw_info').execute({}, ctxAt('/elsewhere'))
+    expect(fromRecord.text).toContain('from the plugin session record')
+  })
+
+  it('fails loud when the working directory belongs to a host that is gone (never the record)', async () => {
+    harness.connect()
+    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    harness.hosts.entries.length = 0 // the host was removed from the config
+    await expectToolError(tool('rw_read_file').execute({ path: 'x' }, ctxAt(root)), 'NOT_CONNECTED')
+    expect(harness.pool.execCalls).toEqual([])
   })
 })

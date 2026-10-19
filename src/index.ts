@@ -252,6 +252,14 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     )
   }
 
+  // The prompt cannot read the agent's cwd (AssembleContext carries only a
+  // scope), so it states the precedence instead of guessing: rw_* resolve from
+  // the working directory first and fall back to the record.
+  const workspacePrecedence =
+    'Target selection: rw_* address the workspace this session is ACTUALLY working in (derived from the ' +
+    'working directory when it is inside a dsh-rw placeholder); the plugin session record above is only a ' +
+    'fallback — rw_info reports which one is in effect.'
+
   const promptText = (): string => {
     const alias = session.alias
     const workspace = session.workspace
@@ -284,6 +292,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
         return [
           '## Remote workspace (dsh-rw)',
           `Current remote workspace: ${who}:${workspace}`,
+          workspacePrecedence,
           `WARNING — the native tools were running on the LOCAL machine for the last call: it named paths outside ` +
             `the dsh-rw placeholder (${placeholder}) and this session's working directory ` +
             `(${nativeRouting.cwd ?? 'unknown'}) is not inside that placeholder either. Native file calls that DO ` +
@@ -304,6 +313,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
         return [
           '## Remote workspace (dsh-rw)',
           `Current remote workspace: ${who}:${workspace}`,
+          workspacePrecedence,
           `This session's workspace is remote-backed: the native ${native} tools are translated to the remote ` +
             `host automatically — ${how}. Use them exactly as if the workspace were local. ` +
             `${rwTools} The remote filesystem is the source of truth (no local mirror).`,
@@ -315,6 +325,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       return [
         '## Remote workspace (dsh-rw)',
         `Current remote workspace: ${who}:${workspace}`,
+          workspacePrecedence,
         `The native ${native} tools have two translation anchors: (1) a call whose path argument is inside the ` +
           `dsh-rw placeholder directory (${placeholder}) is translated to the remote host from ANY working ` +
           `directory; (2) bash — and glob/grep without an explicit path — is translated only while this ` +
@@ -328,6 +339,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     return [
       '## Remote workspace (dsh-rw)',
       `Current remote workspace: ${who}:${workspace}`,
+          workspacePrecedence,
       'Use the rw_* tools (rw_list_dir / rw_read_file / rw_write_file / rw_mkdir / rw_move / rw_delete / rw_exec) ' +
         'to inspect and modify the remote host directly; the remote filesystem is the source of truth (no local ' +
         'mirror). All rw_* file paths are confined to the workspace root.',

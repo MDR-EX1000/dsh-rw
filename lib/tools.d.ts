@@ -72,6 +72,19 @@ export interface ToolsDeps {
     shimEnabled?: () => boolean;
 }
 /**
+ * The slice of the tool execution context this module reads. Structural on
+ * purpose: the real value is a `ToolRunContext`, and tests drive plain objects.
+ */
+interface ExecLike {
+    agent?: {
+        session?: {
+            header?: {
+                cwd?: string;
+            };
+        };
+    };
+}
+/**
  * Shared pick-workspace validation used by rw_pick_workspace and the
  * /api/dsh-rw/workspace route: resolve symlinks via realpath, require a
  * directory, create the local placeholder. Returns the real workspace path
@@ -83,8 +96,9 @@ export declare function resolveWorkspaceDir(deps: ToolsDeps, alias: string, path
     placeholderDir: string;
 }>;
 /** Sync status lines shared by rw_info and the /rw slash command. */
-export declare function statusText(deps: ToolsDeps): string;
+export declare function statusText(deps: ToolsDeps, exec?: ExecLike): string;
 /** The fixed number of rw_* tools, exported so the registration-order tests track it. */
 export declare const RW_TOOL_COUNT = 16;
 /** The twelve rw_* tools in their fixed registration order. */
 export declare function makeTools(deps: ToolsDeps): unknown[];
+export {};
