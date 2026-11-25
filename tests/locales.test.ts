@@ -16,4 +16,16 @@ describe('client locales', () => {
     expect(en.testConnection).toBe('Test connection')
     expect(en.setRemoteWorkspace).toBe('Use as remote workspace')
   })
+
+  it('ships the per-host main directory copy in both languages', () => {
+    for (const key of ['badgeMainDir', 'mainDirLine', 'setMainDir', 'clearMainDir', 'mainDirSaving', 'mainDirFailed', 'openMainWorkspace'] as const) {
+      expect(en[key].length).toBeGreaterThan(0)
+      expect(zh[key].length).toBeGreaterThan(0)
+    }
+    // Path-bearing strings must keep their placeholder so the path is shown.
+    for (const key of ['mainDirLine', 'setMainDir', 'clearMainDir', 'openMainWorkspace'] as const) {
+      expect(en[key]).toContain('{path}')
+      expect(zh[key]).toContain('{path}')
+    }
+  })
 })

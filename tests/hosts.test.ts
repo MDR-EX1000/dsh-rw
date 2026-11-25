@@ -346,4 +346,66 @@ describe('HostTable', () => {
     expect(t.find('nas')).toBeDefined()
   })
 
+  it('stores a main directory per host, reports it in the summary, and persists it (version stays 1)', () => {
+    writeFileSync(sshConfigPath(), ['Host dev', '  HostName v.example.com', '  User u', ''].join('\n'))
+    const t = table()
+    t.addManual({ alias: 'nas', host: 'nas.lan', user: 'admin', password: 'pw' })
+    expect(t.mainDir('nas')).toBeUndefined()
+    expect(t.summarize(t.find('nas')!).mainDir).toBeUndefined()
+
+    t.setMainDir('nas', '/srv/data/')
+    t.setMainDir('dev', '/home/u/proj')
+    expect(t.mainDir('nas')).toBe('/srv/data')
+    expect(t.summaries().find((h) => h.alias === 'dev')?.mainDir).toBe('/home/u/proj')
+
+    const stored = JSON.parse(readFileSync(storePath(), 'utf8')) as { version: number; mains: Record<string, string> }
+    expect(stored.version).toBe(1)
+    expect(stored.mains).toEqual({ dev: '/home/u/proj', nas: '/srv/data' })
+    expect(table().mainDir('dev')).toBe('/home/u/proj')
+
+    t.setMainDir('dev', null)
+    expect(table().mainDir('dev')).toBeUndefined()
+    expect(table().mainDir('nas')).toBe('/srv/data')
+  })
+
+  it('rejects a main directory for an unknown alias or a relative path', () => {
+    const t = table()
+    t.addManual({ alias: 'nas', host: 'nas.lan', user: 'admin', password: 'pw' })
+    expect(() => t.setMainDir('ghost', '/x')).toThrow(RwError)
+    expect(() => t.setMainDir('nas', 'relative')).toThrow(RwError)
+    expect(t.mainDir('nas')).toBeUndefined()
+  })
+
+  it('drops a manual host’s main directory when the host is removed', () => {
+    const t = table()
+    t.addManual({ alias: 'nas', host: 'nas.lan', user: 'admin', password: 'pw' })
+    t.setMainDir('nas', '/srv')
+    t.removeManual('nas')
+    t.addManual({ alias: 'nas', host: 'nas.lan', user: 'admin', password: 'pw' })
+    expect(t.mainDir('nas')).toBeUndefined()
+    expect(table().mainDir('nas')).toBeUndefined()
+  })
+
+  it('reads a pre-2.0 store (no mains) unchanged, and ignores malformed mains', () => {
+    mkdirSync(join(dir, 'dsh'), { recursive: true })
+    writeFileSync(
+      storePath(),
+      JSON.stringify({ version: 1, hosts: [{ alias: 'a', host: 'h', port: 22, user: 'u', auth: { kind: 'password', password: 'p' } }] }),
+    )
+    expect(table().find('a')).toBeDefined()
+    expect(table().mainDir('a')).toBeUndefined()
+    writeFileSync(
+      storePath(),
+      JSON.stringify({
+        version: 1,
+        hosts: [{ alias: 'a', host: 'h', port: 22, user: 'u', auth: { kind: 'password', password: 'p' } }],
+        mains: { a: 42, b: 'relative', c: '/ok' },
+      }),
+    )
+    const t = table()
+    expect(t.find('a')).toBeDefined()
+    expect(t.mainDir('a')).toBeUndefined()
+    expect(t.mainDir('b')).toBeUndefined()
+    expect(t.mainDir('c')).toBe('/ok')
+  })
 })

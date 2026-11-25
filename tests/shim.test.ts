@@ -1,7 +1,7 @@
 // Shim-mode tests: the middlewares are driven directly with fake exec/next
 // pairs (same mock discipline as tests/index.test.ts), plus one apply() wiring
 // test with a hand-built ctx that captures ctx.on registrations.
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -9,9 +9,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolDispatchExecution, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { apply } from '../src/index.js'
 import type { Config } from '../src/index.js'
-import { ensurePlaceholder } from '../src/placeholder.js'
-import { Session } from '../src/session.js'
-import { makeShim } from '../src/shim.js'
+import { ensurePlaceholder, HOST_OWNER_FILE } from '../src/placeholder.js'
+import { SessionStore } from '../src/session.js'
+import { createNativeRouting, makeShim } from '../src/shim.js'
 import type { ShimConfig, ShimDeps } from '../src/shim.js'
 import type { ExecResult } from '../src/ssh-pool.js'
 import type { HostEntry } from '../src/hosts.js'
@@ -50,10 +50,12 @@ afterEach(() => {
 function makeHarness() {
   const hosts = new FakeHosts()
   const pool = new FakePool()
-  const session = new Session(join(dir, 'session.json'))
+  const sessions = new SessionStore(join(dir, 'sessions.json'))
+  const session = sessions.view('')
   const placeholderBaseDir = join(dir, 'placeholders')
+  const placeholderRoot = join(dir, 'rw-root')
   pool.fs.addDir('/srv/app/src').addFile('/srv/app/README.md', 'line1\nline2\nline3\n').addFile('/srv/app/src/index.ts', 'export {}\n')
-  return { hosts, pool, session, placeholderBaseDir }
+  return { hosts, pool, sessions, session, placeholderBaseDir, placeholderRoot }
 }
 
 type Harness = ReturnType<typeof makeHarness>
@@ -61,16 +63,17 @@ type Harness = ReturnType<typeof makeHarness>
 /** Activate the 'prod' @ /srv/app session and create its on-disk placeholder; returns the placeholder dir. */
 function connect(h: Harness): string {
   h.session.set({ alias: 'prod', workspace: '/srv/app' })
-  return ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', h.placeholderBaseDir)
+  return ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir })
 }
 
 function makeDeps(h: Harness, overrides?: Partial<ShimDeps>): ShimDeps {
   return {
     hosts: h.hosts,
     pool: h.pool,
-    session: h.session,
+    session: h.sessions,
     config: { ...SHIM_CONFIG },
     placeholderBaseDir: h.placeholderBaseDir,
+    placeholderRoot: h.placeholderRoot,
     getTool: () => ONE_SHOT_BASH,
     ...overrides,
   }
@@ -143,7 +146,9 @@ describe('shim pass-through', () => {
     const h = makeHarness()
     const root = connect(h)
     const shim = makeShim(makeDeps(h))
-    for (const args of [{ file_path: '/etc/passwd' }, { file_path: join(root, '..', 'escape.txt') }]) {
+    // Outside the whole mirror root. (A sibling like join(root, '..', 'x') is
+    // remote only when some picked workspace — e.g. remote '/' — contains it.)
+    for (const args of [{ file_path: '/etc/passwd' }, { file_path: join(h.placeholderRoot, '..', 'escape.txt') }]) {
       const { next, passedThrough } = makeNext()
       const res = await shim.onExecute(execOf('read', args, root), next)
       expect(res).toBe(LOCAL_RESULT)
@@ -735,7 +740,7 @@ describe('shim cwd-anchored target', () => {
     const h = makeHarness()
     const root = connect(h) // cwd = prod placeholder; session: prod @ /srv/app
     // A second workspace on disk; the user reconnected `dev` for rw_* work.
-    ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', h.placeholderBaseDir)
+    ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir })
     h.session.set({ alias: 'dev', workspace: '/srv/dev' })
     h.pool.execQueue.push(execResult('ok\n'))
 
@@ -753,7 +758,7 @@ describe('shim cwd-anchored target', () => {
     const h = makeHarness()
     connect(h) // establishes the prod placeholder and session
     // A second workspace on disk whose host is NOT in the (overridden) table.
-    const devRoot = ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', h.placeholderBaseDir)
+    const devRoot = ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir })
     const shim = makeShim(makeDeps(h, { hosts: new FakeHosts([ENTRY_PROD]) }))
     // Disconnected: alias null.
     h.session.set({ alias: null })
@@ -775,7 +780,7 @@ describe('shim cwd-anchored target', () => {
     function brokenState() {
       const h = makeHarness()
       connect(h)
-      const devRoot = ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', h.placeholderBaseDir)
+      const devRoot = ensurePlaceholder('dev', ENTRY_DEV, '/srv/dev', { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir })
       const shim = makeShim(makeDeps(h, { hosts: new FakeHosts([ENTRY_PROD]) }))
       h.session.set({ alias: null })
       return { h, devRoot, shim }
@@ -1053,8 +1058,9 @@ describe('shim wiring in apply', () => {
     apply(ctx as Context, config, {
       hosts: h.hosts,
       pool: h.pool,
-      session: h.session,
+      session: h.sessions,
       placeholderBaseDir: h.placeholderBaseDir,
+      placeholderRoot: h.placeholderRoot,
     })
   }
 
@@ -1177,86 +1183,119 @@ describe('shim wiring in apply', () => {
     expect(settings.watcherCount).toBe(0)
   })
 
-  // Bug A class: a recorded remote workspace does not mean native calls reach
-  // it. The prompt must not say "remote-backed" until the shim has OBSERVED a
-  // translated call, and a pass-through caused by a local session cwd must be
-  // reported rather than left implicit.
-  describe('native routing is observed, never assumed', () => {
-    it('a translated call marks the session remote and the prompt says so', async () => {
+  // 2.0: the prompt section is a function of the ASSEMBLING session (DSH passes
+  // the Agent as context.scope). It no longer reflects the last native call,
+  // so it is stable within a session; the observation still drives the
+  // one-time console warning and rw_info.
+  describe('prompt section is per session, routing observation is per session', () => {
+    /** The AssembleContext DSH passes: scope is the Agent, whose header names the session. */
+    const scopeOf = (header: { id?: string; cwd?: string; parentSession?: string }) => ({ scope: { session: { header } } })
+    type SectionFn = (context?: unknown) => string
+
+    it('a session working inside a placeholder is told it IS a remote workspace', async () => {
       const { ctx, executeListener, getSection } = makeCtx()
       const h = makeHarness()
       const root = connect(h)
       applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+      const text = getSection()!.text as unknown as SectionFn
 
-      // Before any dispatch the rule is stated, not the outcome.
-      expect(getSection()!.text()).not.toContain('remote-backed')
-      expect(getSection()!.text()).toContain('is not known yet')
+      const before = text(scopeOf({ id: 's1', cwd: root }))
+      expect(before).toContain("This session is a remote workspace: host alias 'prod' (deploy@example.com:22)")
+      expect(before).toContain('remote root /srv/app')
+      expect(before).toContain(root)
+      expect(before).toContain('translated to the remote host automatically')
+      expect(before).toContain('single source of truth')
 
-      const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
-      expect(text(res)).toContain(`<path>${join(root, 'README.md')}</path>`)
-
-      const active = getSection()!.text()
-      expect(active).toContain('remote-backed')
-      expect(active).toContain('translated to the remote host automatically')
+      // A native call does not change the text: it is stable for the session.
+      await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
+      expect(text(scopeOf({ id: 's1', cwd: root }))).toBe(before)
     })
 
-    it('a local session cwd warns once, keeps the call local, and the prompt reports LOCAL', async () => {
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-      const { ctx, executeListener, getSection } = makeCtx()
+    it('a local session with an rw_* record is told native tools stay local', () => {
+      const { ctx, getSection } = makeCtx()
       const h = makeHarness()
-      connect(h) // a remote workspace IS recorded …
+      const root = connect(h)
       applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
-      const localDir = dir // … but this session works in a real local directory
+      h.sessions.set({ id: 'local-1' }, { alias: 'prod', workspace: '/srv/app' })
+      const text = (getSection()!.text as unknown as SectionFn)(scopeOf({ id: 'local-1', cwd: dir }))
+      expect(text).toContain("rw_* tools are connected to host alias 'prod'")
+      expect(text).toContain('workspace /srv/app')
+      expect(text).toContain('run on the LOCAL machine')
+      expect(text).toContain(root) // the placeholder a path may name to reach the remote
+      expect(text).not.toContain('This session is a remote workspace')
+    })
+
+    it('each session gets its own text; a subagent inherits its parent record', () => {
+      const { ctx, getSection } = makeCtx()
+      const h = makeHarness()
+      connect(h)
+      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+      h.sessions.set({ id: 'A' }, { alias: 'prod', workspace: '/srv/app' })
+      h.sessions.set({ id: 'B' }, { alias: 'dev', workspace: '/data' })
+      const text = getSection()!.text as unknown as SectionFn
+      expect(text(scopeOf({ id: 'A', cwd: dir }))).toContain("host alias 'prod'")
+      expect(text(scopeOf({ id: 'B', cwd: dir }))).toContain("host alias 'dev'")
+      expect(text(scopeOf({ id: 'child', parentSession: 'B', cwd: dir }))).toContain("host alias 'dev'")
+      expect(text(scopeOf({ id: 'C', cwd: dir }))).toContain('No remote workspace is active in this session')
+      // No scope at all: generic guidance (the '' record is empty here).
+      h.session.set({ alias: null })
+      expect(text(undefined)).toContain('No remote workspace is active')
+      expect(text({})).toContain('rw_pick_workspace')
+    })
+
+    it('a placeholder cwd whose host is gone is reported, never claimed as working', () => {
+      const { ctx, getSection } = makeCtx()
+      const h = makeHarness()
+      const root = connect(h)
+      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
+      h.hosts.entries.length = 0
+      const text = (getSection()!.text as unknown as SectionFn)(scopeOf({ id: 's', cwd: root }))
+      expect(text).toContain('no longer configured')
+      expect(text).not.toContain('translated to the remote host automatically')
+    })
+
+    it('a local session cwd warns once and keeps the call local; routing is recorded per session', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const h = makeHarness()
+      connect(h) // the '' record names a remote workspace …
+      const routing = createNativeRouting()
+      const shim = makeShim(makeDeps(h, { routing }))
+      const localDir = dir // … but this call works in a real local directory
 
       const first = makeNext()
-      await executeListener()(execOf('read', { file_path: 'local.txt' }, localDir), first.next)
+      await shim.onExecute(execOf('read', { file_path: 'local.txt' }, localDir), first.next)
       expect(first.passedThrough()).toBe(true)
       expect(warn).toHaveBeenCalledTimes(1)
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('ran LOCALLY'))
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('placeholder path ARE translated from any'))
+      expect(routing.peek('')).toMatchObject({ mode: 'local', cwd: localDir })
 
-      const local = getSection()!.text()
-      expect(local).toContain('WARNING')
-      expect(local).toContain('running on the LOCAL machine')
-      expect(local).toContain(localDir)
-      expect(local).not.toContain('remote-backed')
-
-      // Same cwd again: still local, but the console line is not repeated.
       const second = makeNext()
-      await executeListener()(execOf('read', { file_path: 'local.txt' }, localDir), second.next)
+      await shim.onExecute(execOf('read', { file_path: 'local.txt' }, localDir), second.next)
       expect(second.passedThrough()).toBe(true)
       expect(warn).toHaveBeenCalledTimes(1)
     })
 
-    it('a disconnect (no remote workspace) returns the routing record to unknown', async () => {
-      const { ctx, executeListener, getSection } = makeCtx()
+    it('observations are keyed by session id and bounded', async () => {
       const h = makeHarness()
       const root = connect(h)
-      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
-      await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, root), makeNext().next)
-      expect(getSection()!.text()).toContain('remote-backed')
-
-      h.session.set({ alias: null })
-      await executeListener()(execOf('read', { file_path: 'local.txt' }, dir), makeNext().next)
-      expect(getSection()!.text()).toContain('No remote workspace is active')
-    })
-
-    it('a path-anchored call from a local cwd reports remote (by path) in the prompt', async () => {
-      const { ctx, executeListener, getSection } = makeCtx()
-      const h = makeHarness()
-      const root = connect(h)
-      applyTo(ctx, h, { ...BASE_CONFIG, shim: true })
-
-      // The session cwd is a plain local directory; only the call's own path
-      // points into the placeholder.
-      const res = await executeListener()(execOf('read', { file_path: join(root, 'README.md') }, dir), makeNext().next)
-      expect(text(res)).toContain('line1')
-
-      const section = getSection()!.text()
-      expect(section).toContain('remote-backed')
-      expect(section).toContain('translated to the remote host automatically')
-      expect(section).toContain('any working directory')
-      expect(section).not.toContain('WARNING')
+      const routing = createNativeRouting(2)
+      const shim = makeShim(makeDeps(h, { routing }))
+      const execIn = (id: string, cwd: string, name = 'read', args: Record<string, unknown> = { file_path: join(root, 'README.md') }) =>
+        ({
+          name,
+          arguments: args,
+          signal: new AbortController().signal,
+          agent: { session: { header: { id, cwd } } },
+        }) as unknown as ToolDispatchExecution
+      // A pathless glob is anchored by the cwd; a read naming a placeholder path by that path.
+      await shim.onExecute(execIn('s1', root, 'glob', { pattern: '*' }), makeNext().next)
+      await shim.onExecute(execIn('s2', dir), makeNext().next)
+      expect(routing.peek('s1')).toMatchObject({ mode: 'remote', reason: 'cwd' })
+      expect(routing.peek('s2')).toMatchObject({ mode: 'remote', reason: 'path' })
+      await shim.onExecute(execIn('s3', root), makeNext().next)
+      expect(routing.size).toBe(2)
+      expect(routing.peek('s1')).toBeUndefined() // least recently observed: evicted
+      expect(routing.peek('s3')).toBeDefined()
     })
   })
 })
@@ -1360,5 +1399,254 @@ describe('shim path-anchored target', () => {
     const res = await shim.onExecute(execOf('read', { file_path: 'index.ts' }, join(root, 'src')), read.next)
     expect(read.passedThrough()).toBe(false)
     expect(text(res)).toContain('export {}')
+  })
+})
+
+// 2.0 mirror layout: a host's placeholders mirror its remote paths under
+// <root>/<alias>, so the host root (remote '/') contains every other
+// placeholder of that host. The same local path must map to the same remote
+// path whichever placeholder it is reached through.
+describe('shim mirror layout', () => {
+  /** prod's host root (remote '/') plus a nested /srv/app workspace. */
+  function nested(h: Harness) {
+    const loc = { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir }
+    const app = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', loc)
+    const hostRoot = ensurePlaceholder('prod', ENTRY_PROD, '/', loc)
+    return { app, hostRoot, loc }
+  }
+
+  /** Exec with a session id (header.id) and cwd. */
+  function execAs(name: string, args: Record<string, unknown>, header: { id?: string; cwd?: string; parentSession?: string }): ToolDispatchExecution {
+    return {
+      name,
+      arguments: args,
+      signal: new AbortController().signal,
+      agent: { session: { header } },
+    } as unknown as ToolDispatchExecution
+  }
+
+  it('reads the same local file to the same remote path via the host root and via the nested workspace', async () => {
+    const h = makeHarness()
+    const { app, hostRoot } = nested(h)
+    expect(app).toBe(join(hostRoot, 'srv', 'app'))
+    const shim = makeShim(makeDeps(h))
+    const file = join(app, 'README.md')
+
+    const viaApp = await shim.onExecute(execOf('read', { file_path: file }, app), makeNext().next)
+    const viaHost = await shim.onExecute(execOf('read', { file_path: file }, hostRoot), makeNext().next)
+    const viaRelative = await shim.onExecute(execOf('read', { file_path: 'srv/app/README.md' }, hostRoot), makeNext().next)
+    for (const res of [viaApp, viaHost, viaRelative]) {
+      expect(res.isError).toBe(false)
+      expect(text(res)).toContain('1: line1')
+      expect(text(res)).toContain(`<path>${file}</path>`)
+    }
+  })
+
+  it('writes through either placeholder land on the same remote file', async () => {
+    const h = makeHarness()
+    const { app, hostRoot } = nested(h)
+    const shim = makeShim(makeDeps(h))
+    await shim.onExecute(execOf('write', { file_path: join(app, 'a.txt'), content: 'one\n' }, hostRoot), makeNext().next)
+    expect(h.pool.fs.fileContent('/srv/app/a.txt')).toBe('one\n')
+    await shim.onExecute(execOf('write', { file_path: join(hostRoot, 'srv', 'app', 'a.txt'), content: 'two\n' }, app), makeNext().next)
+    expect(h.pool.fs.fileContent('/srv/app/a.txt')).toBe('two\n')
+    // From the host root, paths outside /srv/app are remote too (remote '/').
+    await shim.onExecute(execOf('write', { file_path: join(hostRoot, 'tmp', 'x.txt'), content: 'x\n' }, hostRoot), makeNext().next)
+    expect(h.pool.fs.fileContent('/tmp/x.txt')).toBe('x\n')
+  })
+
+  it('bash rewrites both spellings to the same remote path, with the deepest placeholder as cwd', async () => {
+    const h = makeHarness()
+    const { app, hostRoot } = nested(h)
+    const shim = makeShim(makeDeps(h))
+
+    h.pool.execQueue.push(execResult('ok\n'), execResult('ok\n'))
+    const command = `cat ${join(app, 'README.md')} ${join(hostRoot, 'srv', 'app', 'README.md')} ${join(hostRoot, 'etc', 'hosts')} ${hostRoot}`
+    await shim.onExecute(execOf('bash', { command }, app), makeNext().next)
+    await shim.onExecute(execOf('bash', { command }, hostRoot), makeNext().next)
+    const expected = 'cat /srv/app/README.md /srv/app/README.md /etc/hosts /'
+    expect(h.pool.execCalls.map((c) => c.command)).toEqual([expected, expected])
+    expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app')
+    expect(h.pool.execCalls[1]!.opts?.cwd).toBe('/')
+  })
+
+  it('a cwd below a nested placeholder anchors on the DEEPEST placeholder, even with a host-root record', async () => {
+    const h = makeHarness()
+    const { app } = nested(h)
+    h.session.set({ alias: 'prod', workspace: '/' }) // the record names the host root
+    h.pool.execQueue.push(execResult('__DSH_RW_ENGINE__=rg\n/srv/app/src/index.ts\n'))
+    const shim = makeShim(makeDeps(h))
+    const res = await shim.onExecute(execOf('glob', { pattern: '*.ts' }, join(app, 'src')), makeNext().next)
+    expect(h.pool.execCalls[0]!.opts?.cwd).toBe('/srv/app') // not '/'
+    expect(text(res)).toBe(join(app, 'src', 'index.ts'))
+  })
+
+  it("maps results back correctly when the workspace root is remote '/'", async () => {
+    const h = makeHarness()
+    const { hostRoot } = nested(h)
+    const shim = makeShim(makeDeps(h))
+    h.pool.execQueue.push(execResult('__DSH_RW_ENGINE__=rg\n/srv/app/README.md\n/etc/hosts\n'))
+    const res = await shim.onExecute(execOf('glob', { pattern: '*' }, hostRoot), makeNext().next)
+    expect(res.value).toEqual({
+      root: hostRoot,
+      paths: [join(hostRoot, 'srv', 'app', 'README.md'), join(hostRoot, 'etc', 'hosts')],
+    })
+    expect(text(res)).not.toContain('//')
+    const read = await shim.onExecute(execOf('read', { file_path: join(hostRoot, 'srv', 'app', 'README.md') }, hostRoot), makeNext().next)
+    expect(text(read)).toContain(`<path>${join(hostRoot, 'srv', 'app', 'README.md')}</path>`)
+  })
+
+  it("never produces '//' when rewriting a '/' workspace root", async () => {
+    const h = makeHarness()
+    const { hostRoot } = nested(h)
+    const shim = makeShim(makeDeps(h))
+    h.pool.execQueue.push(execResult(''))
+    await shim.onExecute(
+      execOf('bash', { command: `ls ${hostRoot}/ ${hostRoot}/srv '${hostRoot}' && cd ${hostRoot}/srv/app/` }, hostRoot),
+      makeNext().next,
+    )
+    expect(h.pool.execCalls[0]!.command).toBe(`ls / /srv '/' && cd /srv/app/`)
+  })
+
+  it('a host-root prefix only matches at a path boundary (prod ≠ production)', async () => {
+    const h = makeHarness()
+    const production: HostEntry = { ...ENTRY_PROD, alias: 'production', host: 'production.example.com' }
+    h.hosts.entries.push(production)
+    const loc = { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir }
+    const prodRoot = ensurePlaceholder('prod', ENTRY_PROD, '/', loc)
+    const productionRoot = ensurePlaceholder('production', production, '/', loc)
+    const shim = makeShim(makeDeps(h))
+    h.pool.execQueue.push(execResult(''))
+    await shim.onExecute(
+      execOf('bash', { command: `diff ${join(prodRoot, 'a')} ${join(productionRoot, 'a')} ${prodRoot}.bak` }, prodRoot),
+      makeNext().next,
+    )
+    expect(h.pool.execCalls[0]!.alias).toBe('prod')
+    expect(h.pool.execCalls[0]!.command).toBe(`diff /a ${join(productionRoot, 'a')} ${prodRoot}.bak`)
+  })
+
+  it('sibling placeholders of the same host are rewritten through the host-root prefix', async () => {
+    const h = makeHarness()
+    const loc = { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir }
+    const app = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', loc)
+    h.pool.fs.addDir('/data')
+    const data = ensurePlaceholder('prod', ENTRY_PROD, '/data', loc)
+    const shim = makeShim(makeDeps(h))
+    h.pool.execQueue.push(execResult(''))
+    await shim.onExecute(execOf('bash', { command: `cp ${join(data, 'in.csv')} ${join(app, 'in.csv')}` }, app), makeNext().next)
+    expect(h.pool.execCalls[0]!.command).toBe('cp /data/in.csv /srv/app/in.csv')
+  })
+
+  it('legacy (≤ 1.6) placeholders keep working: read and bash map to their remote root', async () => {
+    const h = makeHarness()
+    const legacy = join(h.placeholderBaseDir, 'prod', 'app-9472932a')
+    mkdirSync(legacy, { recursive: true })
+    writeFileSync(
+      join(legacy, '.dsh-rw-meta.json'),
+      JSON.stringify({
+        plugin: 'dsh-rw',
+        alias: 'prod',
+        host: 'example.com',
+        port: 22,
+        user: 'deploy',
+        remotePath: '/srv/app',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        note: 'placeholder only — not a copy of remote files',
+      }),
+    )
+    const shim = makeShim(makeDeps(h))
+    const read = await shim.onExecute(execOf('read', { file_path: 'README.md' }, legacy), makeNext().next)
+    expect(text(read)).toContain('1: line1')
+    expect(text(read)).toContain(`<path>${join(legacy, 'README.md')}</path>`)
+    h.pool.execQueue.push(execResult(''))
+    await shim.onExecute(execOf('bash', { command: `ls ${join(legacy, 'src')}` }, legacy), makeNext().next)
+    expect(h.pool.execCalls[0]).toMatchObject({ alias: 'prod', command: 'ls /srv/app/src', opts: { cwd: '/srv/app' } })
+  })
+
+  it("uses the CALLER's session record when there is no cwd; a subagent falls back to its parent's", async () => {
+    const h = makeHarness()
+    const loc = { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir }
+    ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', loc)
+    h.sessions.set({ id: 'parent' }, { alias: 'prod', workspace: '/srv/app' })
+    const shim = makeShim(makeDeps(h))
+
+    const child = await shim.onExecute(execAs('read', { file_path: 'README.md' }, { id: 'child', parentSession: 'parent' }), makeNext().next)
+    expect(text(child)).toContain('1: line1')
+
+    // Another session (no record, no parent) has nothing to anchor on: local.
+    const stranger = makeNext()
+    await shim.onExecute(execAs('read', { file_path: 'README.md' }, { id: 'stranger' }), stranger.next)
+    expect(stranger.passedThrough()).toBe(true)
+  })
+})
+
+describe('namespace safety remains path-aware', () => {
+  function corruptOwner(h: Harness) {
+    const root = connect(h)
+    writeFileSync(join(h.placeholderRoot, 'prod', HOST_OWNER_FILE), JSON.stringify({ plugin: 'dsh-rw', version: 1, alias: 'other' }))
+    return root
+  }
+
+  it('does not let a bad remote record block a genuinely local cwd', async () => {
+    const h = makeHarness()
+    corruptOwner(h)
+    const routing = createNativeRouting()
+    const shim = makeShim(makeDeps(h, { routing }))
+    for (const [name, args] of [['read', { file_path: join(dir, 'local.txt') }], ['bash', { command: 'echo local' }]] as const) {
+      const local = makeNext()
+      expect(await shim.onExecute(execOf(name, args, dir), local.next)).toBe(LOCAL_RESULT)
+      expect(local.passedThrough()).toBe(true)
+    }
+    expect(await shim.onPreExecute(execOf('bash', { command: 'echo local' }, dir) as unknown as ToolExecution, async () => ({ kind: 'allow' }))).toEqual({ kind: 'allow' })
+    expect(routing.peek('')?.mode).toBe('local')
+    expect(h.pool.execCalls).toEqual([])
+  })
+
+  it('keeps an explicit unrelated local file local even from an ambiguous cwd', async () => {
+    const h = makeHarness()
+    const root = corruptOwner(h)
+    const shim = makeShim(makeDeps(h, { routing: createNativeRouting() }))
+    const local = makeNext()
+    expect(await shim.onExecute(execOf('read', { file_path: join(dir, 'local.txt') }, root), local.next)).toBe(LOCAL_RESULT)
+    expect(local.passedThrough()).toBe(true)
+    expect(h.pool.execCalls).toEqual([])
+  })
+
+  it('fails remote-backed reads and bash without remote execution or LOCAL fallback', async () => {
+    const h = makeHarness()
+    const root = corruptOwner(h)
+    const shim = makeShim(makeDeps(h))
+    for (const [name, args] of [['read', { file_path: join(root, 'README.md') }], ['bash', { command: 'echo remote' }]] as const) {
+      const local = makeNext()
+      const result = await shim.onExecute(execOf(name, args, root), local.next)
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('belongs to alias')
+      expect(local.passedThrough()).toBe(false)
+    }
+    await expect(shim.onPreExecute(execOf('bash', { command: 'echo remote' }, root) as unknown as ToolExecution, async () => ({ kind: 'allow' }))).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(h.pool.execCalls).toEqual([])
+  })
+
+  it('uses a healthy cwd host instead of inspecting a bad recorded host namespace', async () => {
+    const h = makeHarness()
+    corruptOwner(h)
+    const root = ensurePlaceholder('dev', ENTRY_DEV, '/srv/app', { root: h.placeholderRoot, legacyBaseDir: h.placeholderBaseDir })
+    const shim = makeShim(makeDeps(h))
+    h.pool.execQueue.push(execResult('ok'))
+    const local = makeNext()
+    const result = await shim.onExecute(execOf('bash', { command: 'echo healthy' }, root), local.next)
+    expect(result.isError).toBe(false)
+    expect(local.passedThrough()).toBe(false)
+    expect(h.pool.execCalls[0]?.alias).toBe('dev')
+  })
+
+  it('never blocks unrelated plugin tools because a namespace is broken', async () => {
+    const h = makeHarness()
+    const root = corruptOwner(h)
+    const local = makeNext()
+    const shim = makeShim(makeDeps(h))
+    expect(await shim.onExecute(execOf('ask_user_question', { question: 'Choose a new root' }, root), local.next)).toBe(LOCAL_RESULT)
+    expect(local.passedThrough()).toBe(true)
+    expect(h.pool.execCalls).toEqual([])
   })
 })

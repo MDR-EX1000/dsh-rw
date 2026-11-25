@@ -21,6 +21,8 @@ export type RwErrorCode =
   | 'INVALID_INPUT'
   | 'RW_EDIT_CONFLICT'
   | 'RW_WRITE_CONFLICT'
+  /** The local placeholder root is not a private directory of the current user (symlink, foreign owner, …). */
+  | 'UNSAFE_PLACEHOLDER_ROOT'
   | 'REMOTE_ERROR'
 
 export class RwError extends Error {

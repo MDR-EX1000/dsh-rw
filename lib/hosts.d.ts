@@ -29,6 +29,11 @@ export interface HostSummary {
      */
     keyPath?: string;
     source: 'ssh-config' | 'manual';
+    /**
+     * The host's main remote directory — the workspace the picker opens by
+     * default for this host. Absent when none is set.
+     */
+    mainDir?: string;
 }
 /** Expand a leading `~` (or `~/...`) against the current user's home. */
 export declare function expandHome(p: string): string;
@@ -56,6 +61,7 @@ export declare class HostTable {
     private readonly sshConfigExclude;
     private manual;
     private hidden;
+    private mains;
     private sshCache;
     constructor(opts?: {
         sshConfigPath?: string;
@@ -67,6 +73,13 @@ export declare class HostTable {
     list(): HostEntry[];
     find(alias: string): HostEntry | undefined;
     summarize(entry: HostEntry): HostSummary;
+    /** The host's main remote directory, if one is set. */
+    mainDir(alias: string): string | undefined;
+    /**
+     * Set the host's main remote directory (an absolute remote path — callers
+     * canonicalize it first), or clear it with null. The alias must be listed.
+     */
+    setMainDir(alias: string, path: string | null): void;
     summaries(): HostSummary[];
     /** Validate a manual host's connection details and build its entry. */
     private buildManualEntry;
@@ -105,6 +118,7 @@ export declare class HostTable {
     unhide(alias: string): void;
     /** Aliases currently hidden from the host list (sorted, for display). */
     hiddenAliases(): string[];
+    /** Delete a manual host — and its main directory with it. */
     removeManual(alias: string): void;
     private sshEntries;
     private loadStore;

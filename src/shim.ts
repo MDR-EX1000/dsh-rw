@@ -29,10 +29,11 @@ import type {
 } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError } from './errors.js'
 import { assertRealpathInside, normalizeRemote, resolveInWorkspace, shq } from './guard.js'
-import { findPlaceholderByPath, resolvePlaceholderDir } from './placeholder.js'
-import type { PlaceholderMeta } from './placeholder.js'
+import { findPlaceholderByPath, locatePlaceholder, placeholderLocationsOf } from './placeholder.js'
+import type { PlaceholderHit, PlaceholderMeta } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
-import type { Session } from './session.js'
+import { sessionHeaderOf, sessionKeysOf } from './session.js'
+import type { SessionStore } from './session.js'
 import type { HostEntry } from './hosts.js'
 import type { ExecResult, SftpLike } from './ssh-pool.js'
 import type { ShellManagerLike } from './persistent-shell.js'
@@ -58,7 +59,7 @@ export interface ShimConfig {
 
 /**
  * Where the native read/write/edit/str_replace_editor/glob/grep/bash tools
- * actually go in the CURRENT agent session. This is an OBSERVATION the shim
+ * actually go in ONE agent session (2.0: one record per session id). This is an OBSERVATION the shim
  * updates on every dispatch, never an inference from the rw_* session record:
  * a recorded remote workspace does not by itself tell anyone whether the
  * agent's working directory lives inside its placeholder (translated) or on a
@@ -84,20 +85,65 @@ export interface NativeRouting {
   reason?: 'cwd' | 'path'
 }
 
-/** A fresh, unobserved routing record (one per plugin load). */
-export function createNativeRouting(): NativeRouting {
-  return { mode: 'unknown' }
+/** Sessions whose routing observation is kept; the least recently observed beyond this is dropped. */
+export const NATIVE_ROUTING_LIMIT = 256
+
+/**
+ * The per-session observation table (plugin-load scope). Keyed by the DSH
+ * session id ('' when a call carries none), bounded LRU so a long-running host
+ * does not accumulate one record per session forever.
+ */
+export class NativeRoutingTable {
+  private readonly records = new Map<string, NativeRouting>()
+
+  constructor(readonly limit: number = NATIVE_ROUTING_LIMIT) {}
+
+  /** The observation for one session, or undefined when nothing was observed (never creates). */
+  peek(sessionId: string): NativeRouting | undefined {
+    return this.records.get(sessionId)
+  }
+
+  /** The mutable record for one session — created on demand, marked most recent, oldest evicted. */
+  touch(sessionId: string): NativeRouting {
+    const existing = this.records.get(sessionId)
+    const record: NativeRouting = existing ?? { mode: 'unknown' }
+    this.records.delete(sessionId)
+    this.records.set(sessionId, record)
+    while (this.records.size > this.limit) {
+      const oldest = this.records.keys().next().value
+      if (oldest === undefined) break
+      this.records.delete(oldest)
+    }
+    return record
+  }
+
+  /** Seed (or replace) one session's observation — for tests and diagnostics. */
+  set(sessionId: string, routing: NativeRouting): void {
+    Object.assign(this.touch(sessionId), routing)
+  }
+
+  get size(): number {
+    return this.records.size
+  }
+}
+
+/** A fresh, unobserved routing table (one per plugin load). */
+export function createNativeRouting(limit?: number): NativeRoutingTable {
+  return new NativeRoutingTable(limit)
 }
 
 export interface ShimDeps {
   hosts: HostTableLike
   pool: PoolLike
-  session: Session
+  /** Per-session connection records (the fast path reads the CALLER's record). */
+  session: SessionStore
   config: ShimConfig
-  /** Base dir for placeholder dirs (tests inject a tmp dir). */
+  /** Mirror-layout placeholder root (plugin config placeholderRoot; tests inject a tmp dir). */
+  placeholderRoot?: string
+  /** Legacy (≤ 1.6) placeholder base dir, searched by lookups only (tests inject a tmp dir). */
   placeholderBaseDir?: string
-  /** Observation record shared with the prompt section and rw_info. */
-  routing?: NativeRouting
+  /** Per-session observation table shared with rw_info. */
+  routing?: NativeRoutingTable
   /**
    * Resolve the caller-visible tool definition (ctx.tools.get in production).
    * Only used for the bash flavor check; undefined → bash is treated as
@@ -201,6 +247,12 @@ interface ActiveTarget {
   localRoot: string
   /** Containment forms of the placeholder: resolved, plus realpath (macOS /var ↔ /private/var). */
   localRoots: string[]
+  /**
+   * Mirror layout only: the forms of the host-root placeholder `<root>/<alias>`
+   * (remote '/'). Any local path below it maps to the remote path with that
+   * prefix stripped, which is what lets bash rewrite sibling placeholders too.
+   */
+  hostRoots?: string[]
 }
 
 /** The placeholder's local root forms (lexical + realpath), as insideLocal expects them. */
@@ -216,8 +268,19 @@ function localRootsOf(localRoot: string): string[] {
 }
 
 /** Build an ActiveTarget from a resolved host entry, remote root, and placeholder dir. */
-function buildTarget(entry: HostEntry, remotePath: string, localRoot: string): ActiveTarget {
-  return { entry, remoteRoot: normalizeRemote(remotePath), localRoot, localRoots: localRootsOf(localRoot) }
+function buildTarget(entry: HostEntry, remotePath: string, localRoot: string, hostRoot?: string): ActiveTarget {
+  return {
+    entry,
+    remoteRoot: normalizeRemote(remotePath),
+    localRoot,
+    localRoots: localRootsOf(localRoot),
+    ...(hostRoot !== undefined ? { hostRoots: localRootsOf(hostRoot) } : {}),
+  }
+}
+
+/** Build an ActiveTarget from a located placeholder. */
+function targetOf(entry: HostEntry, hit: PlaceholderHit): ActiveTarget {
+  return buildTarget(entry, hit.meta.remotePath, hit.dir, hit.hostRoot)
 }
 
 /**
@@ -235,35 +298,26 @@ function buildTarget(entry: HostEntry, remotePath: string, localRoot: string): A
 function activeTarget(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecution): ActiveTarget | null {
   const cwd = agentCwd(exec)
 
-  // Fast path: the rw_* session's (alias, workspace), in-memory. Used when it
-  // matches the agent cwd (the common case — the user picked this workspace
-  // and stayed), so the hot path does no placeholder scan.
-  const alias = deps.session.alias
-  const workspace = deps.session.workspace
-  if (alias !== null && workspace !== null) {
-    const entry = deps.hosts.find(alias)
-    if (entry !== undefined) {
-      const localRoot = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
-      if (localRoot !== null) {
-        const target = buildTarget(entry, workspace, localRoot)
-        if (cwd === undefined || insideLocal(target.localRoots, resolve(cwd))) return target
-      }
-    }
-  }
-
-  // Authoritative slow path: the agent cwd itself. The placeholder meta
-  // carries the host alias + remote path; the HostTable supplies credentials.
+  // A known cwd is authoritative. Never inspect an unrelated (possibly
+  // ambiguous) recorded namespace before deciding that a call is truly local.
   if (cwd !== undefined) {
-    const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
+    const found = findPlaceholderByPath(cwd, placeholderLocationsOf(deps))
     if (found !== null) {
       const entry = deps.hosts.find(found.meta.alias)
-      if (entry !== undefined) return buildTarget(entry, found.meta.remotePath, found.dir)
-      // cwd is a dsh-rw placeholder whose host is no longer configured: never
-      // silently fall back to the local empty placeholder — onExecute reports
-      // it as a clear error.
+      if (entry !== undefined) return targetOf(entry, found)
     }
+    return null
   }
 
+  // Only callers without a cwd fall back to their explicit/inherited record.
+  const record = deps.session.get(sessionKeysOf(exec.agent))
+  if (record.alias !== null && record.workspace !== null) {
+    const entry = deps.hosts.find(record.alias)
+    if (entry !== undefined) {
+      const hit = locatePlaceholder(record.alias, record.workspace, placeholderLocationsOf(deps))
+      if (hit !== null) return targetOf(entry, hit)
+    }
+  }
   return null
 }
 
@@ -276,7 +330,7 @@ function activeTarget(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecutio
 function brokenPlaceholder(deps: ShimDeps, exec: ToolExecution | ToolDispatchExecution): { dir: string; meta: PlaceholderMeta } | null {
   const cwd = agentCwd(exec)
   if (cwd === undefined) return null
-  const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
+  const found = findPlaceholderByPath(cwd, placeholderLocationsOf(deps))
   if (found === null) return null
   if (deps.hosts.find(found.meta.alias) !== undefined) return null
   return found
@@ -313,6 +367,7 @@ function callPathArg(name: string, args: Record<string, unknown>): { key: string
 type CallResolution =
   | { kind: 'target'; target: ActiveTarget; reason: 'cwd' | 'path'; args: Record<string, unknown> }
   | { kind: 'broken'; found: { dir: string; meta: PlaceholderMeta } }
+  | { kind: 'local' }
 
 /**
  * Resolve where a native call must run. Two independent anchors, in this order:
@@ -345,19 +400,21 @@ function resolveCall(deps: ShimDeps, exec: ToolDispatchExecution): CallResolutio
         ? resolve(cwd, anchor.value)
         : undefined
     if (abs !== undefined) {
-      const found = findPlaceholderByPath(abs, deps.placeholderBaseDir)
+      const found = findPlaceholderByPath(abs, placeholderLocationsOf(deps))
       if (found !== null) {
         const entry = deps.hosts.find(found.meta.alias)
         if (entry === undefined) return { kind: 'broken', found }
         return {
           kind: 'target',
-          target: buildTarget(entry, found.meta.remotePath, found.dir),
+          target: targetOf(entry, found),
           reason: 'path',
           // Normalize to the absolute local form the anchor was resolved at, so
           // toRemotePath and the workspace guard see exactly the anchored path.
           args: { ...args, [anchor.key]: abs },
         }
       }
+      // An absolute local path does not touch even a broken cwd namespace.
+      return { kind: 'local' }
     }
   }
 
@@ -436,14 +493,19 @@ function toRemotePath(target: ActiveTarget, input: string): string | null {
 function toLocalPath(target: ActiveTarget, remote: string): string {
   const r = normalizeRemote(remote)
   if (r === target.remoteRoot) return target.localRoot
-  if (!r.startsWith(`${target.remoteRoot}/`)) return remote
-  return join(target.localRoot, ...r.slice(target.remoteRoot.length + 1).split('/'))
+  const prefix = target.remoteRoot === '/' ? '/' : `${target.remoteRoot}/`
+  if (!r.startsWith(prefix)) return remote
+  return join(target.localRoot, ...r.slice(prefix.length).split('/'))
 }
 
 /** The calling agent's session cwd — where DSH put the workspace (dsh-agent-loop reads it the same way). */
 function agentCwd(exec: ToolExecution | ToolDispatchExecution): string | undefined {
-  const cwd: unknown = exec.agent?.session?.header?.cwd
-  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+  return sessionHeaderOf(exec.agent).cwd
+}
+
+/** The calling agent's session id ('' when the call carries none). */
+function agentSessionId(exec: ToolExecution | ToolDispatchExecution): string {
+  return sessionHeaderOf(exec.agent).id ?? ''
 }
 
 /** The bash interception gate: the agent session must live inside the placeholder (cwd unknown → pass through). */
@@ -1211,12 +1273,31 @@ function agentIdOf(exec: ToolDispatchExecution): string | undefined {
   return typeof id === 'string' && id !== '' ? id : undefined
 }
 
-/** Replace every placeholder path form in the command with the remote root. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Replace every placeholder path form in the command with its remote path, in
+ * ONE pass so a replacement is never rewritten again. Prefixes: the target's
+ * own forms → its remote root; in the mirror layout also the host-root forms
+ * `<root>/<alias>` → '/' (so a path into a sibling placeholder of the same
+ * host maps right as well). Longer prefixes win, a prefix only matches at a
+ * path boundary (`<root>/prod` never eats `<root>/production`), and a '/'
+ * remote root never produces `//`.
+ */
 function rewriteCommand(target: ActiveTarget, command: string): string {
-  const roots = [...new Set([target.localRoot, ...target.localRoots])].sort((a, b) => b.length - a.length)
-  let rewritten = command
-  for (const root of roots) rewritten = rewritten.split(root).join(target.remoteRoot)
-  return rewritten
+  const map = new Map<string, string>()
+  for (const root of target.hostRoots ?? []) map.set(root, '/')
+  for (const root of [target.localRoot, ...target.localRoots]) map.set(root, target.remoteRoot)
+  const prefixes = [...map.keys()].sort((a, b) => b.length - a.length)
+  if (prefixes.length === 0) return command
+  const pattern = new RegExp(`(?:${prefixes.map(escapeRegExp).join('|')})(?![\\w.\\-+@~%\\u0080-\\uFFFF])`, 'g')
+  return command.replace(pattern, (match: string, offset: number, whole: string) => {
+    const to = map.get(match) ?? match
+    // '/' followed by the path's own '/' would double it: keep the path's.
+    return to === '/' && whole[offset + match.length] === '/' ? '' : to
+  })
 }
 
 /**
@@ -1352,8 +1433,8 @@ export function makeShim(deps: ShimDeps): Shim {
     exec: ToolDispatchExecution,
     resolved: { target: ActiveTarget; reason: 'cwd' | 'path' } | null,
   ): void => {
-    const routing = deps.routing
-    if (routing === undefined) return
+    if (deps.routing === undefined) return
+    const routing = deps.routing.touch(agentSessionId(exec))
     if (resolved !== null) {
       routing.mode = 'remote'
       routing.alias = resolved.target.entry.alias
@@ -1363,11 +1444,10 @@ export function makeShim(deps: ShimDeps): Shim {
       delete routing.cwd
       return
     }
-    const alias = deps.session.alias
-    const workspace = deps.session.workspace
+    const { alias, workspace } = deps.session.get(sessionKeysOf(exec.agent))
     if (alias === null || workspace === null) {
-      // No remote workspace recorded: the prompt section's idle guidance owns
-      // this state and there is nothing native calls could be translated to.
+      // No remote workspace recorded for this session: there is nothing native
+      // calls could have been translated to.
       routing.mode = 'unknown'
       delete routing.cwd
       delete routing.alias
@@ -1376,8 +1456,23 @@ export function makeShim(deps: ShimDeps): Shim {
       delete routing.reason
       return
     }
-    const placeholder = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
     const cwd = agentCwd(exec)
+    let placeholder: string | null
+    try {
+      placeholder = locatePlaceholder(alias, workspace, placeholderLocationsOf(deps))?.dir ?? null
+    } catch (err) {
+      if (!(err instanceof RwError)) throw err
+      // Observation must not turn an unrelated local call into a namespace
+      // error. It is already known to pass through; retain no remote claim.
+      routing.mode = 'local'
+      if (cwd !== undefined) routing.cwd = cwd
+      else delete routing.cwd
+      delete routing.alias
+      delete routing.workspace
+      delete routing.placeholder
+      delete routing.reason
+      return
+    }
     if (cwd === undefined || placeholder === null) return // cannot tell: keep the last observation
     if (insideLocal(localRootsOf(placeholder), resolve(cwd))) return // the shim would have translated
     routing.mode = 'local'
@@ -1402,8 +1497,19 @@ export function makeShim(deps: ShimDeps): Shim {
     exec: ToolDispatchExecution,
     next: () => Promise<ToolExecutionResult>,
   ): Promise<ToolExecutionResult> => {
-    if (!deps.config.shim) return next()
-    const resolved = resolveCall(deps, exec)
+    if (!deps.config.shim || !['read', 'write', 'edit', 'str_replace_editor', 'glob', 'grep', 'bash'].includes(exec.name)) return next()
+    if (exec.name === 'bash' && !deps.config.shimBash) return next()
+    let resolved: CallResolution | null
+    try {
+      resolved = resolveCall(deps, exec)
+    } catch (err) {
+      if (!(err instanceof RwError)) throw err
+      return fail(err.message, { name: 'RwError', code: err.code })
+    }
+    if (resolved?.kind === 'local') {
+      recordRouting(exec, null)
+      return next()
+    }
     if (process.env.DSH_RW_DEBUG) {
       console.log('[dsh-rw shim] dispatch', {
         name: exec.name,

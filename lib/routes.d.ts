@@ -3,12 +3,31 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver';
 import type { ToolsDeps } from './tools.js';
 /** Re-exported so index.ts builds routes without importing dsh-host-webserver. */
 export type Route = WebRoute;
+/**
+ * The slice of DSH's workspace registry (`ctx.get('workspaceRegistry')`) the
+ * picker uses. `create` realpaths the path, returns the existing record for a
+ * known canonical path WITHOUT changing its title, and puts a new record first.
+ */
+export interface WorkspaceRegistryLike {
+    create(path: string, title?: string): Promise<unknown>;
+}
+/**
+ * The host's main directory: its own setting, else the plugin-wide default
+ * (`defaultMainDir`, '/'; '' disables it). Normalized, or undefined.
+ */
+export declare function effectiveMainDir(deps: Pick<RoutesDeps, 'hosts' | 'defaultMainDir'>, alias: string): string | undefined;
 export interface RoutesDeps extends ToolsDeps {
     /**
      * Native local-directory picker (adapted from the ctx directoryPicker
      * service by index.ts). Absent → /local-pick answers 400.
      */
     pickDirectory?: () => Promise<string | null>;
+    /**
+     * DSH's workspace registry, resolved per call (index.ts:
+     * `() => ctx.get('workspaceRegistry')`). Absent → /workspace still creates
+     * the placeholder but answers `registered: false`.
+     */
+    workspaceRegistry?: () => WorkspaceRegistryLike | undefined;
 }
 /** IPv4 127/8 predicate (four decimal octets, first == 127). */
 export declare function isIPv4Loopback(v4: string): boolean;

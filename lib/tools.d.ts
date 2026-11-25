@@ -1,6 +1,6 @@
 import type { HostEntry, HostSummary } from './hosts.js';
-import type { Session } from './session.js';
-import type { NativeRouting } from './shim.js';
+import type { SessionStore } from './session.js';
+import type { NativeRoutingTable } from './shim.js';
 import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js';
 /**
  * Structural subset of HostTable consumed by the tools/routes. HostTable has
@@ -41,6 +41,10 @@ export interface HostTableLike {
         keyPath?: string;
         passphrase?: string;
     }): HostEntry;
+    /** The host's main remote directory (its default workspace in the picker), if set. */
+    mainDir?(alias: string): string | undefined;
+    /** Set (or with null, clear) the host's main remote directory. */
+    setMainDir?(alias: string, path: string | null): void;
 }
 /** Structural subset of SshPool (same rationale as HostTableLike). */
 export interface PoolLike {
@@ -63,17 +67,25 @@ export interface PoolLike {
 export interface ToolsDeps {
     hosts: HostTableLike;
     pool: PoolLike;
-    session: Session;
+    /** Per-session connection records (2.0: keyed by the DSH session id). */
+    session: SessionStore;
     config: {
         commandTimeoutMs: number;
         maxOutputChars: number;
         /** Shown by rw_info; optional so minimal test configs still typecheck. */
         hostKeyPolicy?: string;
     };
-    /** Base dir for placeholder dirs (tests inject a tmp dir). */
+    /** Mirror-layout placeholder root (plugin config placeholderRoot; tests inject a tmp dir). */
+    placeholderRoot?: string;
+    /**
+     * Main directory of hosts that have none of their own (plugin config
+     * defaultMainDir, '/'); '' or undefined means none.
+     */
+    defaultMainDir?: string;
+    /** Legacy (≤ 1.6) placeholder base dir, searched by lookups only (tests inject a tmp dir). */
     placeholderBaseDir?: string;
-    /** Where native tools actually go, as observed by the shim (plugin-load scope). */
-    routing?: NativeRouting;
+    /** Where native tools actually go, as observed by the shim, per session id. */
+    routing?: NativeRoutingTable;
     /** Whether the shim is currently on (a live getter: the settings layer can flip it). */
     shimEnabled?: () => boolean;
 }
@@ -82,22 +94,24 @@ export interface ToolsDeps {
  * purpose: the real value is a `ToolRunContext`, and tests drive plain objects.
  */
 interface ExecLike {
-    agent?: {
-        session?: {
-            header?: {
-                cwd?: string;
-            };
-        };
-    };
+    /** The calling agent; its `session.header` carries `id`, `cwd` and `parentSession`. */
+    agent?: unknown;
 }
 /**
- * Shared pick-workspace validation used by rw_pick_workspace and the
- * /api/dsh-rw/workspace route: resolve symlinks via realpath, require a
- * directory, create the local placeholder. Returns the real workspace path
- * and the placeholder directory. Does not touch the session. `name` (picker
- * only) names a fresh placeholder; the tool flow omits it (basename default).
+ * Resolve a remote directory the way a workspace pick does: `~` expansion
+ * against the SFTP home, realpath (symlinks resolved), must be a directory.
+ * Returns the normalized real path. Shared by the workspace pick and the
+ * host main-directory route.
  */
-export declare function resolveWorkspaceDir(deps: ToolsDeps, alias: string, path: string, name?: string): Promise<{
+export declare function resolveRemoteDir(deps: ToolsDeps, entry: HostEntry, path: string): Promise<string>;
+/**
+ * Shared pick-workspace validation used by rw_pick_workspace and the
+ * /api/dsh-rw/workspace route: resolve the remote directory, then create its
+ * local placeholder (mirror layout, plus the host-root placeholder). Returns
+ * the real workspace path and the placeholder directory. Touches neither the
+ * session records nor the DSH workspace registry.
+ */
+export declare function resolveWorkspaceDir(deps: ToolsDeps, alias: string, path: string): Promise<{
     workspace: string;
     placeholderDir: string;
 }>;

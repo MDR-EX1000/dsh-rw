@@ -5,7 +5,8 @@ import { RwError } from '../src/errors.js'
 import type { HostEntry, HostSummary } from '../src/hosts.js'
 import type { ExecResult, SftpLike } from '../src/ssh-pool.js'
 import type { HostTableLike, PoolLike, ToolsDeps } from '../src/tools.js'
-import { Session } from '../src/session.js'
+import { SessionStore } from '../src/session.js'
+import type { SessionView } from '../src/session.js'
 import { FakeSftp } from './fakes.js'
 
 /** The password-bearing entry: assertions scan every output for this string. */
@@ -54,7 +55,24 @@ export class FakeHosts implements HostTableLike {
       keyReady: entry.auth.kind === 'key' && entry.auth.keyPath !== '',
       passwordSet: entry.auth.kind === 'password' && !!entry.auth.password,
       source: entry.source,
+      ...(this.mains.has(entry.alias) ? { mainDir: this.mains.get(entry.alias) } : {}),
     }
+  }
+
+  /** Main remote directory per alias (same contract as HostTable). */
+  readonly mains = new Map<string, string>()
+
+  mainDir(alias: string): string | undefined {
+    return this.mains.get(alias)
+  }
+
+  setMainDir(alias: string, path: string | null): void {
+    if (path === null) {
+      this.mains.delete(alias)
+      return
+    }
+    if (this.find(alias) === undefined) throw new RwError('INVALID_INPUT', `unknown host alias: ${JSON.stringify(alias)}`)
+    this.mains.set(alias, path)
   }
 
   summaries(): HostSummary[] {
@@ -92,7 +110,10 @@ export class FakeHosts implements HostTableLike {
 
   removeManual(alias: string): void {
     const i = this.entries.findIndex((e) => e.alias === alias && e.source === 'manual')
-    if (i >= 0) this.entries.splice(i, 1)
+    if (i >= 0) {
+      this.entries.splice(i, 1)
+      this.mains.delete(alias)
+    }
   }
 
   private readonly hiddenSet = new Set<string>()
@@ -196,7 +217,10 @@ export interface FakeHarness {
   deps: ToolsDeps
   hosts: FakeHosts
   pool: FakePool
-  session: Session
+  /** The per-session record store wired into deps. */
+  sessions: SessionStore
+  /** A view of the '' record — what calls without a session id read and write. */
+  session: SessionView
   /** Remote fixture root, seeded as a directory with a couple of files. */
   workspace: string
 }
@@ -209,7 +233,8 @@ export interface FakeHarness {
 export function makeHarness(dir: string): FakeHarness & { connect(): void } {
   const hosts = new FakeHosts()
   const pool = new FakePool()
-  const session = new Session(`${dir}/session.json`)
+  const sessions = new SessionStore(`${dir}/sessions.json`)
+  const session = sessions.view('')
   pool.fs
     .addDir('/srv/app/src')
     .addFile('/srv/app/README.md', 'line1\nline2\nline3\n')
@@ -219,14 +244,16 @@ export function makeHarness(dir: string): FakeHarness & { connect(): void } {
   const deps: ToolsDeps = {
     hosts,
     pool,
-    session,
+    session: sessions,
     config: { commandTimeoutMs: 30000, maxOutputChars: 200000, hostKeyPolicy: 'accept-new' },
+    placeholderRoot: `${dir}/rw-root`,
     placeholderBaseDir: `${dir}/placeholders`,
   }
   return {
     deps,
     hosts,
     pool,
+    sessions,
     session,
     workspace: '/srv/app',
     connect() {

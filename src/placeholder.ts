@@ -1,25 +1,43 @@
 // dsh-rw — local placeholder directories. DSH's native workspace flow needs a
 // real local directory (fs.realpath must succeed), so each (alias, remotePath)
-// pair gets an empty placeholder holding only a meta file — never a copy of
-// remote files. The meta file carries no credentials, but is still written
+// pair gets an empty placeholder holding only private metadata — never a copy of
+// remote files. The workspace meta file carries no credentials, and the host
+// namespace owner record does not grant remote-root access. Both are written
 // 0600 inside a 0700 directory like every other dsh-rw state file.
 //
-// Naming: the placeholder takes a CLEAN name — the remote path's basename, or
-// the display name the user gave in the picker — sanitized to a safe directory
-// name. The sha1 suffix appears ONLY on collision: when the candidate
-// directory already exists and does not provably belong to this workspace
-// (another workspace's meta, or an unreadable one), the name becomes
-// `<name>-<sha1(normalized remotePath)[:8]>`. Because names are no longer
-// computable from (alias, remotePath), lookup works by scanning meta files
-// (resolvePlaceholderDir) — which keeps legacy hash-suffixed directories from
-// v0.1/v0.2 working unchanged: their meta still records the remotePath.
-import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join, resolve, sep } from 'node:path'
-import { baseName, normalizeRemote } from './guard.js'
+// Layout (2.0): the placeholders of one host MIRROR its remote paths under a
+// private root that lives OUTSIDE the user's home directory:
+//
+//   <root>/<alias>                 host dir    (no meta unless remote '/' is picked)
+//   <root>/<alias>/data            workspace   (remotePath '/data')
+//   <root>/<alias>/home/me/proj    workspace   (remotePath '/home/me/proj';
+//                                  home/ and home/me/ are meta-less 0700 dirs)
+//
+// Two reasons. (1) DSH nests a workspace under the closest registered local
+// ancestor; with the root outside ~, a host's main workspace (default /data)
+// is its own top-level node instead of hanging off the home workspace. (2)
+// Because local layout == remote layout, local → remote translation is "strip
+// <root>/<alias>, keep the rest": a local path reached through an outer and an
+// inner workspace maps to the SAME remote path. A placeholder therefore must never live at a
+// location other than its mirror position, which is why ownership is decided
+// by location (a meta whose own mirror position differs is ignored) and why
+// collisions are errors rather than hash-suffixed siblings.
+//
+// Legacy placeholders (≤ 1.6: ~/.dsh/remote-workspaces/<alias>/<name>, clean
+// names, display names, or hash suffixes) are still FOUND by every lookup —
+// the session that works in one keeps working — but new placeholders are
+// always created in the mirror layout.
+import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import type { Dirent, Stats } from 'node:fs'
+import { homedir, userInfo } from 'node:os'
+import { basename, dirname, join, resolve, sep } from 'node:path'
+import { RwError } from './errors.js'
+import { normalizeRemote } from './guard.js'
 
 export const PLACEHOLDER_META_FILE = '.dsh-rw-meta.json'
+/** Host namespace ownership only; never makes remote '/' a workspace. */
+export const HOST_OWNER_FILE = '.dsh-rw-host.json'
+const HOST_NAMESPACE_SCAN_LIMIT = 10_000
 
 const PLACEHOLDER_NOTE = 'placeholder only — not a copy of remote files' as const
 
@@ -34,86 +52,363 @@ export interface PlaceholderMeta {
   note: typeof PLACEHOLDER_NOTE
 }
 
-/** Anything outside [a-zA-Z0-9._-] becomes '_'. */
-function sanitize(alias: string): string {
-  return alias.replace(/[^a-zA-Z0-9._-]/g, '_')
+/**
+ * Where placeholders live. Every field is optional so production code passes
+ * the plugin config through and tests inject tmp directories.
+ */
+export interface PlaceholderLocations {
+  /** Mirror-layout root (2.0). Default: {@link defaultPlaceholderRoot}. */
+  root?: string
+  /** Legacy (≤ 1.6) base directory, searched by lookups only. Default ~/.dsh/remote-workspaces. */
+  legacyBaseDir?: string
+  /** Platform whose path rules apply (tests); default process.platform. */
+  platform?: NodeJS.Platform
+  /** The uid the root must belong to (tests simulate a foreign owner); default process.getuid(). */
+  currentUid?: () => number | undefined
 }
 
-function defaultBaseDir(): string {
-  return join(homedir(), '.dsh', 'remote-workspaces')
+/** One located placeholder. `hostRoot` is set for mirror-layout hits only. */
+export interface PlaceholderHit {
+  dir: string
+  meta: PlaceholderMeta
+  layout: 'mirror' | 'legacy'
+  /** `<root>/<alias>` in the same path form as `dir` (mirror layout only). */
+  hostRoot?: string
 }
 
-/** sha1(normalized remotePath)[:8] — the collision suffix (also the v0.1/v0.2 directory naming). */
-function pathHash(normalized: string): string {
-  return createHash('sha1').update(normalized, 'utf8').digest('hex').slice(0, 8)
+/** Anything outside [a-zA-Z0-9._-] becomes '_'; dot-only names cannot climb out of the root. */
+export function sanitizeAlias(alias: string): string {
+  const clean = alias.replace(/[^a-zA-Z0-9._-]/g, '_')
+  if (clean === '') return '_'
+  return /^\.+$/.test(clean) ? clean.replace(/\./g, '_') : clean
+}
+
+function sanitizeUser(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'user'
+}
+
+function currentUserName(): string {
+  try {
+    return userInfo().username
+  } catch {
+    return process.env.USER ?? process.env.USERNAME ?? 'user'
+  }
 }
 
 /**
- * Locate the placeholder of (alias, remotePath) by scanning the alias's
- * placeholder directories and matching their meta files (exact alias +
- * normalized remotePath). Names are no longer computable — clean basenames,
- * user display names, and legacy hash suffixes coexist — so this is the ONLY
- * correct lookup. Null when nothing matches (workspace never picked, or the
- * meta is lost/corrupt).
+ * The default mirror root. macOS: /Users/Shared/dsh-rw-<user> (always exists,
+ * never under ~, so DSH's workspace tree shows each host at the top level).
+ * Elsewhere: ~/.dsh/rw-workspaces — which may itself sit below a registered
+ * home workspace; set `placeholderRoot` to move it.
  */
-export function resolvePlaceholderDir(alias: string, remotePath: string, baseDir?: string): string | null {
-  const normalized = normalizeRemote(remotePath)
-  const parent = join(baseDir ?? defaultBaseDir(), sanitize(alias))
+export function defaultPlaceholderRoot(platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'darwin') return join('/Users/Shared', `dsh-rw-${sanitizeUser(currentUserName())}`)
+  return join(homedir(), '.dsh', 'rw-workspaces')
+}
+
+/** The ≤ 1.6 placeholder base (lookups only). */
+export function legacyPlaceholderBaseDir(): string {
+  return join(homedir(), '.dsh', 'remote-workspaces')
+}
+
+function expandLocalHome(p: string): string {
+  if (p === '~') return homedir()
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2))
+  return p
+}
+
+/** The effective mirror root (resolved, `~` expanded). */
+export function placeholderRootOf(loc: PlaceholderLocations = {}): string {
+  return loc.root !== undefined && loc.root !== '' ? resolve(expandLocalHome(loc.root)) : defaultPlaceholderRoot(loc.platform)
+}
+
+function legacyBaseOf(loc: PlaceholderLocations): string {
+  return loc.legacyBaseDir ?? legacyPlaceholderBaseDir()
+}
+
+function errorCode(err: unknown): unknown {
+  return err && typeof err === 'object' && 'code' in err ? (err as { code: unknown }).code : undefined
+}
+
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function unsafeRoot(root: string, why: string): RwError {
+  return new RwError(
+    'UNSAFE_PLACEHOLDER_ROOT',
+    `unsafe dsh-rw placeholder root ${root}: ${why} — it must be a real directory owned by the current user; ` +
+      'remove it or set placeholderRoot in the dsh-rw plugin config',
+  )
+}
+
+/**
+ * Create (if needed) and validate the mirror root: a real directory — not a
+ * symlink — owned by the current user, mode 0700. The macOS default lives in
+ * the world-writable /Users/Shared, so another account could pre-create the
+ * name; these checks are what keep placeholders out of someone else's tree.
+ * The default root is created non-recursively (/Users/Shared always exists and
+ * must keep its own mode); a configured root is created recursively.
+ */
+export function ensurePlaceholderRoot(loc: PlaceholderLocations = {}): string {
+  const root = placeholderRootOf(loc)
+  const platform = loc.platform ?? process.platform
+  const custom = loc.root !== undefined && loc.root !== ''
+  const recursive = custom || platform !== 'darwin'
+  try {
+    mkdirSync(root, { recursive, mode: 0o700 })
+  } catch (err) {
+    if (errorCode(err) !== 'EEXIST') throw unsafeRoot(root, `cannot create it (${messageOf(err)})`)
+  }
+  let st: Stats
+  try {
+    st = lstatSync(root)
+  } catch (err) {
+    throw unsafeRoot(root, `cannot stat it (${messageOf(err)})`)
+  }
+  if (st.isSymbolicLink()) throw unsafeRoot(root, 'it is a symbolic link')
+  if (!st.isDirectory()) throw unsafeRoot(root, 'it is not a directory')
+  const uid = (loc.currentUid ?? (() => (typeof process.getuid === 'function' ? process.getuid() : undefined)))()
+  if (uid !== undefined && st.uid !== uid) throw unsafeRoot(root, `it is owned by uid ${st.uid}, not the current user (uid ${uid})`)
+  try {
+    chmodSync(root, 0o700)
+  } catch (err) {
+    throw unsafeRoot(root, `cannot restrict it to 0700 (${messageOf(err)})`)
+  }
+  return root
+}
+
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i
+// eslint-disable-next-line no-control-regex
+const WIN_INVALID = /[<>:"\\|?*\u0000-\u001f]/
+
+/** Reject a path segment the local file system cannot (or must not) hold. */
+function assertSegment(seg: string, what: string, platform: NodeJS.Platform): void {
+  if (seg === PLACEHOLDER_META_FILE || seg === HOST_OWNER_FILE) {
+    throw new RwError('INVALID_INPUT', `${what} ${JSON.stringify(seg)} collides with a reserved dsh-rw metadata file name`)
+  }
+  if (platform !== 'win32') return
+  if (WIN_INVALID.test(seg)) {
+    throw new RwError('INVALID_INPUT', `${what} ${JSON.stringify(seg)} contains a character Windows cannot store in a directory name`)
+  }
+  if (/[. ]$/.test(seg)) {
+    throw new RwError('INVALID_INPUT', `${what} ${JSON.stringify(seg)} ends with a dot or a space, which Windows cannot store`)
+  }
+  if (WIN_RESERVED.test(seg)) {
+    throw new RwError('INVALID_INPUT', `${what} ${JSON.stringify(seg)} is a reserved device name on Windows`)
+  }
+}
+
+/** The non-empty segments of a normalized remote path ('/' → []). */
+function remoteSegments(remotePath: string): string[] {
+  return normalizeRemote(remotePath)
+    .split('/')
+    .filter((s) => s !== '')
+}
+
+/** `<root>/<sanitized alias>` for an explicit root form. */
+function hostRootUnder(root: string, alias: string): string {
+  return join(root, sanitizeAlias(alias))
+}
+
+/** The mirror position of (alias, remotePath) under an explicit root form; throws on unstorable segments. */
+function mirrorUnder(root: string, alias: string, remotePath: string, platform: NodeJS.Platform): string {
+  const aliasSeg = sanitizeAlias(alias)
+  assertSegment(aliasSeg, 'host alias directory', platform)
+  const segs = remoteSegments(remotePath)
+  for (const seg of segs) assertSegment(seg, 'remote path segment', platform)
+  return join(root, aliasSeg, ...segs)
+}
+
+/** The host-root placeholder directory (`<root>/<alias>`, remote '/'). */
+export function hostRootDir(alias: string, loc: PlaceholderLocations = {}): string {
+  return hostRootUnder(placeholderRootOf(loc), alias)
+}
+
+/** Where (alias, remotePath) lives in the mirror layout (computed, not checked on disk). */
+export function mirrorPlaceholderDir(alias: string, remotePath: string, loc: PlaceholderLocations = {}): string {
+  return mirrorUnder(placeholderRootOf(loc), alias, remotePath, loc.platform ?? process.platform)
+}
+
+/**
+ * On a case-insensitive file system an existing `<parent>/<seg>` may really be
+ * `<parent>/<Seg>`. Such a pair would silently share one placeholder, so the
+ * exact spelling must be present in the parent listing (unicode-normalization
+ * differences — HFS+ stores NFD — are not a conflict).
+ */
+function assertExactSpelling(parent: string, seg: string): void {
   let names: string[]
   try {
     names = readdirSync(parent)
   } catch {
-    return null
+    return
   }
-  for (const name of names) {
-    const dir = join(parent, name)
+  const want = seg.normalize('NFC')
+  if (names.some((name) => name === seg || name.normalize('NFC') === want)) return
+  const other = names.find((name) => name.normalize('NFC').toLowerCase() === want.toLowerCase())
+  throw new RwError(
+    'INVALID_INPUT',
+    `placeholder directory ${JSON.stringify(join(parent, seg))} collides with the existing ${JSON.stringify(join(parent, other ?? '?'))}: ` +
+      `this local file system is case-insensitive, so ${JSON.stringify(seg)} and ${JSON.stringify(other ?? '?')} name the same directory`,
+  )
+}
+
+/** mkdir -p one segment at a time below `base`: 0700, plain directories only, exact spelling. */
+function ensureDirChain(base: string, segments: string[]): string {
+  let cur = base
+  for (const seg of segments) {
+    const next = join(cur, seg)
+    let st: Stats | undefined
+    try {
+      st = lstatSync(next)
+    } catch (err) {
+      if (errorCode(err) !== 'ENOENT') throw new RwError('INVALID_INPUT', `cannot inspect ${next}: ${messageOf(err)}`)
+    }
+    if (st === undefined) {
+      try {
+        mkdirSync(next, { mode: 0o700 })
+      } catch (err) {
+        if (errorCode(err) !== 'EEXIST') throw new RwError('INVALID_INPUT', `cannot create ${next}: ${messageOf(err)}`)
+        assertExactSpelling(cur, seg)
+      }
+      st = lstatSync(next)
+    } else {
+      assertExactSpelling(cur, seg)
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new RwError('INVALID_INPUT', `${next} exists and is not a plain directory — cannot place a dsh-rw placeholder there`)
+    }
+    cur = next
+  }
+  return cur
+}
+
+/** Unicode-equivalent spellings count only if the filesystem proves they are the same directory. */
+function sameMirrorPosition(expected: string, actual: string): boolean {
+  if (expected === actual) return true
+  if (expected.normalize('NFC') !== actual.normalize('NFC')) return false
+  try {
+    const a = lstatSync(expected, { bigint: true })
+    const b = lstatSync(actual, { bigint: true })
+    return a.isDirectory() && b.isDirectory() && !a.isSymbolicLink() && !b.isSymbolicLink() &&
+      a.ino !== 0n && a.dev === b.dev && a.ino === b.ino
+  } catch {
+    return false
+  }
+}
+
+/** An alias owns its entire host-root namespace, not just one project leaf. */
+function namespaceConflict(hostRoot: string, alias: string, owner: string): RwError {
+  return new RwError(
+    'INVALID_INPUT',
+    `placeholder host directory ${hostRoot} belongs to alias ${JSON.stringify(owner)}, not ${JSON.stringify(alias)} ` +
+      '(the aliases map to the same directory name) — choose a distinct SSH alias or placeholderRoot; no paths were remapped',
+  )
+}
+
+/** Read-only ownership check. Audit old trees too, including those touched by an older process. */
+function assertHostOwner(hostRoot: string, alias: string, platform: NodeJS.Platform): boolean {
+  const ownerFile = join(hostRoot, HOST_OWNER_FILE)
+  let hasOwner = false
+  try {
+    const st = lstatSync(ownerFile)
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error('owner record is not a regular file')
+    const owner = JSON.parse(readFileSync(ownerFile, 'utf8')) as { plugin?: unknown; version?: unknown; alias?: unknown }
+    if (owner?.plugin !== 'dsh-rw' || owner.version !== 1 || typeof owner.alias !== 'string') {
+      throw new Error('invalid owner record')
+    }
+    if (owner.alias !== alias) throw namespaceConflict(hostRoot, alias, owner.alias)
+    hasOwner = true
+  } catch (err) {
+    if (err instanceof RwError) throw err
+    if (errorCode(err) !== 'ENOENT') {
+      throw new RwError('INVALID_INPUT', `cannot verify host ownership at ${ownerFile}: ${messageOf(err)}`)
+    }
+  }
+
+  // A marker alone is not enough: an older DSH process may still add a foreign
+  // leaf. Inspect only plain placeholder directories, never follow symlinks.
+  const pending = [hostRoot]
+  let seen = 0
+  while (pending.length > 0) {
+    const dir = pending.pop()!
     const meta = readPlaceholderMeta(dir)
-    if (meta !== null && meta.alias === alias && meta.remotePath === normalized) return dir
+    if (meta !== null) {
+      let expected: string | undefined
+      try {
+        expected = mirrorUnder(dirname(hostRoot), meta.alias, meta.remotePath, platform)
+      } catch {
+        // A misplaced/unstorable meta is not a claim on this namespace.
+      }
+      if (expected !== undefined && sameMirrorPosition(expected, dir) && meta.alias !== alias) {
+        throw namespaceConflict(hostRoot, alias, meta.alias)
+      }
+    }
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch (err) {
+      throw new RwError('INVALID_INPUT', `cannot verify host namespace ${hostRoot}: ${messageOf(err)}`)
+    }
+    for (const entry of entries) {
+      if (++seen > HOST_NAMESPACE_SCAN_LIMIT) {
+        throw new RwError('INVALID_INPUT', `host namespace ${hostRoot} exceeds the ${HOST_NAMESPACE_SCAN_LIMIT}-entry ownership check limit`)
+      }
+      if (entry.isDirectory() && !entry.isSymbolicLink()) pending.push(join(dir, entry.name))
+    }
   }
-  return null
+  return hasOwner
+}
+
+/** Reserve once, exclusively: another profile/process cannot overwrite an alias's claim. */
+function ensureHostOwner(hostRoot: string, alias: string, platform: NodeJS.Platform): void {
+  if (assertHostOwner(hostRoot, alias, platform)) return
+  const ownerFile = join(hostRoot, HOST_OWNER_FILE)
+  try {
+    writeFileSync(ownerFile, `${JSON.stringify({ plugin: 'dsh-rw', version: 1, alias })}\n`, { flag: 'wx', mode: 0o600 })
+  } catch (err) {
+    if (errorCode(err) === 'EEXIST') {
+      assertHostOwner(hostRoot, alias, platform)
+      return
+    }
+    throw new RwError('INVALID_INPUT', `cannot reserve host namespace ${hostRoot}: ${messageOf(err)}`)
+  }
+}
+
+function writeMeta(dir: string, meta: PlaceholderMeta): void {
+  chmodSync(dir, 0o700)
+  const file = join(dir, PLACEHOLDER_META_FILE)
+  const tmp = `${file}.tmp-${process.pid}`
+  writeFileSync(tmp, `${JSON.stringify(meta, null, 2)}\n`, { mode: 0o600 })
+  chmodSync(tmp, 0o600)
+  renameSync(tmp, file)
 }
 
 /**
- * The directory name for a fresh placeholder: displayName (trimmed) or the
- * remote basename, sanitized; the sha1 suffix appears only when the candidate
- * is already occupied by something that is not provably this workspace.
+ * Make `dir` the placeholder of (alias, remote). A valid meta naming another
+ * workspace is a hard error (location decides ownership — never relocate). A
+ * consistent meta is left untouched; changed host/port/user is rewritten in
+ * place keeping createdAt; a missing or corrupt meta is (re)written.
  */
-function freshPlaceholderDir(alias: string, normalized: string, baseDir: string | undefined, displayName?: string): string {
-  const parent = join(baseDir ?? defaultBaseDir(), sanitize(alias))
-  const clean = sanitize(displayName?.trim() || baseName(normalized))
-  const dir = join(parent, clean)
-  if (!existsSync(dir)) return dir
-  return join(parent, `${clean}-${pathHash(normalized)}`)
-}
-
-/**
- * Create the placeholder directory plus its meta file (0600, dir 0700).
- * Idempotent: an existing placeholder for the same (alias, remotePath) — found
- * via resolvePlaceholderDir — is kept as-is when its meta is consistent; an
- * inconsistent meta is rewritten but keeps the original createdAt.
- * displayName (picker-only) names a fresh placeholder; omitting it uses the
- * remote basename. Returns the placeholder directory.
- */
-export function ensurePlaceholder(
-  alias: string,
-  entry: { host: string; port: number; user: string },
-  remotePath: string,
-  baseDir?: string,
-  displayName?: string,
-): string {
-  const remote = normalizeRemote(remotePath)
-  const dir = resolvePlaceholderDir(alias, remote, baseDir) ?? freshPlaceholderDir(alias, remote, baseDir, displayName)
+function ensureMetaAt(dir: string, alias: string, entry: { host: string; port: number; user: string }, remote: string): void {
   const existing = readPlaceholderMeta(dir)
-  const consistent =
+  if (existing !== null && (existing.alias !== alias || existing.remotePath !== remote)) {
+    throw new RwError(
+      'INVALID_INPUT',
+      `placeholder directory ${dir} already belongs to host alias ${JSON.stringify(existing.alias)} remote ` +
+        `${existing.remotePath} — cannot reuse it for ${JSON.stringify(alias)} remote ${remote}` +
+        (existing.alias !== alias ? ' (the two aliases map to the same directory name)' : ''),
+    )
+  }
+  if (
     existing !== null &&
-    existing.alias === alias &&
     existing.host === entry.host &&
     existing.port === entry.port &&
-    existing.user === entry.user &&
-    existing.remotePath === remote
-  if (consistent) return dir
-
-  const meta: PlaceholderMeta = {
+    existing.user === entry.user
+  ) {
+    return
+  }
+  writeMeta(dir, {
     plugin: 'dsh-rw',
     alias,
     host: entry.host,
@@ -122,12 +417,36 @@ export function ensurePlaceholder(
     remotePath: remote,
     createdAt: existing?.createdAt ?? new Date().toISOString(),
     note: PLACEHOLDER_NOTE,
-  }
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-  chmodSync(dir, 0o700)
-  const file = join(dir, PLACEHOLDER_META_FILE)
-  writeFileSync(file, `${JSON.stringify(meta, null, 2)}\n`, { mode: 0o600 })
-  chmodSync(file, 0o600)
+  })
+}
+
+/**
+ * Create the placeholder of (alias, remotePath) at its mirror position;
+ * `<root>/<alias>` has an alias ownership record, not a workspace meta, and
+ * the directories between it and the placeholder are meta-less 0700 dirs.
+ * The host root gets a workspace meta (remote '/') only when '/'
+ * itself is picked: a meta there would make every path of the host
+ * remote-backed, so it is never created as a side effect. Idempotent. Always
+ * the mirror layout — a legacy placeholder for the same pair is left alone
+ * (still found by path). Returns the placeholder directory.
+ */
+export function ensurePlaceholder(
+  alias: string,
+  entry: { host: string; port: number; user: string },
+  remotePath: string,
+  loc: PlaceholderLocations = {},
+): string {
+  const platform = loc.platform ?? process.platform
+  const remote = normalizeRemote(remotePath)
+  const aliasSeg = sanitizeAlias(alias)
+  const segs = remoteSegments(remote)
+  // Validate every segment before anything touches the disk.
+  mirrorUnder('/', alias, remote, platform)
+  const root = ensurePlaceholderRoot(loc)
+  const hostRoot = ensureDirChain(root, [aliasSeg])
+  ensureHostOwner(hostRoot, alias, platform)
+  const dir = ensureDirChain(hostRoot, segs)
+  ensureMetaAt(dir, alias, entry, remote)
   return dir
 }
 
@@ -161,37 +480,84 @@ export function readPlaceholderMeta(dir: string): PlaceholderMeta | null {
 
 /** True when `p` (already resolve()d) is `root` or inside it (path-platform-aware). */
 function inside(p: string, root: string): boolean {
-  return p === root || p.startsWith(`${root}${sep}`)
+  return p === root || p.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
 }
 
 /**
- * Find the placeholder whose directory contains `cwd`, by scanning every
- * placeholder directory under the base dir and matching its meta. Containment
- * is checked both lexically (resolve()) and via realpath (macOS /var ↔
- * /private/var), mirroring the shim's insideLocal. Returns the placeholder dir
- * and its meta, or null when the cwd is not inside any dsh-rw placeholder —
- * i.e. the agent is working in a real local directory, where native tools
- * should run locally. This is the reverse of resolvePlaceholderDir: names are
- * not computable from (alias, remotePath), so lookup is by scan.
+ * realpath of the deepest existing ancestor, with the missing tail re-appended
+ * — so a not-yet-created file below a symlinked prefix (macOS /var ↔
+ * /private/var) still compares against the real form of the root.
  */
-export function findPlaceholderByPath(cwd: string, baseDir?: string): { dir: string; meta: PlaceholderMeta } | null {
-  const root = baseDir ?? defaultBaseDir()
+function realpathLoose(p: string): string | null {
+  let cur = p
+  const tail: string[] = []
+  for (;;) {
+    try {
+      const real = realpathSync(cur)
+      return tail.length === 0 ? real : join(real, ...tail.reverse())
+    } catch {
+      const parent = dirname(cur)
+      if (parent === cur) return null
+      tail.push(basename(cur))
+      cur = parent
+    }
+  }
+}
+
+/** The lexical and real forms of a path (deduplicated, lexical first). */
+function pathForms(p: string): string[] {
+  const lex = resolve(p)
+  const real = realpathLoose(lex)
+  return real !== null && real !== lex ? [lex, real] : [lex]
+}
+
+/**
+ * Mirror-layout lookup: walk from the candidate up to (not including) the
+ * root and take the first — i.e. deepest — directory whose meta is valid AND
+ * sits exactly at its own mirror position. A meta found anywhere else is
+ * ignored: it would map local paths to the wrong remote paths.
+ */
+function findInMirror(path: string, loc: PlaceholderLocations): PlaceholderHit | null {
+  const platform = loc.platform ?? process.platform
+  const roots = pathForms(placeholderRootOf(loc))
+  for (const cand of pathForms(path)) {
+    for (const root of roots) {
+      if (cand === root || !inside(cand, root)) continue
+      const segs = cand
+        .slice(root.length)
+        .split(sep)
+        .filter((s) => s !== '')
+      for (let i = segs.length; i >= 1; i--) {
+        const dir = join(root, ...segs.slice(0, i))
+        const meta = readPlaceholderMeta(dir)
+        if (meta === null) continue
+        let expected: string
+        try {
+          expected = mirrorUnder(root, meta.alias, meta.remotePath, platform)
+        } catch {
+          continue
+        }
+        if (!sameMirrorPosition(expected, dir)) continue
+        const hostRoot = hostRootUnder(root, meta.alias)
+        assertHostOwner(hostRoot, meta.alias, platform)
+        return { dir, meta, layout: 'mirror', hostRoot }
+      }
+    }
+  }
+  return null
+}
+
+/** Legacy (≤ 1.6) lookup: scan `<base>/<alias>/<name>` metas for one containing the path. */
+function findInLegacy(path: string, base: string): PlaceholderHit | null {
   let aliasDirNames: string[]
   try {
-    aliasDirNames = readdirSync(root)
+    aliasDirNames = readdirSync(base)
   } catch {
     return null
   }
-  const candLex = resolve(cwd)
-  let candReal: string | null = null
-  try {
-    const real = realpathSync(cwd)
-    if (real !== candLex) candReal = real
-  } catch {
-    // cwd may not exist (e.g. a probe path) — lexical containment still applies
-  }
+  const cands = pathForms(path)
   for (const aliasName of aliasDirNames) {
-    const aliasParent = join(root, aliasName)
+    const aliasParent = join(base, aliasName)
     let placeholderNames: string[]
     try {
       placeholderNames = readdirSync(aliasParent)
@@ -209,9 +575,70 @@ export function findPlaceholderByPath(cwd: string, baseDir?: string): { dir: str
       } catch {
         // placeholder missing on disk: lexical containment still applies
       }
-      const hit = dirRoots.some((r) => inside(candLex, r) || (candReal !== null && inside(candReal, r)))
-      if (hit) return { dir, meta }
+      if (dirRoots.some((r) => cands.some((c) => inside(c, r)))) return { dir, meta, layout: 'legacy' }
     }
   }
   return null
+}
+
+/**
+ * Find the placeholder whose directory contains `path` (a session cwd or a
+ * native tool path argument): the mirror layout first (deepest valid meta
+ * wins), then the legacy base. Containment is checked both lexically and via
+ * realpath. Null when the path is a real local directory — native tools then
+ * legitimately run locally.
+ */
+export function findPlaceholderByPath(path: string, loc: PlaceholderLocations = {}): PlaceholderHit | null {
+  return findInMirror(path, loc) ?? findInLegacy(path, legacyBaseOf(loc))
+}
+
+/**
+ * Locate the placeholder of (alias, remotePath): its mirror position when the
+ * meta there matches, else a legacy directory whose meta matches (legacy names
+ * are not computable, so that half scans). Null when the workspace was never
+ * picked or its meta is lost/corrupt.
+ */
+export function locatePlaceholder(alias: string, remotePath: string, loc: PlaceholderLocations = {}): PlaceholderHit | null {
+  const normalized = normalizeRemote(remotePath)
+  let mirrorDir: string | undefined
+  try {
+    mirrorDir = mirrorPlaceholderDir(alias, normalized, loc)
+  } catch {
+    // Unstorable segment: no mirror placeholder. Ownership errors below must
+    // never be swallowed into a legacy/null (and therefore local) fallback.
+  }
+  if (mirrorDir !== undefined) {
+    const meta = readPlaceholderMeta(mirrorDir)
+    if (meta !== null && meta.alias === alias && meta.remotePath === normalized) {
+      const hostRoot = hostRootDir(alias, loc)
+      assertHostOwner(hostRoot, alias, loc.platform ?? process.platform)
+      return { dir: mirrorDir, meta, layout: 'mirror', hostRoot }
+    }
+  }
+  const parent = join(legacyBaseOf(loc), sanitizeAlias(alias))
+  let names: string[]
+  try {
+    names = readdirSync(parent)
+  } catch {
+    return null
+  }
+  for (const name of names) {
+    const dir = join(parent, name)
+    const meta = readPlaceholderMeta(dir)
+    if (meta !== null && meta.alias === alias && meta.remotePath === normalized) return { dir, meta, layout: 'legacy' }
+  }
+  return null
+}
+
+/** {@link locatePlaceholder}, directory only. */
+export function resolvePlaceholderDir(alias: string, remotePath: string, loc: PlaceholderLocations = {}): string | null {
+  return locatePlaceholder(alias, remotePath, loc)?.dir ?? null
+}
+
+/** Build lookup locations from a deps-style pair (`placeholderRoot` + legacy `placeholderBaseDir`). */
+export function placeholderLocationsOf(deps: { placeholderRoot?: string; placeholderBaseDir?: string }): PlaceholderLocations {
+  return {
+    ...(deps.placeholderRoot !== undefined ? { root: deps.placeholderRoot } : {}),
+    ...(deps.placeholderBaseDir !== undefined ? { legacyBaseDir: deps.placeholderBaseDir } : {}),
+  }
 }

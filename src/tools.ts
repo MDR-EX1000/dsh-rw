@@ -16,10 +16,11 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { mapSftpError, RwError, toRwError } from './errors.js'
 import { normalizeRemote, expandRemoteHome, resolveInWorkspace, assertRealpathInside, shq } from './guard.js'
 import type { HostEntry, HostSummary } from './hosts.js'
-import { ensurePlaceholder, findPlaceholderByPath, resolvePlaceholderDir } from './placeholder.js'
+import { ensurePlaceholder, findPlaceholderByPath, placeholderLocationsOf, resolvePlaceholderDir } from './placeholder.js'
 import { RemoteFs } from './remote-fs.js'
-import type { Session } from './session.js'
-import type { NativeRouting } from './shim.js'
+import { sessionHeaderOf, sessionKeysOf } from './session.js'
+import type { SessionKeys, SessionStore } from './session.js'
+import type { NativeRoutingTable } from './shim.js'
 import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js'
 import { applyUnifiedDiff, looksBinary, patchTargets, unifiedDiff } from './patch.js'
 import { PLUGIN_VERSION } from './version.js'
@@ -68,6 +69,10 @@ export interface HostTableLike {
       passphrase?: string
     },
   ): HostEntry
+  /** The host's main remote directory (its default workspace in the picker), if set. */
+  mainDir?(alias: string): string | undefined
+  /** Set (or with null, clear) the host's main remote directory. */
+  setMainDir?(alias: string, path: string | null): void
 }
 
 /** Structural subset of SshPool (same rationale as HostTableLike). */
@@ -89,17 +94,25 @@ export interface PoolLike {
 export interface ToolsDeps {
   hosts: HostTableLike
   pool: PoolLike
-  session: Session
+  /** Per-session connection records (2.0: keyed by the DSH session id). */
+  session: SessionStore
   config: {
     commandTimeoutMs: number
     maxOutputChars: number
     /** Shown by rw_info; optional so minimal test configs still typecheck. */
     hostKeyPolicy?: string
   }
-  /** Base dir for placeholder dirs (tests inject a tmp dir). */
+  /** Mirror-layout placeholder root (plugin config placeholderRoot; tests inject a tmp dir). */
+  placeholderRoot?: string
+  /**
+   * Main directory of hosts that have none of their own (plugin config
+   * defaultMainDir, '/'); '' or undefined means none.
+   */
+  defaultMainDir?: string
+  /** Legacy (≤ 1.6) placeholder base dir, searched by lookups only (tests inject a tmp dir). */
   placeholderBaseDir?: string
-  /** Where native tools actually go, as observed by the shim (plugin-load scope). */
-  routing?: NativeRouting
+  /** Where native tools actually go, as observed by the shim, per session id. */
+  routing?: NativeRoutingTable
   /** Whether the shim is currently on (a live getter: the settings layer can flip it). */
   shimEnabled?: () => boolean
 }
@@ -129,19 +142,25 @@ function unknownAliasError(deps: ToolsDeps, alias: string): RwError {
  * purpose: the real value is a `ToolRunContext`, and tests drive plain objects.
  */
 interface ExecLike {
-  agent?: { session?: { header?: { cwd?: string } } }
+  /** The calling agent; its `session.header` carries `id`, `cwd` and `parentSession`. */
+  agent?: unknown
 }
 
 /** The calling agent's session cwd — where the agent is ACTUALLY working. */
 function agentCwdOf(exec: ExecLike | undefined): string | undefined {
-  const cwd: unknown = exec?.agent?.session?.header?.cwd
-  return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+  return sessionHeaderOf(exec?.agent).cwd
+}
+
+/** The calling session's record keys (own id + direct parent for subagents). */
+function keysOf(exec: ExecLike | undefined): SessionKeys {
+  return sessionKeysOf(exec?.agent)
 }
 
 /**
  * Where this session actually works, resolved from the AGENT CWD first.
  *
- * The session record (`alias` + `workspace`) is only a fallback. If the agent
+ * This session's record (`alias` + `workspace`, inherited from the parent
+ * session for a subagent without its own) is only a fallback. If the agent
  * is working inside a dsh-rw placeholder, that placeholder's host and remote
  * root are the truth — the record can be stale, can point at another machine
  * after a reconnect, or can be a leftover from a previous pick. Making the
@@ -152,7 +171,15 @@ function agentCwdOf(exec: ExecLike | undefined): string | undefined {
  * configured: the caller must fail loudly, never silently use the record.
  */
 type WorkspaceTarget =
-  | { kind: 'ok'; entry: HostEntry; workspace: string; source: 'cwd' | 'session' }
+  | {
+      kind: 'ok'
+      entry: HostEntry
+      workspace: string
+      /** cwd: the working directory's placeholder; record: this session's record; parent: the parent session's. */
+      source: 'cwd' | 'record' | 'parent'
+      /** The placeholder directory (cwd source only). */
+      dir?: string
+    }
   /** Connected, but no remote directory picked yet — host tools work, file tools do not. */
   | { kind: 'no-workspace'; entry: HostEntry }
   | { kind: 'broken'; alias: string; workspace: string; dir: string }
@@ -160,24 +187,25 @@ type WorkspaceTarget =
 function activeWorkspace(deps: ToolsDeps, exec?: ExecLike): WorkspaceTarget | null {
   const cwd = agentCwdOf(exec)
   if (cwd !== undefined) {
-    const found = findPlaceholderByPath(cwd, deps.placeholderBaseDir)
+    const found = findPlaceholderByPath(cwd, placeholderLocationsOf(deps))
     if (found !== null) {
       const entry = deps.hosts.find(found.meta.alias)
       if (entry === undefined) {
         return { kind: 'broken', alias: found.meta.alias, workspace: found.meta.remotePath, dir: found.dir }
       }
-      return { kind: 'ok', entry, workspace: found.meta.remotePath, source: 'cwd' }
+      return { kind: 'ok', entry, workspace: found.meta.remotePath, source: 'cwd', dir: found.dir }
     }
   }
-  const alias = deps.session.alias
+  const record = deps.session.lookup(keysOf(exec))
+  const alias = record.alias
   if (alias === null) return null
   const entry = deps.hosts.find(alias)
   if (!entry) return null
-  const workspace = deps.session.workspace
+  const workspace = record.workspace
   // Connected but unpicked is its own state: rw_exec legitimately runs in the
   // SSH default directory, while every file tool must say NO_WORKSPACE.
   if (workspace === null) return { kind: 'no-workspace', entry }
-  return { kind: 'ok', entry, workspace, source: 'session' }
+  return { kind: 'ok', entry, workspace, source: record.source === 'parent' ? 'parent' : 'record' }
 }
 
 /** The host this call must target, or a thrown NOT_CONNECTED / INVALID_INPUT. */
@@ -212,20 +240,12 @@ async function requireWorkspaceFs(deps: ToolsDeps, exec?: ExecLike): Promise<Rem
 }
 
 /**
- * Shared pick-workspace validation used by rw_pick_workspace and the
- * /api/dsh-rw/workspace route: resolve symlinks via realpath, require a
- * directory, create the local placeholder. Returns the real workspace path
- * and the placeholder directory. Does not touch the session. `name` (picker
- * only) names a fresh placeholder; the tool flow omits it (basename default).
+ * Resolve a remote directory the way a workspace pick does: `~` expansion
+ * against the SFTP home, realpath (symlinks resolved), must be a directory.
+ * Returns the normalized real path. Shared by the workspace pick and the
+ * host main-directory route.
  */
-export async function resolveWorkspaceDir(
-  deps: ToolsDeps,
-  alias: string,
-  path: string,
-  name?: string,
-): Promise<{ workspace: string; placeholderDir: string }> {
-  const entry = deps.hosts.find(alias)
-  if (!entry) throw unknownAliasError(deps, alias)
+export async function resolveRemoteDir(deps: ToolsDeps, entry: HostEntry, path: string): Promise<string> {
   if (!path.startsWith('/') && path !== '~' && !path.startsWith('~/')) {
     throw new RwError('INVALID_INPUT', `workspace path must be absolute (or ~/…): ${JSON.stringify(path)}`)
   }
@@ -244,7 +264,25 @@ export async function resolveWorkspaceDir(
     throw mapSftpError(err, real)
   }
   if (!isDir) throw new RwError('NOT_A_DIRECTORY', `not a directory: ${real}`)
-  const placeholderDir = ensurePlaceholder(alias, entry, real, deps.placeholderBaseDir, name)
+  return real
+}
+
+/**
+ * Shared pick-workspace validation used by rw_pick_workspace and the
+ * /api/dsh-rw/workspace route: resolve the remote directory, then create its
+ * local placeholder (mirror layout, plus the host-root placeholder). Returns
+ * the real workspace path and the placeholder directory. Touches neither the
+ * session records nor the DSH workspace registry.
+ */
+export async function resolveWorkspaceDir(
+  deps: ToolsDeps,
+  alias: string,
+  path: string,
+): Promise<{ workspace: string; placeholderDir: string }> {
+  const entry = deps.hosts.find(alias)
+  if (!entry) throw unknownAliasError(deps, alias)
+  const real = await resolveRemoteDir(deps, entry, path)
+  const placeholderDir = ensurePlaceholder(alias, entry, real, placeholderLocationsOf(deps))
   return { workspace: real, placeholderDir }
 }
 
@@ -254,14 +292,14 @@ export async function resolveWorkspaceDir(
  * the line that makes a disagreement between the two tool families visible: a
  * recorded remote workspace is not evidence that native calls are reaching it.
  */
-function nativeRoutingLine(deps: ToolsDeps, placeholderDir: string | null): string {
+function nativeRoutingLine(deps: ToolsDeps, placeholderDir: string | null, sessionId: string): string {
   if (deps.shimEnabled !== undefined && !deps.shimEnabled()) {
     return (
       'Native tools: shim off — read/write/edit/str_replace_editor/glob/grep/bash stay on the local machine; ' +
       'use rw_* for the remote'
     )
   }
-  const routing = deps.routing
+  const routing = deps.routing?.peek(sessionId)
   const where = routing?.placeholder ?? placeholderDir ?? 'the placeholder directory'
   if (routing?.mode === 'remote') {
     if (routing.reason === 'path') {
@@ -280,24 +318,26 @@ function nativeRoutingLine(deps: ToolsDeps, placeholderDir: string | null): stri
     )
   }
   return (
-    'Native tools: not observed yet — translation starts with the first native tool call in this session; ' +
+    'Native tools: not observed yet in this session — translation starts with its first native tool call; ' +
     'rw_* always addresses the remote'
   )
 }
 
 /** Sync status lines shared by rw_info and the /rw slash command. */
 export function statusText(deps: ToolsDeps, exec?: ExecLike): string {
-  const { hosts, pool, session } = deps
+  const { hosts, pool } = deps
   const summaries = hosts.summaries()
+  const keys = keysOf(exec)
+  const record = deps.session.get(keys)
   // The ACTUAL workspace wins: when the agent cwd is inside a placeholder, that
-  // placeholder's host/root are what every rw_* call will use — the session
+  // placeholder's host/root are what every rw_* call will use — this session's
   // record is only a fallback and is reported as such.
   const target = activeWorkspace(deps, exec)
   const resolved = target !== null && target.kind === 'ok' ? target : null
-  const alias = resolved !== null ? resolved.entry.alias : session.alias
+  const alias = resolved !== null ? resolved.entry.alias : record.alias
   const entry = resolved !== null ? resolved.entry : alias !== null ? hosts.find(alias) : undefined
   const connected = alias !== null && pool.connected().includes(alias)
-  const workspace = resolved !== null ? resolved.workspace : session.workspace
+  const workspace = resolved !== null ? resolved.workspace : record.workspace
   const lines: string[] = []
   const hidden = deps.hosts.hiddenAliases?.() ?? []
   lines.push(`Hosts configured: ${summaries.length}${hidden.length > 0 ? ` (${hidden.length} hidden: ${hidden.join(', ')})` : ''}`)
@@ -309,21 +349,31 @@ export function statusText(deps: ToolsDeps, exec?: ExecLike): string {
     lines.push('Current host: (none — call rw_connect with an alias from rw_hosts)')
   }
   lines.push(`Connected: ${connected ? 'yes' : 'no'}`)
+  const ownMain = alias !== null && entry !== undefined ? hosts.mainDir?.(alias) : undefined
+  const defaultMain = deps.defaultMainDir !== undefined && deps.defaultMainDir !== '' ? deps.defaultMainDir : undefined
+  if (alias !== null && entry !== undefined && (ownMain ?? defaultMain) !== undefined) {
+    lines.push(
+      `Main directory of ${alias}: ${ownMain ?? defaultMain} ` +
+        (ownMain !== undefined ? "(the host's own setting)" : '(the plugin default defaultMainDir)'),
+    )
+  }
   const source =
     resolved === null
       ? ''
       : resolved.source === 'cwd'
-        ? ' (from this session\'s working directory)'
-        : ' (from the plugin session record)'
+        ? " (from this session's working directory)"
+        : resolved.source === 'parent'
+          ? " (inherited from the parent session's dsh-rw record)"
+          : " (from this session's dsh-rw record)"
   lines.push(`Current workspace: ${workspace ?? '(none — call rw_pick_workspace to set one)'}${source}`)
   if (alias !== null && workspace !== null) {
-    const placeholderDir = resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir)
+    const placeholderDir = resolved?.dir ?? resolvePlaceholderDir(alias, workspace, placeholderLocationsOf(deps))
     lines.push(
       placeholderDir !== null
-        ? `Placeholder dir (register this as the DSH workspace): ${placeholderDir}`
+        ? `Placeholder dir (the local stand-in DSH registers as the workspace): ${placeholderDir}`
         : 'Placeholder dir: (none found — call rw_pick_workspace to (re)create it)',
     )
-    lines.push(nativeRoutingLine(deps, placeholderDir))
+    lines.push(nativeRoutingLine(deps, placeholderDir, keys.id ?? ''))
   }
   lines.push(
     `Host key policy: ${deps.config.hostKeyPolicy ?? 'accept-new'} (plugin config hostKeyPolicy; keys verified against known_hosts)`,
@@ -549,7 +599,10 @@ export function makeTools(deps: ToolsDeps): unknown[] {
           const latencyMs = await pool.testConnect(entry)
           // A workspace is only meaningful on the host it was picked on:
           // keep it when reconnecting the same alias, clear it when switching.
-          session.set({ alias: entry.alias, workspace: session.alias === entry.alias ? session.workspace : null })
+          // Only THIS session's record changes (a subagent writes its own copy).
+          const keys = keysOf(exec)
+          const current = session.get(keys)
+          session.set(keys, { alias: entry.alias, workspace: current.alias === entry.alias ? current.workspace : null })
           return {
             text:
               `Connected to ${entry.user}@${entry.host}:${entry.port} (alias: ${entry.alias}) in ${latencyMs}ms.\n` +
@@ -576,18 +629,31 @@ export function makeTools(deps: ToolsDeps): unknown[] {
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
       async execute(args, exec) {
         try {
-          const alias = session.alias
+          const keys = keysOf(exec)
+          const target = activeWorkspace(deps, exec)
+          // This session's host; a session opened inside a placeholder without
+          // a record of its own picks on the host its working directory names.
+          const alias =
+            session.get(keys).alias ?? (target !== null && target.kind === 'ok' && target.source === 'cwd' ? target.entry.alias : null)
           if (alias === null) {
             throw new RwError('NOT_CONNECTED', 'no host connected — call rw_connect(alias) first')
           }
+          // Placeholder only: registering a workspace in the user's sidebar is
+          // the picker UI's job, never the model's.
           const { workspace, placeholderDir } = await resolveWorkspaceDir(deps, alias, args.path)
-          session.set({ workspace })
+          session.set(keys, { alias, workspace })
+          const shadowed =
+            target !== null && target.kind === 'ok' && target.source === 'cwd' && (target.entry.alias !== alias || target.workspace !== workspace)
+              ? `\nNote: this session's working directory is inside the placeholder for ${target.entry.alias}:${target.workspace}, ` +
+                'which keeps taking precedence for rw_* calls made from it.'
+              : ''
           return {
             text:
               `Remote workspace set to ${workspace} on ${alias}.\n` +
               `Local placeholder directory: ${placeholderDir}\n` +
-              '(The DSH workspace points at this empty placeholder; the remote filesystem stays the source of truth. ' +
-              'All rw_* file paths are confined to the workspace root.)',
+              '(An empty local stand-in mirroring the remote path; the remote filesystem stays the source of truth. ' +
+              'All rw_* file paths are confined to the workspace root.)' +
+              shadowed,
           }
         } catch (err) {
           throw toToolError(err)
@@ -787,7 +853,10 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         try {
           if (args.command.trim() === '') throw new RwError('INVALID_INPUT', 'command must not be empty')
           const entry = requireEntry(deps, exec)
-          const cwd = session.workspace ?? undefined
+          // The cwd follows the SAME target as the host (working directory
+          // placeholder first, then this session's record).
+          const target = activeWorkspace(deps, exec)
+          const cwd = target !== null && target.kind === 'ok' ? target.workspace : undefined
           const timeoutMs = args.timeoutMs ?? config.commandTimeoutMs
           const res = await pool.exec(entry, args.command, { cwd, timeoutMs })
           return { text: renderExecResult(args.command, cwd, res, timeoutMs) }
@@ -842,11 +911,15 @@ export function makeTools(deps: ToolsDeps): unknown[] {
           if (hasCalls && hasFanout) {
             throw new RwError('INVALID_INPUT', 'give either `calls` or `command` + `hosts`, not both')
           }
+          // The current host and its workspace, resolved like rw_exec's.
+          const current = activeWorkspace(deps, exec)
+          const currentAlias = current === null ? null : current.kind === 'broken' ? null : current.entry.alias
+          const currentWorkspace = current !== null && current.kind === 'ok' ? current.workspace : undefined
           let calls: ExecManyCall[]
           if (callsArg !== undefined) {
             if (callsArg.length === 0) throw new RwError('INVALID_INPUT', 'calls must not be empty')
             calls = callsArg.map((call, index) => {
-              const alias = call.alias ?? session.alias
+              const alias = call.alias ?? currentAlias
               if (alias === null) {
                 throw new RwError(
                   'NOT_CONNECTED',
@@ -889,7 +962,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
             // Same rule as rw_exec: the workspace cwd only applies to the host
             // that owns it; every other host starts in its SSH default dir
             // unless the call names one.
-            const cwd = call.cwd ?? (call.alias === session.alias ? (session.workspace ?? undefined) : undefined)
+            const cwd = call.cwd ?? (call.alias === currentAlias ? currentWorkspace : undefined)
             const timeoutMs = call.timeoutMs ?? config.commandTimeoutMs
             const base: ExecManyCall = { ...call, ...(cwd !== undefined ? { cwd } : {}) }
             try {
@@ -1119,10 +1192,11 @@ export function makeTools(deps: ToolsDeps): unknown[] {
       output: { schema: TEXT_OUTPUT_SCHEMA, render: (_args, value) => text(value) },
       async execute(_args, exec) {
         try {
-          const alias = session.alias
+          const keys = keysOf(exec)
+          const alias = session.get(keys).alias
           if (alias === null) return { text: 'not connected — nothing to disconnect' }
           pool.disconnect(alias)
-          session.set({ alias: null })
+          session.set(keys, { alias: null })
           return { text: `disconnected from ${alias}` }
         } catch (err) {
           throw toToolError(err)

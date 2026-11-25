@@ -12,6 +12,12 @@ describe('RwError', () => {
     expect(err.message).toBe('gone')
     expect(err.cause).toBe(cause)
   })
+
+  it('carries the placeholder-root safety code', () => {
+    const err = new RwError('UNSAFE_PLACEHOLDER_ROOT', 'root is a symlink')
+    expect(err.code).toBe('UNSAFE_PLACEHOLDER_ROOT')
+    expect(toRwError(err)).toBe(err)
+  })
 })
 
 describe('mapConnectError', () => {

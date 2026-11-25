@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis';
 import z from 'schemastery';
-import { Session } from './session.js';
+import { SessionStore } from './session.js';
 import type { HostTableLike, PoolLike } from './tools.js';
 export declare const name = "dsh-rw";
 export declare const inject: string[];
@@ -43,6 +43,20 @@ export declare const Config: z<Schemastery.ObjectS<{
     jobPollMs: z<number, number>;
     /** Remote directory holding background-job logs (default /tmp). */
     jobDir: z<string, string>;
+    /**
+     * Local directory holding the placeholder directories (one mirror tree per
+     * host). Empty = the default: /Users/Shared/dsh-rw-<user> on macOS (outside
+     * ~, so each host is a top-level node in DSH's workspace tree), else
+     * ~/.dsh/rw-workspaces. Must be a real directory owned by you; it is kept 0700.
+     */
+    placeholderRoot: z<string, string>;
+    /**
+     * Main directory of every host that has none of its own (set per host in the
+     * picker). The picker opens a host there, and the workspace picked there is
+     * titled by the bare host alias, i.e. it is the host's node in the sidebar.
+     * Empty = none (the picker opens the remote home).
+     */
+    defaultMainDir: z<string, string>;
 }>, Schemastery.ObjectT<{
     /** Host key policy: verify against ~/.ssh/known_hosts (accept-new learns on first connect). */
     hostKeyPolicy: z<string, string>;
@@ -80,6 +94,20 @@ export declare const Config: z<Schemastery.ObjectS<{
     jobPollMs: z<number, number>;
     /** Remote directory holding background-job logs (default /tmp). */
     jobDir: z<string, string>;
+    /**
+     * Local directory holding the placeholder directories (one mirror tree per
+     * host). Empty = the default: /Users/Shared/dsh-rw-<user> on macOS (outside
+     * ~, so each host is a top-level node in DSH's workspace tree), else
+     * ~/.dsh/rw-workspaces. Must be a real directory owned by you; it is kept 0700.
+     */
+    placeholderRoot: z<string, string>;
+    /**
+     * Main directory of every host that has none of its own (set per host in the
+     * picker). The picker opens a host there, and the workspace picked there is
+     * titled by the bare host alias, i.e. it is the host's node in the sidebar.
+     * Empty = none (the picker opens the remote home).
+     */
+    defaultMainDir: z<string, string>;
 }>>;
 export interface Config {
     hostKeyPolicy: HostKeyPolicy;
@@ -100,6 +128,10 @@ export interface Config {
     backgroundJobs?: boolean;
     jobPollMs?: number;
     jobDir?: string;
+    /** Placeholder root ('' or absent = the platform default). */
+    placeholderRoot?: string;
+    /** Main directory of hosts without their own (absent = '/'; '' = none). */
+    defaultMainDir?: string;
 }
 /**
  * Test seams for apply(): the DSH loader calls apply(ctx, config); tests pass
@@ -108,7 +140,11 @@ export interface Config {
 export interface ApplyOverrides {
     hosts?: HostTableLike;
     pool?: PoolLike;
-    session?: Session;
+    /** Per-session record store (tests inject one over a tmp file). */
+    session?: SessionStore;
+    /** Mirror-layout placeholder root (wins over config.placeholderRoot). */
+    placeholderRoot?: string;
+    /** Legacy (≤ 1.6) placeholder base, searched by lookups only. */
     placeholderBaseDir?: string;
     pickDirectory?: () => Promise<string | null>;
 }

@@ -10,18 +10,43 @@
 import { readdirSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, posix, resolve } from 'node:path'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { mapSftpError, RwError, toRwError } from './errors.js'
 import type { RwErrorCode } from './errors.js'
 import { normalizeRemote, expandRemoteHome } from './guard.js'
 import type { HostEntry } from './hosts.js'
-import { resolvePlaceholderDir } from './placeholder.js'
-import { resolveWorkspaceDir } from './tools.js'
+import { resolveRemoteDir, resolveWorkspaceDir } from './tools.js'
 import type { ToolsDeps } from './tools.js'
 
 /** Re-exported so index.ts builds routes without importing dsh-host-webserver. */
 export type Route = WebRoute
+
+/**
+ * The slice of DSH's workspace registry (`ctx.get('workspaceRegistry')`) the
+ * picker uses. `create` realpaths the path, returns the existing record for a
+ * known canonical path WITHOUT changing its title, and puts a new record first.
+ */
+export interface WorkspaceRegistryLike {
+  create(path: string, title?: string): Promise<unknown>
+}
+
+/** The slice of a registered DSH Workspace the picker reads back (title migration). */
+interface RegisteredWorkspaceLike {
+  title?: unknown
+  setTitle?(title: string): Promise<void>
+}
+
+/**
+ * The host's main directory: its own setting, else the plugin-wide default
+ * (`defaultMainDir`, '/'; '' disables it). Normalized, or undefined.
+ */
+export function effectiveMainDir(deps: Pick<RoutesDeps, 'hosts' | 'defaultMainDir'>, alias: string): string | undefined {
+  const own = deps.hosts.mainDir?.(alias)
+  if (own !== undefined && own !== '') return normalizeRemote(own)
+  const fallback = deps.defaultMainDir
+  return fallback !== undefined && fallback !== '' ? normalizeRemote(fallback) : undefined
+}
 
 export interface RoutesDeps extends ToolsDeps {
   /**
@@ -29,6 +54,12 @@ export interface RoutesDeps extends ToolsDeps {
    * service by index.ts). Absent → /local-pick answers 400.
    */
   pickDirectory?: () => Promise<string | null>
+  /**
+   * DSH's workspace registry, resolved per call (index.ts:
+   * `() => ctx.get('workspaceRegistry')`). Absent → /workspace still creates
+   * the placeholder but answers `registered: false`.
+   */
+  workspaceRegistry?: () => WorkspaceRegistryLike | undefined
 }
 
 /** Cap on JSON request bodies (host entries and workspace payloads are small). */
@@ -130,6 +161,9 @@ function statusFor(code: RwErrorCode): number {
     case 'NOT_CONNECTED':
     case 'NO_WORKSPACE':
       return 409
+    case 'UNSAFE_PLACEHOLDER_ROOT':
+      // A local configuration problem the user must fix; not the request's fault.
+      return 500
     default:
       return 500
   }
@@ -167,18 +201,15 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
       path: '/api/dsh-rw/status',
       handler: (req, res) => {
         if (!guard(req, res, 'GET')) return
-        const alias = session.alias
-        const workspace = session.workspace
         writeJson(res, 200, {
           hosts: hosts.summaries(),
           // Hidden ssh-config aliases: the picker offers a "show all" restore.
           hiddenAliases: hosts.hiddenAliases?.() ?? [],
-          current: {
-            alias,
-            workspace,
-            placeholderDir: alias !== null && workspace !== null ? resolvePlaceholderDir(alias, workspace, deps.placeholderBaseDir) : null,
-            connected: alias !== null && pool.connected().includes(alias),
-          },
+          // 2.0: connections are per DSH session, so there is no global
+          // "current" workspace any more — only the host the picker used last.
+          current: { alias: session.lastAlias },
+          // Where a host without its own main directory lands ('' = remote home).
+          defaultMainDir: deps.defaultMainDir ?? '',
         })
       },
     },
@@ -288,7 +319,8 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           }
           hosts.removeManual(alias)
           pool.disconnect(alias)
-          if (session.alias === alias) session.set({ alias: null, workspace: null })
+          // Every session that was connected to it loses the connection record.
+          session.forgetAlias(alias)
           writeJson(res, 200, { ok: true })
           return
         }
@@ -521,6 +553,47 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
       },
     },
 
+    // --------------------------------------- POST /api/dsh-rw/hosts/main
+    {
+      kind: 'exact',
+      path: '/api/dsh-rw/hosts/main',
+      handler: async (req, res) => {
+        if (!guard(req, res, 'POST')) return
+        const body = await readJsonBody(req)
+        if (body === undefined) {
+          writeJson(res, 400, { error: 'invalid JSON body', code: 'INVALID_INPUT' })
+          return
+        }
+        const alias = typeof body.alias === 'string' ? body.alias : ''
+        if (alias === '') {
+          writeJson(res, 400, { error: 'alias is required', code: 'INVALID_INPUT' })
+          return
+        }
+        if (!('path' in body) || (body.path !== null && typeof body.path !== 'string') || body.path === '') {
+          writeJson(res, 400, { error: 'path must be a remote directory path or null', code: 'INVALID_INPUT' })
+          return
+        }
+        const entry = hosts.find(alias)
+        if (!entry) {
+          writeJson(res, 404, { error: `unknown host alias: ${JSON.stringify(alias)}`, code: 'INVALID_INPUT' })
+          return
+        }
+        if (hosts.setMainDir === undefined) {
+          writeJson(res, 501, { error: 'this host table cannot store a main directory', code: 'INVALID_INPUT' })
+          return
+        }
+        try {
+          // Same resolution as a workspace pick: ~ expansion, realpath, must
+          // be a directory. The canonical path is what gets stored.
+          const main = body.path === null ? null : await resolveRemoteDir(deps, entry, body.path as string)
+          hosts.setMainDir(alias, main)
+          writeJson(res, 200, { ok: true, host: hosts.summarize(entry) })
+        } catch (err) {
+          writeError(res, err)
+        }
+      },
+    },
+
     // -------------------------------------------- POST /api/dsh-rw/workspace
     {
       kind: 'exact',
@@ -534,16 +607,72 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           writeJson(res, 400, { ok: false, error: 'alias and path are required', code: 'INVALID_INPUT' })
           return
         }
-        // Optional display name for a fresh placeholder (blank trims to absent).
+        // Optional display title for the registered workspace (blank trims to absent).
         const name = typeof body?.name === 'string' && body.name.trim() !== '' ? body.name.trim() : undefined
+        let workspace: string
+        let placeholderDir: string
         try {
-          const { workspace, placeholderDir } = await resolveWorkspaceDir(deps, alias, path, name)
-          session.set({ alias, workspace })
-          writeJson(res, 200, { ok: true, workspace, placeholderDir })
+          ;({ workspace, placeholderDir } = await resolveWorkspaceDir(deps, alias, path))
         } catch (err) {
           const e = toRwError(err)
           writeJson(res, statusFor(e.code), { ok: false, error: e.message, code: e.code })
+          return
         }
+        // Register only the picked directory. Its mirror position, not its
+        // display name, makes DSH nest it under the closest registered remote
+        // ancestor. The main workspace (and remote '/') keeps the host alias;
+        // ordinary projects use the canonical POSIX basename on every platform.
+        // Never register a remote root as a side effect just to create a group:
+        // that would either widen the remote scope or introduce a local-only
+        // workspace pointing at an empty placeholder.
+        // On re-pick, migrate only the old automatic `alias · path` title.
+        // Preserve custom titles unless the user explicitly supplies a new one.
+        // Registration remains best effort: a failure never fails the pick.
+        let main = effectiveMainDir(deps, alias)
+        if (main !== undefined && main !== workspace) {
+          // A configured default may itself be a symlink. Compare canonical
+          // paths, just like the selected workspace, without letting a missing
+          // main directory prevent the user from picking another valid project.
+          const entry = hosts.find(alias)
+          try {
+            main = entry === undefined ? undefined : await resolveRemoteDir(deps, entry, main)
+          } catch {
+            main = undefined
+          }
+        }
+        const isMain = main !== undefined && main === workspace
+        const legacyAutoTitle = `${alias} · ${workspace}`
+        const defaultTitle = isMain || workspace === '/' ? alias : posix.basename(workspace)
+        let title = name ?? defaultTitle
+        let registered = false
+        try {
+          const registry = deps.workspaceRegistry?.()
+          if (registry !== undefined && registry !== null && typeof registry.create === 'function') {
+            const created = (await registry.create(placeholderDir, title)) as RegisteredWorkspaceLike | null | undefined
+            if (created !== null && typeof created === 'object' && typeof created.title === 'string') {
+              if (
+                typeof created.setTitle === 'function' &&
+                created.title !== title &&
+                (name !== undefined || created.title === legacyAutoTitle)
+              ) {
+                await created.setTitle(title)
+              } else {
+                // create() does not rename an existing record. Return the title
+                // actually kept by DSH, not the unused automatic suggestion.
+                title = created.title
+              }
+            }
+            registered = true
+          }
+        } catch (err) {
+          console.warn(
+            `[dsh-rw] could not register ${placeholderDir} as a DSH workspace: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
+        // No session record is written here: the picker is not a session. It
+        // only remembers which host it used last.
+        session.setLastAlias(alias)
+        writeJson(res, 200, { ok: true, workspace, placeholderDir, title, registered })
       },
     },
 

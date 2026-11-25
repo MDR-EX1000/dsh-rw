@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createHash } from 'node:crypto'
 import { RwError } from '../src/errors.js'
 import { ensurePlaceholder, readPlaceholderMeta } from '../src/placeholder.js'
+import { createNativeRouting } from '../src/shim.js'
 import { makeTools, statusText } from '../src/tools.js'
 import type { PoolLike } from '../src/tools.js'
 import type { ExecResult, SftpLike } from '../src/ssh-pool.js'
@@ -147,35 +148,41 @@ describe('rw_info / rw_hosts', () => {
 
   it('rw_info reports host, workspace, placeholder dir when fully picked', async () => {
     harness.connect()
-    const placeholderDir = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    const placeholderDir = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', { root: `${dir}/rw-root`, legacyBaseDir: `${dir}/placeholders` })
     const { text } = await tool('rw_info').execute({})
     expect(text).toContain('deploy@example.com:22 (alias: prod)')
     expect(text).toContain('Connected: yes')
     expect(text).toContain('Current workspace: /srv/app')
     expect(text).toContain(placeholderDir)
-    expect(text).toContain(join('placeholders', 'prod', 'app'))
+    expect(text).toContain(join('rw-root', 'prod', 'srv', 'app'))
     expect(text).not.toContain(SECRET_PASSWORD)
   })
 
-  it('rw_info reports where the native tools actually go, from the observed routing', async () => {
+  it('rw_info reports where the native tools actually go, from this session\'s observed routing', async () => {
     harness.connect()
-    ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', { root: `${dir}/rw-root`, legacyBaseDir: `${dir}/placeholders` })
     const deps = { ...harness.deps, shimEnabled: () => true }
 
     // Nothing dispatched yet: no claim either way, plus the rw_* fallback.
     expect(statusText(deps)).toContain('Native tools: not observed yet')
 
-    const remote = statusText({ ...deps, routing: { mode: 'remote', placeholder: '/p/prod/app' } })
+    const remoteTable = createNativeRouting()
+    remoteTable.set('', { mode: 'remote', placeholder: '/p/prod/app' })
+    const remote = statusText({ ...deps, routing: remoteTable })
     expect(remote).toContain('Native tools: remote')
     expect(remote).toContain('/p/prod/app')
 
-    const local = statusText({
-      ...deps,
-      routing: { mode: 'local', cwd: '/Users/me/project', placeholder: '/p/prod/app' },
-    })
+    const localTable = createNativeRouting()
+    localTable.set('', { mode: 'local', cwd: '/Users/me/project', placeholder: '/p/prod/app' })
+    const local = statusText({ ...deps, routing: localTable })
     expect(local).toContain('Native tools: LOCAL')
     expect(local).toContain('/Users/me/project')
     expect(local).toContain('use rw_* for the remote')
+
+    // Another session's observation is not this session's.
+    const otherTable = createNativeRouting()
+    otherTable.set('someone-else', { mode: 'local', cwd: '/Users/me/project' })
+    expect(statusText({ ...deps, routing: otherTable })).toContain('Native tools: not observed yet')
 
     expect(statusText({ ...deps, shimEnabled: () => false })).toContain('Native tools: shim off')
   })
@@ -231,7 +238,7 @@ describe('rw_pick_workspace', () => {
     const { text } = await tool('rw_pick_workspace').execute({ path: '/srv/link/' })
     expect(harness.session.workspace).toBe('/srv/app')
     expect(text).toContain('Remote workspace set to /srv/app on prod')
-    const placeholderDir = join(`${dir}/placeholders`, 'prod', 'app')
+    const placeholderDir = join(`${dir}/rw-root`, 'prod', 'srv', 'app')
     expect(text).toContain(placeholderDir)
     const meta = readPlaceholderMeta(placeholderDir)
     expect(meta).toMatchObject({ plugin: 'dsh-rw', alias: 'prod', remotePath: '/srv/app' })
@@ -687,7 +694,7 @@ describe('workspace resolution follows the session working directory', () => {
 
   it('uses the placeholder the agent works in, even when the session record points elsewhere', async () => {
     harness.connect() // record: prod:/srv/app
-    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', { root: `${dir}/rw-root`, legacyBaseDir: `${dir}/placeholders` })
     harness.pool.fs.addFile('/srv/app/from-cwd.txt', 'cwd wins\n')
     // The record now names another host entirely (what a reconnect leaves behind).
     harness.session.set({ alias: 'dev', workspace: '/srv/other' })
@@ -699,18 +706,103 @@ describe('workspace resolution follows the session working directory', () => {
 
   it('reports where the workspace came from', async () => {
     harness.connect()
-    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', { root: `${dir}/rw-root`, legacyBaseDir: `${dir}/placeholders` })
     const fromCwd = await tool('rw_info').execute({}, ctxAt(root))
     expect(fromCwd.text).toContain("from this session's working directory")
     const fromRecord = await tool('rw_info').execute({}, ctxAt('/elsewhere'))
-    expect(fromRecord.text).toContain('from the plugin session record')
+    expect(fromRecord.text).toContain("from this session's dsh-rw record")
   })
 
   it('fails loud when the working directory belongs to a host that is gone (never the record)', async () => {
     harness.connect()
-    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    const root = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', { root: `${dir}/rw-root`, legacyBaseDir: `${dir}/placeholders` })
     harness.hosts.entries.length = 0 // the host was removed from the config
     await expectToolError(tool('rw_read_file').execute({ path: 'x' }, ctxAt(root)), 'NOT_CONNECTED')
     expect(harness.pool.execCalls).toEqual([])
+  })
+})
+
+describe('per-session records (2.0)', () => {
+  /** A tool-execution context for one DSH session. */
+  const as = (header: { id?: string; cwd?: string; parentSession?: string }) => ({ agent: { session: { header } } })
+  const loc = () => ({ root: `${dir}/rw-root`, legacyBaseDir: `${dir}/placeholders` })
+
+  it('rw_connect / rw_pick_workspace / rw_disconnect only touch the calling session', async () => {
+    harness.pool.fs.addDir('/data')
+    await tool('rw_connect').execute({ alias: 'prod' }, as({ id: 'A', cwd: dir }))
+    await tool('rw_pick_workspace').execute({ path: '/srv/app' }, as({ id: 'A', cwd: dir }))
+    await tool('rw_connect').execute({ alias: 'dev' }, as({ id: 'B', cwd: dir }))
+    await tool('rw_pick_workspace').execute({ path: '/data' }, as({ id: 'B', cwd: dir }))
+    expect(harness.sessions.get('A')).toEqual({ alias: 'prod', workspace: '/srv/app' })
+    expect(harness.sessions.get('B')).toEqual({ alias: 'dev', workspace: '/data' })
+    expect(harness.sessions.get('')).toEqual({ alias: null, workspace: null })
+
+    const a = await tool('rw_info').execute({}, as({ id: 'A', cwd: dir }))
+    expect(a.text).toContain('alias: prod')
+    expect(a.text).toContain('Current workspace: /srv/app')
+    const b = await tool('rw_info').execute({}, as({ id: 'B', cwd: dir }))
+    expect(b.text).toContain('alias: dev')
+    expect(b.text).toContain('Current workspace: /data')
+
+    await tool('rw_disconnect').execute({}, as({ id: 'A', cwd: dir }))
+    expect(harness.sessions.get('A').alias).toBeNull()
+    expect(harness.sessions.get('B').alias).toBe('dev')
+  })
+
+  it('rw_exec and file tools use the calling session record; a subagent inherits its parent', async () => {
+    harness.sessions.set('parent', { alias: 'prod', workspace: '/srv/app' })
+    const child = as({ id: 'child', parentSession: 'parent', cwd: dir })
+    const { text } = await tool('rw_read_file').execute({ path: 'README.md' }, child)
+    expect(text).toContain('line1')
+    await tool('rw_exec').execute({ command: 'pwd' }, child)
+    expect(harness.pool.execCalls[0]).toMatchObject({ alias: 'prod', opts: { cwd: '/srv/app' } })
+    const info = await tool('rw_info').execute({}, child)
+    expect(info.text).toContain("inherited from the parent session's dsh-rw record")
+
+    // A child's own connect writes its own record and leaves the parent alone.
+    await tool('rw_connect').execute({ alias: 'dev' }, child)
+    expect(harness.sessions.record('child')).toMatchObject({ alias: 'dev', workspace: null })
+    expect(harness.sessions.get('parent')).toEqual({ alias: 'prod', workspace: '/srv/app' })
+
+    // Unrelated sessions see nothing.
+    await expectToolError(tool('rw_exec').execute({ command: 'pwd' }, as({ id: 'other', cwd: dir })), 'NOT_CONNECTED')
+  })
+
+  it('rw_exec / rw_exec_many default to the working-directory workspace over the record', async () => {
+    harness.pool.fs.addDir('/data')
+    const data = ensurePlaceholder('prod', ENTRY_PROD, '/data', loc())
+    harness.sessions.set('S', { alias: 'prod', workspace: '/srv/app' })
+    await tool('rw_exec').execute({ command: 'pwd' }, as({ id: 'S', cwd: data }))
+    expect(harness.pool.execCalls[0]?.opts?.cwd).toBe('/data')
+    await tool('rw_exec_many').execute({ calls: [{ command: 'pwd' }] }, as({ id: 'S', cwd: data }))
+    expect(harness.pool.execCalls[1]).toMatchObject({ alias: 'prod', opts: { cwd: '/data' } })
+  })
+
+  it('rw_pick_workspace creates the mirror placeholder (no remote "/" meta) but registers nothing', async () => {
+    harness.sessions.set('S', { alias: 'prod', workspace: null })
+    const { text } = await tool('rw_pick_workspace').execute({ path: '/srv/app' }, as({ id: 'S', cwd: dir }))
+    const placeholderDir = join(`${dir}/rw-root`, 'prod', 'srv', 'app')
+    expect(text).toContain(placeholderDir)
+    expect(readPlaceholderMeta(placeholderDir)).toMatchObject({ alias: 'prod', remotePath: '/srv/app' })
+    expect(readPlaceholderMeta(join(`${dir}/rw-root`, 'prod'))).toBeNull()
+    // makeTools has no registry dependency at all: the sidebar is the picker's business.
+    expect('workspaceRegistry' in harness.deps).toBe(false)
+  })
+
+  it('rw_pick_workspace inside a placeholder without a record picks on that host', async () => {
+    const hostRoot = ensurePlaceholder('prod', ENTRY_PROD, '/', loc())
+    const { text } = await tool('rw_pick_workspace').execute({ path: '/srv/app' }, as({ id: 'fresh', cwd: hostRoot }))
+    expect(text).toContain('Remote workspace set to /srv/app on prod')
+    expect(text).toContain('keeps taking precedence')
+    expect(harness.sessions.get('fresh')).toEqual({ alias: 'prod', workspace: '/srv/app' })
+  })
+
+  it("rw_info shows the current host's main directory", async () => {
+    harness.hosts.setMainDir('prod', '/srv/app')
+    harness.sessions.set('S', { alias: 'prod', workspace: '/srv/app' })
+    const { text } = await tool('rw_info').execute({}, as({ id: 'S', cwd: dir }))
+    expect(text).toContain('Main directory of prod: /srv/app')
+    const other = await tool('rw_info').execute({}, as({ id: 'T', cwd: dir }))
+    expect(other.text).not.toContain('Main directory')
   })
 })

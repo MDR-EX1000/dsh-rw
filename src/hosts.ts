@@ -11,6 +11,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, w
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { RwError } from './errors.js'
+import { normalizeRemote } from './guard.js'
 
 export interface HostEntry {
   alias: string
@@ -39,6 +40,11 @@ export interface HostSummary {
    */
   keyPath?: string
   source: 'ssh-config' | 'manual'
+  /**
+   * The host's main remote directory — the workspace the picker opens by
+   * default for this host. Absent when none is set.
+   */
+  mainDir?: string
 }
 
 const ALIAS_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/
@@ -173,6 +179,11 @@ interface StoreFile {
    * someone else's file.
    */
   hidden?: string[]
+  /**
+   * Main remote directory per alias (any source). Added in 2.0 without a
+   * version bump: older files simply lack it, and 1.6 ignores it.
+   */
+  mains?: Record<string, string>
 }
 
 /**
@@ -201,6 +212,7 @@ export class HostTable {
   private readonly sshConfigExclude: readonly string[]
   private manual: HostEntry[]
   private hidden: Set<string>
+  private mains: Map<string, string>
   private sshCache: { mtimeMs: number; entries: HostEntry[] } | undefined
 
   constructor(opts?: {
@@ -216,6 +228,7 @@ export class HostTable {
     const stored = this.loadStore()
     this.manual = stored.hosts
     this.hidden = new Set(stored.hidden)
+    this.mains = new Map(Object.entries(stored.mains))
   }
 
   /** All entries; manual entries shadow ssh-config entries with the same alias. */
@@ -239,7 +252,30 @@ export class HostTable {
       passwordSet: entry.auth.kind === 'password' && !!entry.auth.password,
       ...(entry.auth.kind === 'key' ? { keyPath: entry.auth.keyPath } : {}),
       source: entry.source,
+      ...(this.mains.has(entry.alias) ? { mainDir: this.mains.get(entry.alias) } : {}),
     }
+  }
+
+  /** The host's main remote directory, if one is set. */
+  mainDir(alias: string): string | undefined {
+    return this.mains.get(alias)
+  }
+
+  /**
+   * Set the host's main remote directory (an absolute remote path — callers
+   * canonicalize it first), or clear it with null. The alias must be listed.
+   */
+  setMainDir(alias: string, path: string | null): void {
+    if (path === null) {
+      if (this.mains.delete(alias)) this.saveStore()
+      return
+    }
+    if (this.find(alias) === undefined) throw new RwError('INVALID_INPUT', `unknown host alias: ${JSON.stringify(alias)}`)
+    if (!path.startsWith('/')) throw new RwError('INVALID_INPUT', `main directory must be an absolute remote path: ${JSON.stringify(path)}`)
+    const normalized = normalizeRemote(path)
+    if (this.mains.get(alias) === normalized) return
+    this.mains.set(alias, normalized)
+    this.saveStore()
   }
 
   summaries(): HostSummary[] {
@@ -379,10 +415,12 @@ export class HostTable {
     return [...this.hidden].sort()
   }
 
+  /** Delete a manual host — and its main directory with it. */
   removeManual(alias: string): void {
     const next = this.manual.filter((e) => e.alias !== alias)
     if (next.length !== this.manual.length) {
       this.manual = next
+      this.mains.delete(alias)
       this.saveStore()
     }
   }
@@ -408,18 +446,24 @@ export class HostTable {
     return filtered
   }
 
-  private loadStore(): { hosts: HostEntry[]; hidden: string[] } {
+  private loadStore(): { hosts: HostEntry[]; hidden: string[]; mains: Record<string, string> } {
     let raw: string
     try {
       raw = readFileSync(this.storePath, 'utf8')
     } catch {
-      return { hosts: [], hidden: [] }
+      return { hosts: [], hidden: [], mains: {} }
     }
     try {
       const data = JSON.parse(raw) as StoreFile
       if (data?.version !== 1 || !Array.isArray(data.hosts)) throw new Error('bad shape')
       const hidden = Array.isArray(data.hidden) ? data.hidden.filter((a): a is string => typeof a === 'string') : []
-      return { hosts: data.hosts.map((h) => ({ ...h, source: 'manual' as const })), hidden }
+      const mains: Record<string, string> = {}
+      if (data.mains !== null && typeof data.mains === 'object' && !Array.isArray(data.mains)) {
+        for (const [alias, path] of Object.entries(data.mains as Record<string, unknown>)) {
+          if (typeof path === 'string' && path.startsWith('/')) mains[alias] = normalizeRemote(path)
+        }
+      }
+      return { hosts: data.hosts.map((h) => ({ ...h, source: 'manual' as const })), hidden, mains }
     } catch {
       // Never overwrite a corrupt store: move it aside for manual inspection.
       try {
@@ -427,7 +471,7 @@ export class HostTable {
       } catch {
         // best effort; an unmoved corrupt file is still not loaded
       }
-      return { hosts: [], hidden: [] }
+      return { hosts: [], hidden: [], mains: {} }
     }
   }
 
@@ -440,6 +484,7 @@ export class HostTable {
       version: 1,
       hosts: this.manual.map(({ alias, host, port, user, auth }) => ({ alias, host, port, user, auth })),
       ...(this.hidden.size > 0 ? { hidden: [...this.hidden].sort() } : {}),
+      ...(this.mains.size > 0 ? { mains: Object.fromEntries([...this.mains].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) } : {}),
     }
     const tmp = `${this.storePath}.tmp-${process.pid}`
     writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })

@@ -8,14 +8,21 @@
 // carries a 「← 返回」 back to the cards:
 //   • 本机 → 手动输入本机路径，或经 POST /api/dsh-rw/local-pick 调起系统
 //     文件夹选择器，结果直接 onPicked(localPath)。
-//   • 远程 → 主机用下拉选择（选项只显示别名；来自 ~/.ssh/config + 手动条目）；
-//     路径默认落在远端 home（~/，服务端经 realpath('.') 扩展），输入框下方是
-//     行内目录列表（Codex「New remote project」式）：列表实时跟随输入
-//     内容（对父目录做 ls + 前缀过滤，防抖 ~220ms），点行下钻、↑ 回上一级；
-//     可选「工作区名称」命名本地占位目录（留空用路径 basename，
-//     仅重名冲突时服务端才追加哈希后缀）。确认后 POST /api/dsh-rw/workspace
-//     拿到本地占位目录 → onPicked(placeholderDir)，交给 DSH 原生流程登记为
-//     workspace。「+ 添加主机」跳到 modal 内独立子页（带返回）：测试连接走
+//   • 远程 → 主机列表（每行一台：来自 ~/.ssh/config + 手动条目）。选中主机后
+//     路径落在该主机的「主目录」（HostSummary.mainDir，服务端已 realpath），
+//     没有主目录时落在远端 home（~/，服务端经 realpath('.') 扩展）。输入框
+//     下方是行内目录列表（Codex「New remote project」式）：列表实时跟随输入
+//     内容（对父目录做 ls + 前缀过滤，防抖 ~220ms），点行下钻、↑ 回上一级。
+//     主机行可「设为主目录」（把当前路径输入框的路径设为该主机主目录，仅对
+//     选中的主机）或「取消主目录」，都走 POST /api/dsh-rw/hosts/main；有主
+//     目录时底部多一个「打开主工作区」一步直达。
+//     可选「侧边栏标题」只决定 DSH 侧边栏里显示的名称：普通项目留空时用
+//     远端目录末级名称，主工作区或远端 / 用主机别名；自定义标题优先。
+//     本地占位目录按远端路径镜像存放（<占位根>/<别名>/<远端绝对路径>），
+//     与标题无关。确认后 POST /api/dsh-rw/workspace：服务端只登记所选目录
+//     为 DSH 工作区（不自动登记主机根），再返回本地占位目录 →
+//     onPicked(placeholderDir)，交给 DSH 原生流程采用。
+//     「+ 添加主机」跳到 modal 内独立子页（带返回）：测试连接走
 //     POST /test 完整字段形式（临时探测不入库），保存走 POST /hosts；手动
 //     条目带「手动」标注，选中后可在远程页删除。密码只提交不展示。
 //
@@ -24,7 +31,7 @@
 // react/jsx-runtime are provided by the DSH runtime (esbuild externals), never
 // bundled. All traffic goes to the loopback-only /api/dsh-rw/* routes; host
 // payloads come from HostTable.summarize and never contain secrets.
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent } from 'react'
 import { en, zh, type Translate } from './locales.js'
 
 export const name = 'dsh-rw'
@@ -43,6 +50,8 @@ interface HostSummary {
   /** key auth: the configured private-key path (a path, not a secret). */
   keyPath?: string
   source: 'ssh-config' | 'manual'
+  /** The host's main workspace directory (absolute remote path, already realpath'd). */
+  mainDir?: string
 }
 
 /** Last probe outcome of one host, kept in the modal's memory only. */
@@ -62,7 +71,10 @@ interface StatusResponse {
   hosts?: HostSummary[]
   /** ssh-config aliases hidden from the list (restorable). */
   hiddenAliases?: string[]
+  /** The host this picker used last — a UI preference, not any session's state. */
   current?: { alias?: string | null } | null
+  /** Main directory of hosts without their own ('' = none, open the remote home). */
+  defaultMainDir?: string
 }
 
 interface LsResponse {
@@ -90,8 +102,22 @@ interface LocalPickResponse {
 
 interface WorkspaceResponse {
   ok?: boolean
+  /** The canonical remote directory. */
+  workspace?: string
   placeholderDir?: string
+  /** Registered sidebar title: canonical basename, host alias for main/root, or the custom name. */
+  title?: string
+  /** Whether the server could register the DSH workspace itself. */
+  registered?: boolean
   error?: string
+}
+
+/** POST /api/dsh-rw/hosts/main result. */
+interface MainDirResponse {
+  ok?: boolean
+  host?: HostSummary
+  error?: string
+  code?: string
 }
 
 /** POST /api/dsh-rw/test probe result (probe failures are 200s with ok:false). */
@@ -165,6 +191,56 @@ function hostProblem(h: HostSummary, t: Translate): string | null {
   return h.passwordSet ? null : t('passwordNotSet')
 }
 
+/** Remote home: the server expands it through realpath('.'). */
+const REMOTE_HOME = '~/'
+
+/** The host's main workspace directory, or '' when none is set. */
+export function mainDirOf(host: Pick<HostSummary, 'mainDir'> | undefined | null): string {
+  const dir = host?.mainDir
+  return typeof dir === 'string' && dir.trim() !== '' ? dir : ''
+}
+
+/**
+ * The directory that acts as the host's main workspace: its own setting, else
+ * the plugin-wide default (`defaultMainDir`, '/' unless configured), else ''.
+ */
+export function effectiveMainDirOf(host: Pick<HostSummary, 'mainDir'> | undefined | null, defaultMain?: string): string {
+  const own = mainDirOf(host)
+  if (own !== '') return own
+  return typeof defaultMain === 'string' && defaultMain.trim() !== '' ? defaultMain.trim() : ''
+}
+
+/**
+ * Where the remote path lands when a host gets selected: its main directory
+ * (own or default) when there is one, the remote home otherwise.
+ */
+export function hostStartPath(host: Pick<HostSummary, 'mainDir'> | undefined | null, defaultMain?: string): string {
+  return effectiveMainDirOf(host, defaultMain) || REMOTE_HOME
+}
+
+/** Compare remote paths the way the operator reads them: trailing slashes do not matter. */
+function samePath(a: string, b: string): boolean {
+  const norm = (p: string) => (p.length > 1 ? p.replace(/\/+$/, '') : p)
+  return norm(a.trim()) === norm(b.trim())
+}
+
+/**
+ * Which main-directory actions a host row offers. "Set" takes the path in the
+ * remote path input, so it exists only on the selected host and only when that
+ * path is non-empty and differs from the current main directory; "clear"
+ * exists whenever the host has a main directory.
+ */
+export function mainDirActions(
+  host: Pick<HostSummary, 'alias' | 'mainDir'>,
+  selectedAlias: string,
+  inputPath: string,
+): { canSet: boolean; canClear: boolean } {
+  const main = mainDirOf(host)
+  const typed = String(inputPath || '').trim()
+  const canSet = host.alias === selectedAlias && typed !== '' && (main === '' || !samePath(typed, main))
+  return { canSet, canClear: main !== '' }
+}
+
 /** Tiny pill for one host attribute (provenance, credential readiness). */
 function Pill(props: { tone?: 'ok' | 'warn'; children: unknown }) {
   const color = props.tone === 'ok' ? T.ok : props.tone === 'warn' ? T.danger : T.muted
@@ -236,11 +312,20 @@ function HostCard(props: {
   onEdit?: () => void
   onRemove?: () => void
   onHide?: () => void
+  /** Make the path currently in the remote path input this host's main directory. */
+  onSetMain?: () => void
+  /** Path that onSetMain would store (shown in its tooltip). */
+  setMainPath?: string
+  /** Forget this host's main directory. */
+  onClearMain?: () => void
+  /** Which main-directory request for this host is in flight, if any. */
+  mainBusy?: 'set' | 'clear'
 }) {
   const { host, active, health, t } = props
   const [hov, setHov] = useState(false)
   const problem = hostProblem(host, t)
   const exact = host.authKind === 'key' ? host.keyReady : host.passwordSet
+  const main = mainDirOf(host)
   const dot = health === undefined ? T.muted : health.state === 'ok' ? T.ok : health.state === 'fail' ? T.danger : T.accent
   const probe =
     health === undefined
@@ -260,7 +345,7 @@ function HostCard(props: {
         if (problem === null) props.onPick()
       }}
       onKeyDown={(e) => {
-        if (problem === null && (e.key === 'Enter' || e.key === ' ')) {
+        if (e.target === e.currentTarget && problem === null && (e.key === 'Enter' || e.key === ' ')) {
           e.preventDefault()
           props.onPick()
         }
@@ -269,6 +354,7 @@ function HostCard(props: {
       onMouseLeave={() => setHov(false)}
       style={{
         display: 'flex',
+        flexWrap: 'wrap',
         alignItems: 'center',
         gap: 10,
         padding: '8px 8px 8px 12px',
@@ -278,11 +364,13 @@ function HostCard(props: {
         cursor: problem === null ? 'pointer' : 'not-allowed',
         opacity: problem === null ? 1 : 0.62,
         transition: 'background .15s, border-color .15s',
+        flexShrink: 0,
+        minWidth: 0,
       }}
     >
       <span style={{ width: 8, height: 8, borderRadius: 4, background: dot, flexShrink: 0 }} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+      <div style={{ flex: '1 1 160px', minWidth: 0 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 }}>
           <span
             style={{
               fontSize: 14,
@@ -297,6 +385,7 @@ function HostCard(props: {
           </span>
           <Pill>{host.source === 'manual' ? t('badgeManual') : t('badgeSshConfig')}</Pill>
           <Pill tone={exact ? 'ok' : 'warn'}>{host.authKind === 'key' ? t('badgeKey') : t('badgePassword')}</Pill>
+          {main !== '' ? <Pill tone="ok">{t('badgeMainDir')}</Pill> : null}
         </div>
         <div
           style={{
@@ -310,7 +399,46 @@ function HostCard(props: {
         >
           {detail}
         </div>
+        {main !== '' ? (
+          <div
+            title={t('mainDirLine', { path: main })}
+            style={{
+              fontSize: 12,
+              color: T.muted,
+              marginTop: 2,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+              minWidth: 0,
+            }}
+          >
+            <span style={{ display: 'flex', flexShrink: 0 }}>
+              <SvgFolder size={12} />
+            </span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('mainDirLine', { path: main })}</span>
+          </div>
+        ) : null}
       </div>
+      {props.onSetMain !== undefined ? (
+        <MiniAction
+          title={props.mainBusy === 'set' ? t('mainDirSaving') : t('setMainDir', { path: props.setMainPath ?? '' })}
+          onClick={() => {
+            if (props.mainBusy === undefined && props.onSetMain) props.onSetMain()
+          }}
+        >
+          {props.mainBusy === 'set' ? '…' : '⌂'}
+        </MiniAction>
+      ) : null}
+      {props.onClearMain !== undefined ? (
+        <MiniAction
+          title={props.mainBusy === 'clear' ? t('mainDirSaving') : t('clearMainDir', { path: main })}
+          onClick={() => {
+            if (props.mainBusy === undefined && props.onClearMain) props.onClearMain()
+          }}
+        >
+          {props.mainBusy === 'clear' ? '…' : '⊘'}
+        </MiniAction>
+      ) : null}
       <MiniAction title={t('testConnection')} onClick={props.onTest}>
         {health?.state === 'testing' ? '…' : '⟳'}
       </MiniAction>
@@ -372,6 +500,54 @@ const buttonS: CSSProperties = { padding: '9px 16px', borderRadius: T.radius, bo
 
 /** Section caption above a field group (form pages). */
 const labelS: CSSProperties = { fontSize: 14, color: T.muted }
+
+// The viewport bounds the panel; only its body shrinks and scrolls. Keep the
+// header and actions outside that body so a short window or a long host list
+// cannot push them off-screen. No resize/move handlers or wheel interception.
+const pickerOverlayS: CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
+  boxSizing: 'border-box',
+}
+const pickerPanelS: CSSProperties = {
+  background: panelBg, border: '1px solid ' + T.borderStrong, borderRadius: 14,
+  boxShadow: '0 16px 56px rgba(0,0,0,0.55)', width: 'min(640px, 100%)', maxWidth: '100%',
+  maxHeight: 'calc(100dvh - 32px)', minHeight: 0, padding: 'clamp(10px, 3dvh, 22px)', boxSizing: 'border-box',
+  display: 'flex', flexDirection: 'column', overflow: 'hidden',
+}
+const pickerHeaderS: CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 10, marginBottom: 'min(16px, 2dvh)', flexShrink: 0,
+}
+const pickerBodyS: CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 18, flex: '1 1 auto',
+  minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', padding: 2,
+}
+const pickerFooterS: CSSProperties = {
+  display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'flex-end', alignItems: 'center',
+  borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 'min(14px, 2dvh)', flexShrink: 0,
+  maxHeight: '40dvh', minHeight: 0, minWidth: 0, boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden',
+}
+const footerButtonS: CSSProperties = { maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }
+const hostListS: CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 'min(220px, 28dvh)',
+  minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: 2, scrollbarGutter: 'stable',
+}
+const directoryListS: CSSProperties = {
+  border: '1px solid ' + T.border, borderRadius: 10, background: T.bg,
+  maxHeight: 'min(240px, 32dvh)', minHeight: 0, overflowY: 'auto', overflowX: 'hidden',
+  padding: 4, scrollbarGutter: 'stable',
+}
+
+// Style the browser's native scrollbars only within this picker, including
+// environments where the app's global stylesheet hides them. Dragging and
+// keyboard/wheel scrolling remain browser-owned; these rules unmount with it.
+const pickerScrollCss = `
+[data-dsh-rw-scroll] { scrollbar-width: auto !important; }
+[data-dsh-rw-scroll]::-webkit-scrollbar { display: block !important; width: 12px !important; height: 12px !important; }
+[data-dsh-rw-scroll]::-webkit-scrollbar-track { background: ${T.bg}; }
+[data-dsh-rw-scroll]::-webkit-scrollbar-thumb { background: ${T.borderStrong}; border-radius: 8px; min-height: 24px; border: 2px solid transparent; background-clip: padding-box; }
+[data-dsh-rw-scroll]:focus-visible, [data-dsh-rw="directory-row"]:focus-visible, [data-dsh-rw="flow-card"]:focus-visible { outline: 2px solid ${T.accent}; outline-offset: -2px; }
+`
 
 /** Button with hover feedback; `primary` renders the Codex-style white
  * call-to-action (cf. "Add project"), `danger` the muted-danger look. */
@@ -585,8 +761,17 @@ function DirRow(props: { item: LsItem; drill: boolean; onEnter: () => void; t: T
   const { item, drill } = props
   return (
     <div
+      data-dsh-rw="directory-row"
+      role={drill ? 'button' : undefined}
+      tabIndex={drill ? 0 : undefined}
       title={props.t(drill ? 'enterDirectory' : 'fileItem', { name: item.name })}
       onClick={drill ? props.onEnter : undefined}
+      onKeyDown={(e) => {
+        if (drill && (e.key === 'Enter' || e.key === ' ')) {
+          e.preventDefault()
+          props.onEnter()
+        }
+      }}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{ padding: '8px 12px', cursor: drill ? 'pointer' : 'default', color: T.label, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'flex', gap: 10, alignItems: 'center', fontSize: 14, borderRadius: 6, background: hov && drill ? T.bgHover : 'transparent' }}
@@ -607,7 +792,16 @@ function FlowCard(props: { icon: unknown; title: string; onClick: () => void }) 
   const [hov, setHov] = useState(false)
   return (
     <div
+      data-dsh-rw="flow-card"
+      role="button"
+      tabIndex={0}
       onClick={props.onClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          props.onClick()
+        }
+      }}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{
@@ -670,6 +864,9 @@ function DirPicker(props: LocalizedDirPickerProps) {
   const [localParent, setLocalParent] = useState<string | null>(null)
   const suggestTimer = useRef<number | null>(null)
   const localTimer = useRef<number | null>(null)
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const remoteListRef = useRef<HTMLDivElement | null>(null)
+  const localListRef = useRef<HTMLDivElement | null>(null)
   // 「添加主机」子页表单状态（view === 'addHost' 时独占整页）。
   const [form, setForm] = useState<AddHostForm>(emptyAddForm)
   const [formErr, setFormErr] = useState('')
@@ -678,10 +875,14 @@ function DirPicker(props: LocalizedDirPickerProps) {
   const [hostHealth, setHostHealth] = useState<Record<string, HostHealth>>({})
   // ssh-config aliases removed from the list (they stay in ~/.ssh/config).
   const [hiddenAliases, setHiddenAliases] = useState<string[]>([])
+  // The plugin-wide main directory of hosts without their own ('' = none).
+  const [defaultMain, setDefaultMain] = useState('')
   const [editingAlias, setEditingAlias] = useState('')
   const [saving, setSaving] = useState(false)
   const [testMsg, setTestMsg] = useState('')
   const [testOk, setTestOk] = useState(false)
+  // One in-flight main-directory request (set or clear) per host row.
+  const [mainBusy, setMainBusy] = useState<{ alias: string; kind: 'set' | 'clear' } | null>(null)
 
   // On open: always land on the card step, then fetch the host inventory
   // (+ current alias for preselection).
@@ -695,6 +896,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
         const list = Array.isArray(r.hosts) ? r.hosts : []
         setHosts(list)
         setHiddenAliases(Array.isArray(r.hiddenAliases) ? r.hiddenAliases : [])
+        setDefaultMain(typeof r.defaultMainDir === 'string' ? r.defaultMainDir : '')
         const cur = r.current && typeof r.current.alias === 'string' ? r.current.alias : ''
         // Prefer the live session host, then the machine used last time, then
         // the first host that is actually usable.
@@ -710,6 +912,58 @@ function DirPicker(props: LocalizedDirPickerProps) {
       .catch((e) => setErr(t('loadHostsFailed', { error: errText(e) })))
   }, [open, t])
 
+  // The dialog owns its focus; queries below stay within its own panel. Save
+  // only the previously focused element so closing can restore the opener.
+  useEffect(() => {
+    if (!open) return
+    const previous = document.activeElement
+    return () => {
+      if (previous instanceof HTMLElement && previous.isConnected) previous.focus({ preventScroll: true })
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (open) panelRef.current?.focus({ preventScroll: true })
+  }, [open, view])
+
+  // A removed host/action must not leave focus outside an open dialog.
+  useEffect(() => {
+    const panel = panelRef.current
+    if (open && panel && !panel.contains(document.activeElement)) panel.focus({ preventScroll: true })
+  })
+
+  // Loading replaces directory rows. Move focus from a row to its stable
+  // scroll region before that happens, without stealing it from path inputs.
+  const preserveDirectoryFocus = (region: HTMLDivElement | null) => {
+    if (region?.contains(document.activeElement)) region.focus({ preventScroll: true })
+  }
+
+  const onDialogKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      if (!busy) onCancel()
+      return
+    }
+    if (e.key !== 'Tab') return
+    const panel = panelRef.current
+    if (!panel) return
+    const targets = Array.from(panel.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), [tabindex="0"]'))
+    const first = targets[0]
+    const last = targets[targets.length - 1]
+    const active = document.activeElement
+    if (!first || !last) {
+      e.preventDefault()
+      panel.focus({ preventScroll: true })
+    } else if (e.shiftKey && (active === first || active === panel || !panel.contains(active))) {
+      e.preventDefault()
+      last.focus()
+    } else if (!e.shiftKey && (active === last || active === panel || !panel.contains(active))) {
+      e.preventDefault()
+      first.focus()
+    }
+  }
+
   useEffect(
     () => () => {
       if (suggestTimer.current !== null) window.clearTimeout(suggestTimer.current)
@@ -721,8 +975,9 @@ function DirPicker(props: LocalizedDirPickerProps) {
   // 行内目录列表的数据源：列出 dir 的下钻条目（仅目录/符号链接）。
   // sync=true 时把服务端解析后的真实路径回填输入框（用于 ~/ 默认路径，
   // 服务端经 realpath('.') 扩展为远端 home 的绝对路径）。
-  const loadDir = (a: string, dir: string, sync?: boolean) => {
+  const loadDir = (a: string, dir: string, sync?: boolean, fallback?: string) => {
     if (!a) return
+    preserveDirectoryFocus(remoteListRef.current)
     setLoading(true)
     setErr('')
     api<LsResponse>('GET', `/api/dsh-rw/ls?alias=${encodeURIComponent(a)}&path=${encodeURIComponent(dir || '/')}`)
@@ -733,10 +988,32 @@ function DirPicker(props: LocalizedDirPickerProps) {
         setDirItems((Array.isArray(res.items) ? res.items : []).filter(drillable).slice(0, 400))
       })
       .catch((e) => {
+        // A default start directory the host does not have (e.g. no /data)
+        // quietly falls back instead of greeting the user with an error.
+        if (fallback !== undefined && fallback !== dir) {
+          setPath(fallback)
+          loadDir(a, fallback, sync)
+          return
+        }
         setDirItems([])
         setErr(errText(e))
       })
       .finally(() => setLoading(false))
+  }
+
+  /**
+   * Land the remote page on one host's start directory: its main directory
+   * (own, else the plugin default), the remote home otherwise. Only the
+   * plugin default falls back to the home when the host lacks it — a main
+   * directory the user set and that has gone is worth an error. `list` is the
+   * freshest host list when the caller just refreshed it (React state is not
+   * updated yet).
+   */
+  const landOnHost = (a: string, list: HostSummary[] = hosts) => {
+    const host = list.find((h) => h.alias === a)
+    const start = hostStartPath(host, defaultMain)
+    setPath(start)
+    loadDir(a, start, true, mainDirOf(host) === '' ? REMOTE_HOME : undefined)
   }
 
   // 输入补全：对末段的父目录做 ls，按末段前缀过滤，结果同样进列表。
@@ -792,6 +1069,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
   // 本机目录列表的数据源（GET /api/dsh-rw/ls-local）。sync=true 时把服务端
   // 展开后的绝对路径回填输入框（~ 与服务端 home 保持一致）。
   const loadLocalDir = (dir: string, sync?: boolean) => {
+    preserveDirectoryFocus(localListRef.current)
     setLoading(true)
     setErr('')
     api<LsResponse>('GET', `/api/dsh-rw/ls-local?path=${encodeURIComponent(dir || '~')}`)
@@ -906,20 +1184,20 @@ function DirPicker(props: LocalizedDirPickerProps) {
       return
     }
     if (t === 'remote' && alias) {
-      // 已输入过路径则保留（列表跟随其内容），否则默认落在远端 home（~/）。
+      // 已输入过路径则保留（列表跟随其内容），否则落在该主机的主目录，没有主
+      // 目录时落在远端 home（~/）。
       const start = path.trim()
       if (start) {
         loadDir(alias, start)
       } else {
-        setPath('~/')
-        loadDir(alias, '~/', true)
+        landOnHost(alias)
       }
     }
   }
 
-  // Commit the remote path as the workspace: the host resolves it (realpath),
-  // creates the local placeholder dir (named by 工作区名称 when given), and
-  // answers with its path.
+  // Commit the remote path: the host realpath-resolves it, registers its
+  // sidebar title (custom name or the default), and returns the mirrored
+  // placeholder path. The optional title never renames that placeholder.
   const commitPath = (p: string) => {
     const target = String(p || '').trim()
     if (!target || !alias || busy) return
@@ -982,6 +1260,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
       const list = Array.isArray(r.hosts) ? r.hosts : []
       setHosts(list)
       setHiddenAliases(Array.isArray(r.hiddenAliases) ? r.hiddenAliases : [])
+      setDefaultMain(typeof r.defaultMainDir === 'string' ? r.defaultMainDir : '')
       return list
     })
 
@@ -1002,10 +1281,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
         const next = list[0] ? list[0].alias : ''
         setAlias(next)
         setDirItems([])
-        if (next) {
-          setPath('~/')
-          loadDir(next, '~/', true)
-        }
+        if (next) landOnHost(next, list)
       })
       .catch((e) => setErr(errText(e)))
   }
@@ -1028,7 +1304,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
     }
   }
 
-  /** Pick a registered host: select it and load its home directory. */
+  /** Pick a registered host: select it and land on its main directory (or home). */
   const selectHost = (a: string) => {
     setAlias(a)
     setErr('')
@@ -1036,9 +1312,39 @@ function DirPicker(props: LocalizedDirPickerProps) {
       setDirItems([])
       return
     }
-    setPath('~/')
-    loadDir(a, '~/', true)
+    landOnHost(a)
     rememberHost(a)
+  }
+
+  /**
+   * Set (path) or clear (null) one host's main directory. The server
+   * realpath-resolves the path and answers with the updated summary, which
+   * replaces the row; setting it also moves the path input to the stored form.
+   */
+  const updateMainDir = (h: HostSummary, next: string | null) => {
+    if (mainBusy !== null) return
+    const target = next === null ? null : next.trim()
+    if (target === '') return
+    setErr('')
+    setMainBusy({ alias: h.alias, kind: target === null ? 'clear' : 'set' })
+    api<MainDirResponse>('POST', '/api/dsh-rw/hosts/main', { alias: h.alias, path: target })
+      .then((r) => {
+        if (!r || r.ok === false) throw new Error((r && r.error) || t('connectionFailed'))
+        const updated = r.host
+        if (updated && updated.alias === h.alias) {
+          setHosts((prev) => prev.map((x) => (x.alias === updated.alias ? updated : x)))
+          const stored = mainDirOf(updated)
+          if (target !== null && stored !== '' && alias === h.alias) {
+            setPath(stored)
+            loadDir(h.alias, stored)
+          }
+          return undefined
+        }
+        // An older server without the echo: re-read the list instead.
+        return refreshHosts().then(() => undefined)
+      })
+      .catch((e) => setErr(t('mainDirFailed', { error: errText(e) })))
+      .finally(() => setMainBusy(null))
   }
 
   /** Probe one registered host and keep the outcome for its row. */
@@ -1126,11 +1432,10 @@ function DirPicker(props: LocalizedDirPickerProps) {
         setEditingAlias('')
         setView('remote')
         refreshHosts()
-          .then(() => {
+          .then((list) => {
             setAlias(targetAlias)
             setErr('')
-            setPath('~/')
-            loadDir(targetAlias, '~/', true)
+            landOnHost(targetAlias, list)
             rememberHost(targetAlias)
           })
           .catch((e) => setErr(t('hostSavedRefreshFailed', { error: errText(e) })))
@@ -1150,17 +1455,13 @@ function DirPicker(props: LocalizedDirPickerProps) {
           const next = list[0] ? list[0].alias : ''
           setAlias(next)
           setDirItems([])
-          if (next) {
-            setPath('~/')
-            loadDir(next, '~/', true)
-          }
+          if (next) landOnHost(next, list)
         }
       })
       .catch((e) => setErr(t('removeHostFailed', { error: errText(e) })))
   }
 
   function renderAddForm() {
-    const busyForm = testing || saving
     // 认证方式分段选择器的一段。
     const seg = (kind: 'key' | 'password', label: string) => {
       const active = form.authKind === kind
@@ -1225,17 +1526,7 @@ function DirPicker(props: LocalizedDirPickerProps) {
         )}
         {formErr ? <SingleLine text={formErr} color={T.danger} /> : null}
         {testMsg ? <SingleLine text={testMsg} color={testOk ? T.ok : T.danger} /> : null}
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
-          <Btn onClick={resetAddForm} disabled={busyForm}>
-            {t('clear')}
-          </Btn>
-          <Btn onClick={testNewHost} disabled={busyForm}>
-            {testing ? t('testing') : t('testConnection')}
-          </Btn>
-          <Btn primary onClick={saveNewHost} disabled={busyForm}>
-            {saving ? t('saving') : editingAlias ? t('saveChanges') : t('save')}
-          </Btn>
-        </div>
+
       </div>
     )
   }
@@ -1243,6 +1534,8 @@ function DirPicker(props: LocalizedDirPickerProps) {
   if (!open) return null
 
   const selectedHost = hosts.find((h) => h.alias === alias)
+  const selectedMainDir = effectiveMainDirOf(selectedHost, defaultMain)
+  const busyForm = testing || saving
 
   // 卡片步：两张简洁入口卡片（本机 / 远程），点击进入对应表单页。
   const card = (flow: 'local' | 'remote', icon: unknown, title: string) => <FlowCard onClick={() => openFlow(flow)} icon={icon} title={title} />
@@ -1279,20 +1572,30 @@ function DirPicker(props: LocalizedDirPickerProps) {
   // 全屏居中 modal（遮罩 + 面板）：在窄 sidebar 和 conversation 里渲染一致。
   return (
     <div
-      style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
+      data-dsh-rw="picker-overlay"
+      style={pickerOverlayS}
       onClick={() => {
         if (!busy) onCancel()
       }}
     >
+      <style>{pickerScrollCss}</style>
       <div
-        style={{ background: panelBg, border: '1px solid ' + T.borderStrong, borderRadius: 14, boxShadow: '0 16px 56px rgba(0,0,0,0.55)', width: 'min(640px, 94vw)', padding: 22, boxSizing: 'border-box' }}
+        data-dsh-rw="picker-panel"
+        ref={panelRef}
+        tabIndex={-1}
+        onKeyDown={onDialogKeyDown}
+        role="dialog"
+        aria-modal="true"
+        aria-label={viewTitle}
+        style={pickerPanelS}
         onClick={(e) => e.stopPropagation()}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+        <div data-dsh-rw="picker-header" style={pickerHeaderS}>
           {view !== 'cards' ? backBtn : null}
           <div style={{ flex: 1, minWidth: 0, fontSize: 17, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{viewTitle}</div>
           <Btn
-            style={{ padding: '4px 6px', border: '1px solid transparent', background: 'transparent', color: T.muted, display: 'flex', alignItems: 'center' }}
+            title={t('cancel')}
+            style={{ padding: '4px 6px', border: '1px solid transparent', background: 'transparent', color: T.muted, display: 'flex', alignItems: 'center', flexShrink: 0 }}
             onClick={() => {
               if (!busy) onCancel()
             }}
@@ -1301,162 +1604,201 @@ function DirPicker(props: LocalizedDirPickerProps) {
             <SvgX />
           </Btn>
         </div>
-        {view === 'cards' ? (
-          <div style={{ display: 'flex', gap: 12 }}>
-            {card('local', <SvgMonitor size={22} />, t('localCardTitle'))}
-            {card('remote', <SvgGlobe size={22} />, t('remoteCardTitle'))}
-          </div>
-        ) : null}
-        {view === 'local' ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <SingleLine text={t('localPickerHint')} />
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <div style={labelS}>{t('localPathLabel')}</div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <TextInput
-                  value={localPath}
-                  onChange={(e) => onLocalPathChange(e.target.value)}
-                  onFocus={() => (localPath.trim() ? completeLocalPath(localPath) : loadLocalDir('~', true))}
-                  placeholder={t('localPathPlaceholder')}
-                  style={{ flex: 1, minWidth: 120 }}
-                />
-                <Btn primary onClick={() => pickLocal(localPath)} disabled={!localPath.trim()}>
-                  {t('useDirectory')}
-                </Btn>
-              </div>
-              {/* 行内本机目录浏览器：与远程页同一套交互，不必再打开系统选择器。 */}
-              <div style={{ border: '1px solid ' + T.border, borderRadius: 10, background: T.bg, maxHeight: 240, overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
-                {loading ? (
-                  <SingleLine text={t('loading')} style={{ padding: 12 }} />
-                ) : (
-                  <>
-                    {localParent !== null ? (
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        onClick={goLocalUp}
-                        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ' ? goLocalUp() : undefined)}
-                        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, cursor: 'pointer', color: T.muted, fontSize: 13 }}
-                      >
-                        <SvgFolder /> .. {t('goUp')}
-                      </div>
-                    ) : null}
-                    {localItems.length ? (
-                      localItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectLocalDir(it.name)} t={t} />)
-                    ) : (
-                      <SingleLine text={t('noMatchingDirectories')} style={{ padding: 12 }} />
-                    )}
-                  </>
-                )}
-              </div>
+        <div data-dsh-rw="picker-body" data-dsh-rw-scroll="" role="region" aria-label={viewTitle} tabIndex={0} style={pickerBodyS}>
+          {view === 'cards' ? (
+            <div style={{ display: 'flex', gap: 12 }}>
+              {card('local', <SvgMonitor size={22} />, t('localCardTitle'))}
+              {card('remote', <SvgGlobe size={22} />, t('remoteCardTitle'))}
             </div>
-            <Btn style={{ alignSelf: 'flex-start' }} onClick={chooseLocal} disabled={loading}>
-              {loading ? t('opening') : t('openSystemPicker')}
-            </Btn>
-            {err ? <SingleLine text={err} color={T.danger} /> : null}
-          </div>
-        ) : null}
-        {view === 'remote' || view === 'addHost' ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-            {view === 'addHost' ? (
-              renderAddForm()
-            ) : (
-              <>
-                {/* 工作区名称（可选）：Codex 式图标格输入框，置顶；留空用路径末级目录名 */}
-                <IconInput icon={<SvgFolder />} value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder={t('workspaceNamePlaceholder')} />
-                {/* 远程主机：caption 行内放「+ 添加主机 / 删除」，下拉选项只显示别名 */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <div style={{ ...labelS, flex: 1 }}>{t('remoteHostLabel')}</div>
-                    <Btn
-                      style={{ padding: '2px 9px', border: '1px solid transparent', background: 'transparent', color: T.accent, fontSize: 12, whiteSpace: 'nowrap' }}
-                      onClick={() => {
-                        resetAddForm()
-                        setView('addHost')
-                      }}
-                    >
-                      {t('addHost')}
-                    </Btn>
-                    {selectedHost && selectedHost.source === 'manual' ? (
-                      <Btn danger style={{ padding: '2px 9px', fontSize: 12, whiteSpace: 'nowrap' }} title={t('removeManualHostTitle', { alias: selectedHost.alias })} onClick={() => removeManualHost(selectedHost)}>
-                        {t('remove')}
-                      </Btn>
-                    ) : null}
-                  </div>
+          ) : null}
+          {view === 'local' ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <SingleLine text={t('localPickerHint')} />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={labelS}>{t('localPathLabel')}</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <TextInput
+                    value={localPath}
+                    onChange={(e) => onLocalPathChange(e.target.value)}
+                    onFocus={() => (localPath.trim() ? completeLocalPath(localPath) : loadLocalDir('~', true))}
+                    placeholder={t('localPathPlaceholder')}
+                    style={{ flex: 1, minWidth: 120 }}
+                  />
+                  <Btn primary onClick={() => pickLocal(localPath)} disabled={!localPath.trim()}>
+                    {t('useDirectory')}
+                  </Btn>
+                </div>
+                {/* 行内本机目录浏览器：可聚焦区域使用浏览器原生键盘/滚轮滚动。 */}
+                <div data-dsh-rw="local-directory-list" ref={localListRef} data-dsh-rw-scroll="" role="region" aria-label={t('localDirectoryList')} tabIndex={0} style={directoryListS}>
+                  {loading ? (
+                    <SingleLine text={t('loading')} style={{ padding: 12 }} />
+                  ) : (
+                    <>
+                      {localParent !== null ? (
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          onClick={goLocalUp}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault()
+                              goLocalUp()
+                            }
+                          }}
+                          style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, cursor: 'pointer', color: T.muted, fontSize: 13 }}
+                        >
+                          <SvgFolder /> .. {t('goUp')}
+                        </div>
+                      ) : null}
+                      {localItems.length ? (
+                        localItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectLocalDir(it.name)} t={t} />)
+                      ) : (
+                        <SingleLine text={t('noMatchingDirectories')} style={{ padding: 12 }} />
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+              <Btn style={{ ...footerButtonS, alignSelf: 'flex-start' }} onClick={chooseLocal} disabled={loading}>
+                {loading ? t('opening') : t('openSystemPicker')}
+              </Btn>
+              {err ? <SingleLine text={err} color={T.danger} /> : null}
+            </div>
+          ) : null}
+          {view === 'remote' || view === 'addHost' ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+              {view === 'addHost' ? (
+                renderAddForm()
+              ) : (
+                <>
+                  {/* 侧边栏标题（可选）：普通项目默认末级目录名，主工作区或 / 默认主机别名；自定义输入优先 */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {hosts.map((h) => (
-                      <HostCard
-                        key={h.alias}
-                        host={h}
-                        active={h.alias === alias}
-                        health={hostHealth[h.alias]}
-                        t={t}
-                        onPick={() => selectHost(h.alias)}
-                        onTest={() => testHost(h)}
-                        onEdit={h.source === 'manual' ? () => startEditHost(h) : undefined}
-                        onRemove={h.source === 'manual' ? () => removeManualHost(h) : undefined}
-                        onHide={h.source === 'manual' ? undefined : () => hideHost(h)}
+                    <IconInput icon={<SvgFolder />} value={wsName} onChange={(e) => setWsName(e.target.value)} placeholder={t('workspaceNamePlaceholder')} />
+                    <div style={{ color: T.muted, fontSize: 12, lineHeight: 1.5 }}>{t('workspaceNameHint')}</div>
+                  </div>
+                  {/* 远程主机：caption 放「+ 添加主机 / 删除」，下方主机列表独立滚动 */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ ...labelS, flex: 1 }}>{t('remoteHostLabel')}</div>
+                      <Btn
+                        style={{ padding: '2px 9px', border: '1px solid transparent', background: 'transparent', color: T.accent, fontSize: 12, whiteSpace: 'nowrap' }}
+                        onClick={() => {
+                          resetAddForm()
+                          setView('addHost')
+                        }}
+                      >
+                        {t('addHost')}
+                      </Btn>
+                      {selectedHost && selectedHost.source === 'manual' ? (
+                        <Btn danger style={{ padding: '2px 9px', fontSize: 12, whiteSpace: 'nowrap' }} title={t('removeManualHostTitle', { alias: selectedHost.alias })} onClick={() => removeManualHost(selectedHost)}>
+                          {t('remove')}
+                        </Btn>
+                      ) : null}
+                    </div>
+                    <div data-dsh-rw="host-list" data-dsh-rw-scroll="" role="region" aria-label={t('remoteHostLabel')} tabIndex={0} style={hostListS}>
+                      {hosts.map((h) => {
+                        const mainActions = mainDirActions(h, alias, path)
+                        return (
+                          <HostCard
+                            key={h.alias}
+                            host={h}
+                            active={h.alias === alias}
+                            health={hostHealth[h.alias]}
+                            t={t}
+                            onPick={() => selectHost(h.alias)}
+                            onTest={() => testHost(h)}
+                            onEdit={h.source === 'manual' ? () => startEditHost(h) : undefined}
+                            onRemove={h.source === 'manual' ? () => removeManualHost(h) : undefined}
+                            onHide={h.source === 'manual' ? undefined : () => hideHost(h)}
+                            onSetMain={mainActions.canSet ? () => updateMainDir(h, path) : undefined}
+                            setMainPath={path.trim()}
+                            onClearMain={mainActions.canClear ? () => updateMainDir(h, null) : undefined}
+                            mainBusy={mainBusy !== null && mainBusy.alias === h.alias ? mainBusy.kind : undefined}
+                          />
+                        )
+                      })}
+                    </div>
+                  </div>
+                  {hosts.length === 0 ? (
+                    <SingleLine text={t('noHosts')} />
+                  ) : null}
+                  {hiddenAliases.length > 0 ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <SingleLine text={t('hiddenHosts', { count: hiddenAliases.length, aliases: hiddenAliases.join(', ') })} />
+                      <Btn style={{ padding: '2px 9px', fontSize: 12, border: '1px solid transparent', background: 'transparent', color: T.accent }} onClick={unhideAll}>
+                        {t('showAllHidden')}
+                      </Btn>
+                    </div>
+                  ) : null}
+                  {/* 远程路径：↑ 上一级 + 输入框，下方行内目录列表实时跟随 */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={labelS}>{t('remotePathLabel')}</div>
+                    <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
+                      <Btn style={{ padding: '0 12px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }} title={t('parentDirectory')} onClick={goUp} disabled={!alias}>
+                        <SvgArrowUp />
+                      </Btn>
+                      <TextInput
+                        value={path}
+                        onChange={(e: { target: { value: string } }) => onPathChange(e.target.value)}
+                        onFocus={() => completePath(path)}
+                        placeholder={alias ? t('remotePathPlaceholder') : t('chooseHostFirst')}
+                        disabled={!alias}
+                        style={{ flex: 1, minWidth: 120 }}
                       />
-                    ))}
+                    </div>
+                    {/* Native overflow keeps wheel, trackpad, scrollbar and keyboard scrolling intact. */}
+                    <div data-dsh-rw="remote-directory-list" ref={remoteListRef} data-dsh-rw-scroll="" role="region" aria-label={t('remoteDirectoryList')} tabIndex={0} style={directoryListS}>
+                      {!alias ? (
+                        <SingleLine text={t('chooseHostFirst')} style={{ padding: 12 }} />
+                      ) : loading ? (
+                        <SingleLine text={t('loading')} style={{ padding: 12 }} />
+                      ) : dirItems.length ? (
+                        dirItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectDir(it.name)} t={t} />)
+                      ) : (
+                        <SingleLine text={t('noMatchingDirectories')} style={{ padding: 12 }} />
+                      )}
+                    </div>
                   </div>
-                </div>
-                {hosts.length === 0 ? (
-                  <SingleLine text={t('noHosts')} />
-                ) : null}
-                {hiddenAliases.length > 0 ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <SingleLine text={t('hiddenHosts', { count: hiddenAliases.length, aliases: hiddenAliases.join(', ') })} />
-                    <Btn style={{ padding: '2px 9px', fontSize: 12, border: '1px solid transparent', background: 'transparent', color: T.accent }} onClick={unhideAll}>
-                      {t('showAllHidden')}
-                    </Btn>
-                  </div>
-                ) : null}
-                {/* 远程路径：↑ 上一级 + 输入框，下方行内目录列表实时跟随 */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={labelS}>{t('remotePathLabel')}</div>
-                  <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
-                    <Btn style={{ padding: '0 12px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }} title={t('parentDirectory')} onClick={goUp} disabled={!alias}>
-                      <SvgArrowUp />
-                    </Btn>
-                    <TextInput
-                      value={path}
-                      onChange={(e: { target: { value: string } }) => onPathChange(e.target.value)}
-                      onFocus={() => completePath(path)}
-                      placeholder={alias ? t('remotePathPlaceholder') : t('chooseHostFirst')}
-                      disabled={!alias}
-                      style={{ flex: 1, minWidth: 120 }}
-                    />
-                  </div>
-                  <div style={{ border: '1px solid ' + T.border, borderRadius: 10, background: T.bg, maxHeight: 240, overflowY: 'auto', overflowX: 'hidden', padding: 4 }}>
-                    {!alias ? (
-                      <SingleLine text={t('chooseHostFirst')} style={{ padding: 12 }} />
-                    ) : loading ? (
-                      <SingleLine text={t('loading')} style={{ padding: 12 }} />
-                    ) : dirItems.length ? (
-                      dirItems.map((it, i) => <DirRow key={it.name + '-' + i} item={it} drill onEnter={() => selectDir(it.name)} t={t} />)
-                    ) : (
-                      <SingleLine text={t('noMatchingDirectories')} style={{ padding: 12 }} />
-                    )}
-                  </div>
-                </div>
-                {err ? <SingleLine text={err} color={T.danger} /> : null}
-                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', borderTop: '1px solid ' + T.border, paddingTop: 12, marginTop: 2 }}>
-                  <Btn style={{ border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel} disabled={busy}>
-                    {t('cancel')}
+                  {err ? <SingleLine text={err} color={T.danger} /> : null}
+
+                </>
+              )}
+            </div>
+          ) : null}
+        </div>
+        {view !== 'cards' ? (
+          <div data-dsh-rw="picker-footer" data-dsh-rw-scroll="" role="region" aria-label={t('pickerActions')} tabIndex={0} style={pickerFooterS}>
+            {view === 'remote' ? (
+              <>
+                <Btn style={{ ...footerButtonS, border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel} disabled={busy}>
+                  {t('cancel')}
+                </Btn>
+                {selectedMainDir !== '' ? (
+                  <Btn style={footerButtonS} onClick={() => commitPath(selectedMainDir)} disabled={busy || !alias} title={t('openMainWorkspace', { path: selectedMainDir })}>
+                    {t('openMainWorkspaceButton')}
                   </Btn>
-                  <Btn primary onClick={() => commitPath(path)} disabled={busy || !alias || !path.trim()}>
-                    {busy ? t('setting') : t('setRemoteWorkspace')}
-                  </Btn>
-                </div>
+                ) : null}
+                <Btn primary style={footerButtonS} onClick={() => commitPath(path)} disabled={busy || !alias || !path.trim()}>
+                  {busy ? t('setting') : t('setRemoteWorkspace')}
+                </Btn>
               </>
+            ) : view === 'addHost' ? (
+              <>
+                <Btn style={footerButtonS} onClick={resetAddForm} disabled={busyForm}>
+                  {t('clear')}
+                </Btn>
+                <Btn style={footerButtonS} onClick={testNewHost} disabled={busyForm}>
+                  {testing ? t('testing') : t('testConnection')}
+                </Btn>
+                <Btn primary style={footerButtonS} onClick={saveNewHost} disabled={busyForm}>
+                  {saving ? t('saving') : editingAlias ? t('saveChanges') : t('save')}
+                </Btn>
+              </>
+            ) : (
+              <Btn style={{ ...footerButtonS, border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel}>
+                {t('cancel')}
+              </Btn>
             )}
-          </div>
-        ) : null}
-        {view === 'local' ? (
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <Btn style={{ border: '1px solid transparent', background: 'transparent', color: T.muted }} onClick={onCancel}>
-              {t('cancel')}
-            </Btn>
           </div>
         ) : null}
       </div>

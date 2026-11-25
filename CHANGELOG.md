@@ -3,6 +3,177 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 2.0.3 — 2026-11-25
+
+### Fixed — host alias namespace ownership
+
+- Distinct SSH aliases that sanitize to the same host directory are rejected
+  even when they select different remote paths. A private host-ownership record
+  reserves the entire mirror namespace without making remote `/` a workspace.
+- Existing mirror trees are checked for mixed aliases before creation and
+  routing. Ambiguous trees fail loudly instead of routing a native command to
+  the wrong host or falling back to the local placeholder. Legacy 1.x paths
+  retain their existing lookup behaviour; no workspaces or histories are moved.
+- Ownership checks inspect only bounded private placeholder metadata, never
+  follow directory symlinks, and reject unreadable or unsafe owner records.
+
+## 2.0.2 — 2026-11-24
+
+### Fixed — directory picker scrolling
+
+- Bound the picker to the viewport and give its body, host list, and directory
+  browser separate scroll regions. The header and confirmation actions stay
+  reachable with many hosts or on a short window.
+- Directory lists are keyboard-focusable and directory rows support Enter/Space;
+  mouse wheels, trackpads, and native scrollbars use the browser's normal scrolling.
+
+### Changed — short workspace names, unchanged remote hierarchy
+
+- Ordinary remote workspaces default to the canonical remote directory's POSIX
+  basename (for example `/srv/my-app` → `my-app`). The host's main workspace and
+  remote `/` keep the alias title. A supplied title takes precedence. Configured
+  main directories are compared by canonical path, including symlinks; an invalid
+  main directory does not block selecting another valid project.
+- Re-picking an existing workspace preserves a custom title; an explicit name
+  updates it. Old automatic `alias · path` titles migrate on re-pick, and the
+  response reports the title actually kept by DSH.
+- Display names never change placeholder paths. In DSH's Workspace Tree, projects
+  continue to nest beneath their closest registered remote ancestor. Add/open the
+  main workspace first if it is not registered; no unpicked root is registered or
+  remote-backed just to create a visual group. Session histories are untouched.
+
+## 2.0.1 — 2026-11-24
+
+### Changed — default main directory is the remote filesystem root
+
+- `defaultMainDir` now defaults to `/`, both in the Config schema and when
+  `apply()` receives a config without that field. A host without its own main
+  directory opens at `/`, not `/data`.
+- Picking `/` registers `<placeholderRoot>/<alias>` with the bare alias title.
+  `/data` remains an ordinary child workspace. No session headers, histories,
+  or existing workspace registrations are deleted or migrated.
+- Per-host main directories still override the default. Operators upgrading
+  with saved `/data` overrides should set those host main directories to `/`
+  in the picker if they want the new root-first behaviour.
+- Root-first navigation does not grant extra OS permissions: searches should
+  normally name a specific project directory rather than scan all of `/`.
+
+## 2.0.0 — 2026-11-24
+
+### Breaking — connection records are per DSH session
+
+The single global record `~/.dsh/dsh-rw-session.json` (`{ alias, workspace }`)
+is gone. Two sessions working on different hosts used to overwrite each other's
+"current host"; now every `rw_*` tool reads and writes **the calling session's**
+record in `~/.dsh/dsh-rw-sessions.json`
+(`{ version: 2, sessions: { [sessionId]: { alias, workspace, updatedAt } }, lastAlias }`,
+0600 in a 0700 directory, atomic writes, newest 500 records kept, a corrupt file
+is moved aside to `.corrupt-<ts>`).
+
+- A subagent without a record of its own inherits its direct parent's
+  (`header.parentSession`); its first `rw_connect` / `rw_pick_workspace` writes
+  its own copy and never changes the parent.
+- When the session's working directory is inside a placeholder, that
+  placeholder still decides the host and root (unchanged).
+- `rw_exec` / `rw_exec_many` now take the default cwd from the same target as
+  the host (working-directory placeholder first, then the record) — 1.x could
+  combine the cwd placeholder's host with the record's directory.
+- The picker (`POST /api/dsh-rw/workspace`) no longer writes any session record;
+  it only remembers the host it used last. `GET /api/dsh-rw/status` therefore
+  reports `current: { alias: lastAlias }` instead of `{ alias, workspace,
+  placeholderDir, connected }`.
+- The native-routing observation (`rw_info`'s "Native tools: …" line) is kept
+  per session id (bounded to 256 sessions).
+- The old file is neither read, written nor deleted, so a rollback to 1.6.x
+  finds it exactly as it was. After upgrading, sessions simply start
+  unconnected (sessions opened in a placeholder keep working through their cwd).
+
+### Breaking — placeholders moved out of `~` and mirror the remote tree
+
+DSH nests a workspace under its closest registered local ancestor, so every
+remote workspace (in `~/.dsh/remote-workspaces/…`) showed up **inside the home
+workspace** in the sidebar's Workspace Tree. Placeholders now live under a
+private root outside the home directory and mirror the remote paths:
+
+```
+/Users/Shared/dsh-rw-<user>/<alias>/data         workspace   (remote /data)
+/Users/Shared/dsh-rw-<user>/<alias>/srv/app      workspace   (remote /srv/app)
+```
+
+`<alias>` itself and the directories between it and a workspace carry no meta,
+so a path is remote-backed only inside a picked workspace; remote `/` is
+remote-backed only when `/` itself is picked.
+
+- New config key `placeholderRoot` (default: `/Users/Shared/dsh-rw-<user>` on
+  macOS, `~/.dsh/rw-workspaces` elsewhere — which may still sit under a
+  registered home workspace; point it elsewhere if so).
+- The root must be a real directory (not a symlink) owned by you; it is created
+  and kept at 0700. Anything else fails with the new error code
+  `UNSAFE_PLACEHOLDER_ROOT` (HTTP 500 from the routes) — `/Users/Shared` is
+  world-writable, so this is what keeps placeholders out of a tree someone else
+  pre-created.
+- Because local layout == remote layout, a local path maps to the same remote
+  path whether it is reached through an outer or a nested workspace. The
+  deepest placeholder containing a path wins; a meta file that does not sit at
+  its own mirror position is ignored. Shimmed `bash` also rewrites
+  `<root>/<alias>/…` paths of sibling placeholders of the same host, matches
+  prefixes only at path boundaries (`…/prod` never eats `…/production`), and no
+  longer produces `//` for a workspace rooted at `/`. Results of a workspace
+  rooted at `/` map back to local paths correctly.
+- No more hash-suffixed names: a mirror position already owned by another
+  workspace, two aliases that sanitize to the same directory name, or a
+  case-only collision on a case-insensitive disk (`/Data` vs `/data`) is an
+  `INVALID_INPUT` error naming both sides. Windows-unstorable segments
+  (`<>:"\|?*`, control characters, trailing dot/space, `CON`/`NUL`/`COM1`…,
+  also with an extension such as `nul.txt`) are rejected up front.
+- The picker's display name no longer names the directory; it becomes the
+  workspace title (see below).
+- **Legacy placeholders keep working**: every lookup falls back to
+  `~/.dsh/remote-workspaces`, so a session whose cwd is an old placeholder still
+  reaches its host. To get the per-host grouping in the sidebar, add the
+  workspace again from the picker — it is created in the new location.
+
+### Added — the host's main workspace is its sidebar node
+
+`POST /api/dsh-rw/workspace` now registers the picked placeholder with DSH's
+workspace registry (`ctx.get('workspaceRegistry')`). The host's **main
+directory** — its own setting, else the new config key `defaultMainDir`
+(`/data`; empty = none) — is titled with the bare alias, so the host's node in
+the Workspace Tree *is* its main workspace and the workspaces below it nest
+inside it; any other workspace is titled with the given name, or
+`<alias> · <path>`, and sits at the top level. Remote `/` is never registered
+as a side effect. Re-registering a known path keeps the title the user may have
+changed; only a main workspace still carrying the automatic `<alias> · <path>`
+title is renamed to the alias. A missing or failing registry is logged and
+reported as `registered: false` — the pick itself still succeeds. Response:
+`{ ok, workspace, placeholderDir, title, registered }`; `GET /status` also
+reports `defaultMainDir`. The picker opens a host at its main directory and
+falls back to the remote home when the host lacks the default.
+`rw_pick_workspace` creates the placeholder but deliberately does **not**
+register anything: changing the user's sidebar is the picker's job, not the
+model's.
+
+### Added — a main directory per host
+
+`~/.dsh/dsh-rw.json` gains `mains: { [alias]: remotePath }` (still version 1;
+older files load unchanged). `POST /api/dsh-rw/hosts/main` with
+`{ alias, path }` resolves the path like a workspace pick (`~` expansion,
+realpath, must be a directory) and stores the canonical result; `path: null`
+clears it. Host summaries carry `mainDir`, `rw_info` shows it for the current
+host, and removing a manual host removes its main directory.
+
+### Changed — the prompt section is generated per session
+
+The section text is now a function of the assembling session (DSH passes the
+Agent as `context.scope`): a session whose cwd is a placeholder (new or legacy)
+is told it **is** a remote workspace (alias, `user@host:port`, remote root,
+placeholder, native tools translated automatically, `rw_*` confined, the remote
+is the only source of truth); a local session with an `rw_*` record is told which
+host/workspace `rw_*` addresses and that native tools stay local unless a path
+names a placeholder; otherwise it gets the `rw_hosts → rw_connect →
+rw_pick_workspace` guidance. It no longer depends on the last observed native
+call, so the text is stable within a session.
+
 ## 1.6.1 — 2026-10-19
 
 ### Fixed — a refused channel left later operations stuck on a dead connection

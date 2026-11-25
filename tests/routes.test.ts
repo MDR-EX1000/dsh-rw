@@ -1,13 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RwError } from '../src/errors.js'
-import { ensurePlaceholder } from '../src/placeholder.js'
 import { makeRoutes } from '../src/routes.js'
 import type { Route, RoutesDeps } from '../src/routes.js'
-import { makeHarness, ENTRY_PROD, SECRET_PASSWORD } from './p4-fakes.js'
+import { makeHarness, SECRET_PASSWORD } from './p4-fakes.js'
 import type { FakeHarness } from './p4-fakes.js'
 
 interface FakeRes {
@@ -90,6 +89,8 @@ describe('loopback fence', () => {
       ['/api/dsh-rw/ls-local', 'GET'],
       ['/api/dsh-rw/workspace', 'POST'],
       ['/api/dsh-rw/local-pick', 'POST'],
+      ['/api/dsh-rw/hosts/hide', 'POST'],
+      ['/api/dsh-rw/hosts/main', 'POST'],
     ]
     for (const [path, method] of cases) {
       const { status, json } = await call(routes, path, method, { body: {}, remoteAddress: '10.1.2.3' })
@@ -116,22 +117,29 @@ describe('loopback fence', () => {
 })
 
 describe('status / hosts', () => {
-  it('GET status reflects the session and summarizes hosts', async () => {
+  it('GET status summarizes hosts and reports only the last picker host (no global session)', async () => {
     const empty = await call(routes, '/api/dsh-rw/status', 'GET')
     expect(empty.status).toBe(200)
-    expect(empty.json.current).toEqual({ alias: null, workspace: null, placeholderDir: null, connected: false })
+    expect(empty.json.current).toEqual({ alias: null })
     expect(Array.isArray(empty.json.hosts)).toBe(true)
 
+    // Session records are per DSH session and never surface here.
     harness.connect()
-    const placeholderDir = ensurePlaceholder('prod', ENTRY_PROD, '/srv/app', `${dir}/placeholders`)
+    harness.sessions.set('some-session', { alias: 'dev', workspace: '/x' })
+    expect((await call(routes, '/api/dsh-rw/status', 'GET')).json.current).toEqual({ alias: null })
+
+    harness.sessions.setLastAlias('prod')
     const picked = await call(routes, '/api/dsh-rw/status', 'GET')
-    expect(picked.json.current).toEqual({
-      alias: 'prod',
-      workspace: '/srv/app',
-      placeholderDir,
-      connected: true,
-    })
+    expect(picked.json.current).toEqual({ alias: 'prod' })
     expect(JSON.stringify(picked.json)).not.toContain(SECRET_PASSWORD)
+  })
+
+  it('GET status carries each host main directory in its summary', async () => {
+    harness.hosts.setMainDir('prod', '/srv/app')
+    const { json } = await call(routes, '/api/dsh-rw/status', 'GET')
+    const hosts = json.hosts as { alias: string; mainDir?: string }[]
+    expect(hosts.find((h) => h.alias === 'prod')?.mainDir).toBe('/srv/app')
+    expect(hosts.find((h) => h.alias === 'dev')?.mainDir).toBeUndefined()
   })
 
   it('GET hosts lists summaries only (no credentials)', async () => {
@@ -170,10 +178,19 @@ describe('status / hosts', () => {
     const missing = await call(routes, '/api/dsh-rw/hosts', 'DELETE', { body: { alias: 'ghost' } })
     expect(missing.status).toBe(404)
 
+    harness.sessions.set('A', { alias: 'prod', workspace: '/srv/app' })
+    harness.sessions.set('B', { alias: 'dev', workspace: '/w' })
+    harness.sessions.setLastAlias('prod')
+    harness.hosts.setMainDir('prod', '/srv/app')
     const ok = await call(routes, '/api/dsh-rw/hosts', 'DELETE', { body: { alias: 'prod' } })
     expect(ok.status).toBe(200)
     expect(harness.hosts.find('prod')).toBeUndefined()
     expect(harness.pool.disconnected).toContain('prod')
+    // Every session record pointing at the host, and the picker memory, are cleared.
+    expect(harness.sessions.get('A')).toEqual({ alias: null, workspace: null })
+    expect(harness.sessions.get('B')).toEqual({ alias: 'dev', workspace: '/w' })
+    expect(harness.sessions.lastAlias).toBeNull()
+    expect(harness.hosts.mainDir('prod')).toBeUndefined()
   })
 
   it('rejects other methods with 405', async () => {
@@ -279,7 +296,37 @@ describe('test / ls', () => {
 })
 
 describe('workspace / local-pick', () => {
-  it('POST workspace validates, stores the session and creates the placeholder', async () => {
+  /** A recording WorkspaceRegistryLike that keeps titles like DSH does (first create wins). */
+  function fakeRegistry(fail?: (path: string) => boolean) {
+    const created: { path: string; title: string | undefined }[] = []
+    const records = new Map<string, { title: string; setTitle(t: string): Promise<void> }>()
+    return {
+      created,
+      records,
+      registry: {
+        async create(path: string, title?: string) {
+          if (fail?.(path)) throw new Error(`registry refused ${path}`)
+          created.push({ path, title })
+          let rec = records.get(path)
+          if (rec === undefined) {
+            const fresh = {
+              title: title ?? path,
+              async setTitle(t: string) {
+                fresh.title = t
+              },
+            }
+            rec = fresh
+            records.set(path, rec)
+          }
+          return rec
+        },
+      },
+    }
+  }
+
+  const rwRoot = (): string => join(`${dir}/rw-root`)
+
+  it('POST workspace creates the mirror placeholder, records only lastAlias, and writes no session record', async () => {
     const { status, json } = await call(routes, '/api/dsh-rw/workspace', 'POST', {
       body: { alias: 'prod', path: '/srv/app/' },
     })
@@ -287,34 +334,225 @@ describe('workspace / local-pick', () => {
     expect(json).toEqual({
       ok: true,
       workspace: '/srv/app',
-      placeholderDir: join(`${dir}/placeholders`, 'prod', 'app'),
+      placeholderDir: join(rwRoot(), 'prod', 'srv', 'app'),
+      title: 'app',
+      registered: false, // no registry composed
     })
-    expect(harness.session.alias).toBe('prod')
-    expect(harness.session.workspace).toBe('/srv/app')
     expect(existsSync(json.placeholderDir as string)).toBe(true)
+    // No meta for remote '/' is created as a side effect.
+    expect(existsSync(join(rwRoot(), 'prod', '.dsh-rw-meta.json'))).toBe(false)
+    expect(harness.sessions.ids()).toEqual([])
+    expect(harness.session.alias).toBeNull()
+    expect(harness.sessions.lastAlias).toBe('prod')
   })
 
-  it('POST workspace honors an optional display name (trimmed, sanitized; blank = default)', async () => {
-    const named = await call(routes, '/api/dsh-rw/workspace', 'POST', {
-      body: { alias: 'prod', path: '/srv/app', name: '  My App  ' },
-    })
-    expect(named.status).toBe(200)
-    expect(named.json.placeholderDir).toBe(join(`${dir}/placeholders`, 'prod', 'My_App'))
+  it('POST workspace registers only the picked directory, titled by basename', async () => {
+    const { created, registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry })
+    const res = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(res.json).toMatchObject({ ok: true, registered: true, title: 'app' })
+    expect(created).toEqual([{ path: join(rwRoot(), 'prod', 'srv', 'app'), title: 'app' }])
+    // A title does not create or remote-back an unpicked host-root workspace.
+    expect(existsSync(join(rwRoot(), 'prod', '.dsh-rw-meta.json'))).toBe(false)
+  })
 
-    // Blank name falls back to the basename; the existing named placeholder is reused.
-    const blank = await call(routes, '/api/dsh-rw/workspace', 'POST', {
-      body: { alias: 'prod', path: '/srv/app', name: '   ' },
-    })
-    expect(blank.status).toBe(200)
-    expect(blank.json.placeholderDir).toBe(join(`${dir}/placeholders`, 'prod', 'My_App'))
+  it("titles the host's main directory by the bare alias (own setting, else defaultMainDir)", async () => {
+    const { created, records, registry } = fakeRegistry()
+    harness.hosts.setMainDir('prod', '/srv/app')
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry, defaultMainDir: '/srv' })
+    const own = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app/' } })
+    expect(own.json).toMatchObject({ ok: true, title: 'prod', registered: true })
+    // prod has its own main, so the default does not make /srv its main.
+    const notMain = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv' } })
+    expect(notMain.json.title).toBe('srv')
+    // dev has none of its own: the plugin default applies.
+    const byDefault = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'dev', path: '/srv' } })
+    expect(byDefault.json.title).toBe('dev')
+    expect(created.map((c) => c.title)).toEqual(['prod', 'srv', 'dev'])
+    // An explicit title also renames an existing record, not just the response.
+    const named = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'dev', path: '/srv', name: 'Build box' } })
+    expect(named.json.title).toBe('Build box')
+    expect(records.get(join(rwRoot(), 'dev', 'srv'))?.title).toBe('Build box')
+  })
 
-    // A name colliding with another workspace's placeholder gets the hash suffix.
-    harness.pool.fs.addDir('/srv/other')
-    const clash = await call(routes, '/api/dsh-rw/workspace', 'POST', {
-      body: { alias: 'prod', path: '/srv/other', name: 'My App' },
-    })
-    expect(clash.status).toBe(200)
-    expect(String(clash.json.placeholderDir)).toMatch(/My_App-[0-9a-f]{8}$/)
+  it('recognizes a symlinked default main directory by its canonical path', async () => {
+    const { registry } = fakeRegistry()
+    harness.pool.fs.addSymlink('/srv/main-link', '/srv/app')
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry, defaultMainDir: '/srv/main-link' })
+    const linked = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/main-link' } })
+    expect(linked.json).toMatchObject({ workspace: '/srv/app', title: 'prod', registered: true })
+    const canonical = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'dev', path: '/srv/app' } })
+    expect(canonical.json).toMatchObject({ workspace: '/srv/app', title: 'dev', registered: true })
+  })
+
+  it('does not let a missing main directory block picking a valid project', async () => {
+    const { registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry, defaultMainDir: '/missing-main' })
+    const res = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(res.status).toBe(200)
+    expect(res.json).toMatchObject({ workspace: '/srv/app', title: 'app', registered: true })
+  })
+
+  it('migrates old automatic titles on re-pick, for projects and main workspaces', async () => {
+    const { records, registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry })
+    const placeholder = join(rwRoot(), 'prod', 'srv', 'app')
+    await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    await records.get(placeholder)!.setTitle('prod · /srv/app')
+    const project = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(project.json.title).toBe('app')
+    expect(records.get(placeholder)?.title).toBe('app')
+
+    await records.get(placeholder)!.setTitle('prod · /srv/app')
+    harness.hosts.setMainDir('prod', '/srv/app')
+    const main = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(main.json.title).toBe('prod')
+    expect(records.get(placeholder)?.title).toBe('prod')
+  })
+
+  it('preserves existing custom titles with a blank name and returns the actual title', async () => {
+    const { records, registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry })
+    const placeholder = join(rwRoot(), 'prod', 'srv', 'app')
+    await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app', name: '  My App  ' } })
+    const blank = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app', name: '   ' } })
+    expect(blank.json.title).toBe('My App')
+    expect(records.get(placeholder)?.title).toBe('My App')
+    harness.hosts.setMainDir('prod', '/srv/app')
+    const main = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(main.json.title).toBe('My App')
+    expect(records.get(placeholder)?.title).toBe('My App')
+  })
+
+  it('keeps equal basenames in different directories as distinct workspaces', async () => {
+    const { created, records, registry } = fakeRegistry()
+    harness.pool.fs.addDir('/opt/app')
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry })
+    const first = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    const second = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/opt/app' } })
+    expect(first.json.title).toBe('app')
+    expect(second.json.title).toBe('app')
+    expect(first.json.placeholderDir).not.toBe(second.json.placeholderDir)
+    expect(created).toEqual([
+      { path: join(rwRoot(), 'prod', 'srv', 'app'), title: 'app' },
+      { path: join(rwRoot(), 'prod', 'opt', 'app'), title: 'app' },
+    ])
+    expect(records.size).toBe(2)
+  })
+
+  it('uses canonical POSIX basenames after trailing-slash and symlink resolution', async () => {
+    const { created, registry } = fakeRegistry()
+    harness.pool.fs.addSymlink('/srv/link', '/srv/app')
+    harness.pool.fs.addDir('/srv/中文 project')
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry })
+    const link = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/link/' } })
+    expect(link.json).toMatchObject({ workspace: '/srv/app', title: 'app' })
+    const unicode = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/中文 project///' } })
+    expect(unicode.json.title).toBe('中文 project')
+    expect(created[1]?.path).toBe(join(rwRoot(), 'prod', 'srv', '中文 project'))
+  })
+
+  it('keeps renamed projects in the same mirror tree under their registered main workspace', async () => {
+    const { created, registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry, defaultMainDir: '/' })
+    await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/' } })
+    const child = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app', name: 'My App' } })
+    expect(created).toEqual([
+      { path: join(rwRoot(), 'prod'), title: 'prod' },
+      { path: join(rwRoot(), 'prod', 'srv', 'app'), title: 'My App' },
+    ])
+    expect(child.json.placeholderDir).toBe(join(rwRoot(), 'prod', 'srv', 'app'))
+    const otherHost = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'dev', path: '/srv/app' } })
+    expect(otherHost.json).toMatchObject({ title: 'app', placeholderDir: join(rwRoot(), 'dev', 'srv', 'app') })
+    // Equal basenames on different hosts never share a workspace record.
+    expect(created[1]?.path).not.toBe(created[2]?.path)
+  })
+
+  it('defaults a newly picked workspace with a whitespace-only name to basename', async () => {
+    const { created, registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry })
+    const blank = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app', name: '   ' } })
+    expect(blank.json).toMatchObject({ title: 'app', placeholderDir: join(rwRoot(), 'prod', 'srv', 'app') })
+    expect(created[0]?.title).toBe('app')
+  })
+
+  it('reports the actual existing title if an older registry cannot rename records', async () => {
+    const create = vi.fn(async () => ({ title: 'Existing title' }))
+    const withRegistry = buildRoutes({ workspaceRegistry: () => ({ create }) })
+    const res = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app', name: 'New title' } })
+    expect(res.json).toMatchObject({ registered: true, title: 'Existing title' })
+    expect(create).toHaveBeenCalledWith(join(rwRoot(), 'prod', 'srv', 'app'), 'New title')
+  })
+
+  it("uses the alias for remote '/' even when the main directory is elsewhere", async () => {
+    const { created, registry } = fakeRegistry()
+    const withRegistry = buildRoutes({ workspaceRegistry: () => registry, defaultMainDir: '/srv' })
+    const res = await call(withRegistry, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/' } })
+    expect(res.json).toMatchObject({ ok: true, workspace: '/', placeholderDir: join(rwRoot(), 'prod'), title: 'prod', registered: true })
+    expect(created).toEqual([{ path: join(rwRoot(), 'prod'), title: 'prod' }])
+  })
+
+  it('GET status reports the plugin-wide default main directory', async () => {
+    const withDefault = buildRoutes({ defaultMainDir: '/' })
+    expect((await call(withDefault, '/api/dsh-rw/status', 'GET')).json.defaultMainDir).toBe('/')
+    const none = buildRoutes({ defaultMainDir: '' })
+    expect((await call(none, '/api/dsh-rw/status', 'GET')).json.defaultMainDir).toBe('')
+  })
+
+  it('POST workspace degrades to registered:false when the registry throws (the pick still succeeds)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { registry } = fakeRegistry((path) => path.endsWith('app'))
+      const failing = buildRoutes({ workspaceRegistry: () => registry })
+      const res = await call(failing, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+      expect(res.status).toBe(200)
+      expect(res.json).toMatchObject({ ok: true, workspace: '/srv/app', registered: false })
+      expect(existsSync(res.json.placeholderDir as string)).toBe(true)
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not register'))
+
+      const throwingGetter = buildRoutes({
+        workspaceRegistry: () => {
+          throw new Error('service lookup failed')
+        },
+      })
+      const res2 = await call(throwingGetter, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+      expect(res2.json).toMatchObject({ ok: true, registered: false })
+
+      const absent = buildRoutes({ workspaceRegistry: () => undefined })
+      const res3 = await call(absent, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+      expect(res3.json).toMatchObject({ ok: true, registered: false })
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('POST workspace rejects a mirror position owned by another workspace (no hash suffix)', async () => {
+    mkdirSync(join(rwRoot(), 'prod', 'srv', 'app'), { recursive: true })
+    writeFileSync(
+      join(rwRoot(), 'prod', 'srv', 'app', '.dsh-rw-meta.json'),
+      JSON.stringify({
+        plugin: 'dsh-rw',
+        alias: 'prod',
+        host: 'example.com',
+        port: 22,
+        user: 'deploy',
+        remotePath: '/other',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        note: 'placeholder only — not a copy of remote files',
+      }),
+    )
+    const res = await call(routes, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(res.status).toBe(400)
+    expect(res.json).toMatchObject({ ok: false, code: 'INVALID_INPUT' })
+  })
+
+  it('POST workspace reports an unsafe placeholder root as 500 UNSAFE_PLACEHOLDER_ROOT', async () => {
+    const real = join(dir, 'real-root')
+    mkdirSync(real)
+    symlinkSync(real, rwRoot())
+    const res = await call(routes, '/api/dsh-rw/workspace', 'POST', { body: { alias: 'prod', path: '/srv/app' } })
+    expect(res.status).toBe(500)
+    expect(res.json).toMatchObject({ ok: false, code: 'UNSAFE_PLACEHOLDER_ROOT' })
   })
 
   it('POST workspace rejects files, unknown aliases and bad bodies', async () => {
@@ -325,7 +563,7 @@ describe('workspace / local-pick', () => {
     expect(ghost.status).toBe(400)
     const empty = await call(routes, '/api/dsh-rw/workspace', 'POST', { body: {} })
     expect(empty.status).toBe(400)
-    expect(harness.session.workspace).toBeNull()
+    expect(harness.sessions.lastAlias).toBeNull()
   })
 
   it('POST local-pick returns 400 when no picker service is available', async () => {
@@ -474,5 +712,61 @@ describe('POST /api/dsh-rw/hosts/hide', () => {
     const missing = await call(routes, '/api/dsh-rw/hosts/hide', 'POST', { body: { alias: 'ghost' } })
     expect(missing.status).toBe(400)
     expect(missing.json.code).toBe('INVALID_INPUT')
+  })
+})
+
+describe('POST /api/dsh-rw/hosts/main', () => {
+  it('stores the canonical remote directory (~ expanded, symlinks resolved) and echoes the summary', async () => {
+    harness.pool.fs.addSymlink('/srv/link', '/srv/app')
+    const res = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: '/srv/link/' } })
+    expect(res.status).toBe(200)
+    expect(res.json.ok).toBe(true)
+    expect(res.json.host).toMatchObject({ alias: 'prod', mainDir: '/srv/app' })
+    expect(JSON.stringify(res.json)).not.toContain(SECRET_PASSWORD)
+    expect(harness.hosts.mainDir('prod')).toBe('/srv/app')
+
+    // FakeSftp's home is '/', so ~/srv → /srv.
+    const home = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'dev', path: '~/srv' } })
+    expect(home.json.host).toMatchObject({ alias: 'dev', mainDir: '/srv' })
+  })
+
+  it('clears with path: null', async () => {
+    harness.hosts.setMainDir('prod', '/srv/app')
+    const res = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: null } })
+    expect(res.status).toBe(200)
+    expect((res.json.host as { mainDir?: string }).mainDir).toBeUndefined()
+    expect(harness.hosts.mainDir('prod')).toBeUndefined()
+  })
+
+  it('validates alias, path and the remote directory with { error, code }', async () => {
+    const noAlias = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { path: '/srv' } })
+    expect(noAlias.status).toBe(400)
+    expect(noAlias.json.code).toBe('INVALID_INPUT')
+    const noPath = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod' } })
+    expect(noPath.status).toBe(400)
+    const badPath = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: 42 } })
+    expect(badPath.status).toBe(400)
+    const ghost = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'ghost', path: '/srv' } })
+    expect(ghost.status).toBe(404)
+    const relative = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: 'srv' } })
+    expect(relative.status).toBe(400)
+    expect(relative.json.code).toBe('INVALID_INPUT')
+    const missing = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: '/nope' } })
+    expect(missing.status).toBe(404)
+    expect(missing.json.code).toBe('NO_SUCH_PATH')
+    const file = await call(routes, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: '/etc/passwd' } })
+    expect(file.status).toBe(400)
+    expect(file.json.code).toBe('NOT_A_DIRECTORY')
+    expect(harness.hosts.mainDir('prod')).toBeUndefined()
+    const wrongMethod = await call(routes, '/api/dsh-rw/hosts/main', 'GET')
+    expect(wrongMethod.status).toBe(405)
+  })
+
+  it('answers 501 when the host table cannot store main directories', async () => {
+    const bare = Object.create(harness.hosts) as typeof harness.hosts
+    Object.defineProperty(bare, 'setMainDir', { value: undefined })
+    const limited = buildRoutes({ hosts: bare })
+    const res = await call(limited, '/api/dsh-rw/hosts/main', 'POST', { body: { alias: 'prod', path: '/srv' } })
+    expect(res.status).toBe(501)
   })
 })
