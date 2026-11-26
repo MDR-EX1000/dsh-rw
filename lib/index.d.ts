@@ -21,6 +21,8 @@ export declare const Config: z<Schemastery.ObjectS<{
     sshConfigExclude: z<string[], string[]>;
     /** Per remote command timeout. */
     commandTimeoutMs: z<number, number>;
+    /** Total remote file-operation budget, including acquisition and cleanup. */
+    operationTimeoutMs: z<number, number>;
     /** SSH connection establishment timeout. */
     connectTimeoutMs: z<number, number>;
     /** Channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried. */
@@ -72,6 +74,8 @@ export declare const Config: z<Schemastery.ObjectS<{
     sshConfigExclude: z<string[], string[]>;
     /** Per remote command timeout. */
     commandTimeoutMs: z<number, number>;
+    /** Total remote file-operation budget, including acquisition and cleanup. */
+    operationTimeoutMs: z<number, number>;
     /** SSH connection establishment timeout. */
     connectTimeoutMs: z<number, number>;
     /** Channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried. */
@@ -115,6 +119,7 @@ export interface Config {
     sshConfigInclude?: readonly string[];
     sshConfigExclude?: readonly string[];
     commandTimeoutMs: number;
+    operationTimeoutMs?: number;
     connectTimeoutMs: number;
     channelOpenTimeoutMs: number;
     maxOutputChars: number;

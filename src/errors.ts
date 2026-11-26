@@ -6,6 +6,10 @@
 export type RwErrorCode =
   | 'CONN_REFUSED'
   | 'CONN_TIMEOUT'
+  /** The complete remote-operation budget, including business I/O, elapsed. */
+  | 'OPERATION_TIMEOUT'
+  /** Caller cancellation or an ended operation scope forbids further remote work. */
+  | 'OPERATION_ABORTED'
   | 'AUTH_FAILED'
   | 'HOSTKEY_UNKNOWN'
   | 'HOSTKEY_CHANGED'
@@ -25,13 +29,18 @@ export type RwErrorCode =
   | 'UNSAFE_PLACEHOLDER_ROOT'
   | 'REMOTE_ERROR'
 
+export type RemoteOperationOutcome = 'not-started' | 'unknown'
+
 export class RwError extends Error {
   readonly code: RwErrorCode
+  /** No result is not evidence that a dispatched mutation did not execute. */
+  readonly outcome?: RemoteOperationOutcome
 
-  constructor(code: RwErrorCode, message: string, options?: { cause?: unknown }) {
+  constructor(code: RwErrorCode, message: string, options?: { cause?: unknown; outcome?: RemoteOperationOutcome }) {
     super(message, options)
     this.name = 'RwError'
     this.code = code
+    this.outcome = options?.outcome
   }
 }
 

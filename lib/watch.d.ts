@@ -58,7 +58,7 @@ export declare class Watcher {
     /** First snapshot; establishes the baseline. Returns entries counted (changes always empty). */
     start(): Promise<WatchSnapshotResult>;
     /** Re-scan and return the diff against the previous snapshot (also updates the baseline). */
-    poll(): Promise<WatchSnapshotResult>;
+    poll(fs?: WatchFs): Promise<WatchSnapshotResult>;
     /** Drop the baseline (next poll behaves like start). */
     reset(): void;
     /**
@@ -81,7 +81,7 @@ export declare class WatchManager {
     /** Start (or replace) a named watcher; the baseline is only installed once the scan succeeds. */
     start(name: string, fs: WatchFs, options: WatchOptions): Promise<WatchSnapshotResult>;
     /** Rescan one named watcher; an unknown name is a programming error, not a user-facing condition. */
-    poll(name: string): Promise<WatchSnapshotResult>;
+    poll(name: string, fs?: WatchFs): Promise<WatchSnapshotResult>;
     /** Drop a named watcher; true when it existed. */
     stop(name: string): boolean;
     /** Snapshot of the registered watchers, in registration order. */

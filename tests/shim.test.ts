@@ -13,6 +13,9 @@ import { ensurePlaceholder, HOST_OWNER_FILE } from '../src/placeholder.js'
 import { SessionStore } from '../src/session.js'
 import { createNativeRouting, makeShim } from '../src/shim.js'
 import type { ShimConfig, ShimDeps } from '../src/shim.js'
+import { currentRemoteIoOptions, ownRemoteIoResource } from '../src/io-context.js'
+import type { RemoteIoOptions } from '../src/io-context.js'
+import { RwError } from '../src/errors.js'
 import type { ExecResult } from '../src/ssh-pool.js'
 import type { HostEntry } from '../src/hosts.js'
 import { FAKE_MTIME, FakeSftp } from './fakes.js'
@@ -96,6 +99,10 @@ function makeNext() {
     return LOCAL_RESULT
   }
   return { next, passedThrough: () => calls > 0 }
+}
+
+function bashText(body: string, cwd = '/srv/app', alias = 'prod'): string {
+  return `[dsh-rw: ${alias}; remote cwd: ${cwd}]\n${body}`
 }
 
 function text(result: ToolExecutionResult): string {
@@ -208,7 +215,7 @@ describe('shim pass-through', () => {
     const res = await shim.onExecute(execOf('bash', { command: 'make test', run_in_background: true }, root), next)
     expect(passedThrough()).toBe(false)
     expect(res.isError).toBe(false)
-    expect(res.value).toEqual({ kind: 'background', jobId: 'bash-x1', cwd: '/srv/app' })
+    expect(res.value).toEqual({ kind: 'background', jobId: 'bash-x1', cwd: root })
     expect(text(res)).toContain('job_output')
     expect(started).toEqual([{ kind: 'bash', label: 'make test' }])
     // The launch went to the host, not the local machine.
@@ -628,7 +635,7 @@ describe('shim bash', () => {
       makeNext().next,
     )
     expect(res.isError).toBe(false)
-    expect(text(res)).toBe('total 3')
+    expect(text(res)).toBe(bashText('total 3'))
     expect(h.pool.execCalls.length).toBe(1)
     // Quoted and bare placeholder forms both rewrite to the remote root.
     expect(h.pool.execCalls[0]!.command).toBe(`ls -la '/srv/app/src' && cat /srv/app/README.md`)
@@ -658,7 +665,7 @@ describe('shim bash', () => {
     const shim = makeShim(makeDeps(h))
     const res = await shim.onExecute(execOf('bash', { command: 'false-ish', description: 'fail' }, root), makeNext().next)
     expect(res.isError).toBe(false)
-    expect(text(res)).toBe('out\n[stderr]\nbad\n[exit code: 3]')
+    expect(text(res)).toBe(bashText('out\n[stderr]\nbad\n[exit code: 3]'))
   })
 
   it('returns the native foreground-shaped value the registry validates against', async () => {
@@ -670,6 +677,7 @@ describe('shim bash', () => {
     expect(res.isError).toBe(false)
     expect(res.value).toEqual({
       kind: 'foreground',
+      cwd: root,
       exitCode: 3,
       signal: null,
       timedOut: false,
@@ -680,24 +688,41 @@ describe('shim bash', () => {
     })
   })
 
-  it('honors exec.signal: abort interrupts the remote execution and drops the connection', async () => {
+  it('forwards cancellation and awaits core quiescence without disconnecting a shared alias', async () => {
     const h = makeHarness()
     const root = connect(h)
-    // A remote command that never settles on its own.
-    h.pool.exec = async (entry: HostEntry, command: string, opts?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult> => {
+    let started!: () => void
+    const dispatched = new Promise<void>(resolve => { started = resolve })
+    let quiesced = false
+    h.pool.exec = async (entry: HostEntry, command: string, opts?: RemoteIoOptions & { cwd?: string }): Promise<ExecResult> => {
       h.pool.execCalls.push({ alias: entry.alias, command, ...(opts !== undefined ? { opts } : {}) })
-      return new Promise<ExecResult>(() => {})
+      if (opts?.signal === undefined) throw new Error('caller signal was not forwarded')
+      const signal = opts.signal
+      return await new Promise<ExecResult>((_resolve, reject) => {
+        const abort = () => setTimeout(() => {
+          quiesced = true
+          signal.removeEventListener('abort', abort)
+          reject(new RwError('OPERATION_ABORTED', 'command aborted; remote outcome unknown', { outcome: 'unknown' }))
+        }, 20)
+        signal.addEventListener('abort', abort, { once: true })
+        started()
+      })
     }
     const shim = makeShim(makeDeps(h))
     const controller = new AbortController()
     const { next, passedThrough } = makeNext()
     const pending = shim.onExecute(execOf('bash', { command: 'sleep 999', description: 'sleep' }, root, controller.signal), next)
+    await dispatched
     controller.abort()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(quiesced).toBe(false)
     const res = await pending
+    expect(quiesced).toBe(true)
     expect(passedThrough()).toBe(false)
     expect(res.isError).toBe(true)
-    expect(text(res)).toContain('command aborted')
-    expect(h.pool.disconnected).toContain('prod')
+    expect(text(res)).toContain('OPERATION_ABORTED')
+    expect(text(res)).toContain('do not automatically repeat')
+    expect(h.pool.disconnected).toEqual([])
   })
 
   it('a persistent bash degrades to a one-shot remote exec with a state note', async () => {
@@ -747,7 +772,7 @@ describe('shim cwd-anchored target', () => {
     const shim = makeShim(makeDeps(h))
     const res = await shim.onExecute(execOf('bash', { command: 'ls', description: 'list' }, root), makeNext().next)
     expect(res.isError).toBe(false)
-    expect(text(res)).toBe('ok')
+    expect(text(res)).toBe(bashText('ok'))
     // Targeted the cwd's host (prod @ /srv/app), not dev, and never went local.
     expect(h.pool.execCalls.length).toBe(1)
     expect(h.pool.execCalls[0]!.alias).toBe('prod')
@@ -1647,6 +1672,108 @@ describe('namespace safety remains path-aware', () => {
     const shim = makeShim(makeDeps(h))
     expect(await shim.onExecute(execOf('ask_user_question', { question: 'Choose a new root' }, root), local.next)).toBe(LOCAL_RESULT)
     expect(local.passedThrough()).toBe(true)
+    expect(h.pool.execCalls).toEqual([])
+  })
+})
+
+describe('remote IO scope admission', () => {
+  it.each([
+    ['read', { file_path: 'README.md' }],
+    ['write', { file_path: 'new.txt', content: 'created' }],
+    ['edit', { file_path: 'README.md', old_string: 'line1', new_string: 'changed' }],
+    ['str_replace_editor', { command: 'view', path: 'README.md' }],
+    ['glob', { pattern: '**/*.ts' }],
+    ['grep', { pattern: 'line' }],
+    ['bash', { command: 'true', timeoutMs: 5000 }],
+  ] as const)('keeps the full %s mapped operation in one caller scope', async (name, args) => {
+    const h = makeHarness()
+    const root = connect(h)
+    const observed: Readonly<RemoteIoOptions>[] = []
+    let closed = 0
+    const capture = () => {
+      const options = currentRemoteIoOptions()
+      if (!options?.signal || options.deadlineMs === undefined) throw new Error('missing remote operation scope')
+      observed.push(options)
+      return options
+    }
+    const facade = new Proxy(h.pool.fs, {
+      get(target, key) {
+        const value: unknown = Reflect.get(target, key)
+        if (typeof value !== 'function') return value
+        return (...parameters: unknown[]) => { capture(); return Reflect.apply(value, target, parameters) }
+      },
+    })
+    h.pool.sftp = async () => {
+      capture()
+      ownRemoteIoResource(() => { closed++ })
+      return facade
+    }
+    const execute = h.pool.exec.bind(h.pool)
+    h.pool.exec = async (entry, command, options) => { capture(); return execute(entry, command, options) }
+    if (name === 'glob' || name === 'grep') h.pool.execQueue.push(execResult('__DSH_RW_ENGINE__=rg\n'))
+    const shim = makeShim(makeDeps(h, { config: { ...SHIM_CONFIG, operationTimeoutMs: 1234 } }))
+    const local = makeNext()
+    const result = await shim.onExecute(execOf(name, args, root), local.next)
+    expect(result.isError).toBe(false)
+    expect(local.passedThrough()).toBe(false)
+    expect(observed.length).toBeGreaterThan(0)
+    expect(observed.every(options => options === observed[0])).toBe(true)
+    expect(observed[0]?.timeoutMs).toBe(name === 'bash' ? 5000 : 1234)
+    expect(observed[0]?.signal?.aborted).toBe(true) // normal completion closes the caller-owned scope
+    expect(currentRemoteIoOptions()).toBeUndefined()
+    if (!['glob', 'grep', 'bash'].includes(name)) expect(closed).toBeGreaterThan(0)
+  })
+
+  it('times out a cooperative pending remote read and closes its owned facade', async () => {
+    const h = makeHarness()
+    const root = connect(h)
+    let closed = 0
+    h.pool.sftp = async () => {
+      const signal = currentRemoteIoOptions()?.signal
+      if (!signal) throw new Error('no caller signal at facade acquisition')
+      ownRemoteIoResource(() => { closed++ })
+      const facade = new Proxy(h.pool.fs, {
+        get(target, key) {
+          if (key === 'readFile') return async () => await new Promise<Buffer>((_resolve, reject) => {
+            const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason) }
+            if (signal.aborted) abort()
+            else signal.addEventListener('abort', abort, { once: true })
+          })
+          const value: unknown = Reflect.get(target, key)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+      return facade
+    }
+    const shim = makeShim(makeDeps(h, { config: { ...SHIM_CONFIG, operationTimeoutMs: 20 } }))
+    const local = makeNext()
+    const result = await shim.onExecute(execOf('read', { file_path: 'README.md' }, root), local.next)
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('OPERATION_TIMEOUT')
+    expect(local.passedThrough()).toBe(false)
+    expect(closed).toBe(1)
+    expect(h.pool.disconnected).toEqual([])
+    expect(currentRemoteIoOptions()).toBeUndefined()
+  })
+
+  it.each([
+    ['read', { file_path: '/outside-local/file.txt' }],
+    ['write', { file_path: 'new.txt' }],
+    ['str_replace_editor', { command: 'undo_edit', path: 'README.md' }],
+    ['bash', { command: 'pwd', workdir: '/outside-local' }],
+  ] as const)('does not pollute %s local passthrough with an aborted remote scope', async (name, args) => {
+    const h = makeHarness()
+    const root = connect(h)
+    const controller = new AbortController()
+    controller.abort(new Error('caller stopped'))
+    let passed = false
+    const result = await makeShim(makeDeps(h, { config: { ...SHIM_CONFIG, operationTimeoutMs: 1 } })).onExecute(execOf(name, args, root, controller.signal), async () => {
+      expect(currentRemoteIoOptions()).toBeUndefined()
+      passed = true
+      return LOCAL_RESULT
+    })
+    expect(result).toBe(LOCAL_RESULT)
+    expect(passed).toBe(true)
     expect(h.pool.execCalls).toEqual([])
   })
 })

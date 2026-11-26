@@ -2,6 +2,7 @@ import type { HostEntry, HostSummary } from './hosts.js';
 import type { SessionStore } from './session.js';
 import type { NativeRoutingTable } from './shim.js';
 import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js';
+import type { RemoteIoOptions } from './io-context.js';
 /**
  * Structural subset of HostTable consumed by the tools/routes. HostTable has
  * private fields (nominally typed), so depending on this interface is what
@@ -48,18 +49,17 @@ export interface HostTableLike {
 }
 /** Structural subset of SshPool (same rationale as HostTableLike). */
 export interface PoolLike {
-    exec(entry: HostEntry, command: string, opts?: {
+    exec(entry: HostEntry, command: string, opts?: RemoteIoOptions & {
         cwd?: string;
-        timeoutMs?: number;
     }): Promise<ExecResult>;
-    sftp(entry: HostEntry): Promise<SftpLike>;
+    sftp(entry: HostEntry, opts?: RemoteIoOptions): Promise<SftpLike>;
     /**
      * Open a long-lived shell channel. Optional so structural test doubles stay
      * valid; the persistent-shell manager reports a clear error when a pool
      * cannot provide one.
      */
-    openShell?(entry: HostEntry): Promise<RemoteShellChannel>;
-    testConnect(entry: HostEntry): Promise<number>;
+    openShell?(entry: HostEntry, command?: string, opts?: RemoteIoOptions): Promise<RemoteShellChannel>;
+    testConnect(entry: HostEntry, opts?: RemoteIoOptions): Promise<number>;
     disconnect(alias: string): void;
     connected(): string[];
     dispose(): void;
@@ -71,6 +71,8 @@ export interface ToolsDeps {
     session: SessionStore;
     config: {
         commandTimeoutMs: number;
+        /** Total budget for file operations and their cleanup. */
+        operationTimeoutMs?: number;
         maxOutputChars: number;
         /** Shown by rw_info; optional so minimal test configs still typecheck. */
         hostKeyPolicy?: string;
@@ -96,6 +98,7 @@ export interface ToolsDeps {
 interface ExecLike {
     /** The calling agent; its `session.header` carries `id`, `cwd` and `parentSession`. */
     agent?: unknown;
+    signal?: AbortSignal;
 }
 /**
  * Resolve a remote directory the way a workspace pick does: `~` expansion

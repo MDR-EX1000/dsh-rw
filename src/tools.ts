@@ -22,6 +22,8 @@ import { sessionHeaderOf, sessionKeysOf } from './session.js'
 import type { SessionKeys, SessionStore } from './session.js'
 import type { NativeRoutingTable } from './shim.js'
 import type { ExecResult, RemoteShellChannel, SftpLike } from './ssh-pool.js'
+import { assertRemoteIoActive, currentRemoteIoOptions, DEFAULT_OPERATION_TIMEOUT_MS, runRemoteIo } from './io-context.js'
+import type { RemoteIoOptions } from './io-context.js'
 import { applyUnifiedDiff, looksBinary, patchTargets, unifiedDiff } from './patch.js'
 import { PLUGIN_VERSION } from './version.js'
 import { WatchManager } from './watch.js'
@@ -77,15 +79,15 @@ export interface HostTableLike {
 
 /** Structural subset of SshPool (same rationale as HostTableLike). */
 export interface PoolLike {
-  exec(entry: HostEntry, command: string, opts?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult>
-  sftp(entry: HostEntry): Promise<SftpLike>
+  exec(entry: HostEntry, command: string, opts?: RemoteIoOptions & { cwd?: string }): Promise<ExecResult>
+  sftp(entry: HostEntry, opts?: RemoteIoOptions): Promise<SftpLike>
   /**
    * Open a long-lived shell channel. Optional so structural test doubles stay
    * valid; the persistent-shell manager reports a clear error when a pool
    * cannot provide one.
    */
-  openShell?(entry: HostEntry): Promise<RemoteShellChannel>
-  testConnect(entry: HostEntry): Promise<number>
+  openShell?(entry: HostEntry, command?: string, opts?: RemoteIoOptions): Promise<RemoteShellChannel>
+  testConnect(entry: HostEntry, opts?: RemoteIoOptions): Promise<number>
   disconnect(alias: string): void
   connected(): string[]
   dispose(): void
@@ -98,6 +100,8 @@ export interface ToolsDeps {
   session: SessionStore
   config: {
     commandTimeoutMs: number
+    /** Total budget for file operations and their cleanup. */
+    operationTimeoutMs?: number
     maxOutputChars: number
     /** Shown by rw_info; optional so minimal test configs still typecheck. */
     hostKeyPolicy?: string
@@ -144,6 +148,7 @@ function unknownAliasError(deps: ToolsDeps, alias: string): RwError {
 interface ExecLike {
   /** The calling agent; its `session.header` carries `id`, `cwd` and `parentSession`. */
   agent?: unknown
+  signal?: AbortSignal
 }
 
 /** The calling agent's session cwd — where the agent is ACTUALLY working. */
@@ -235,7 +240,7 @@ async function requireWorkspaceFs(deps: ToolsDeps, exec?: ExecLike): Promise<Rem
   if (target.kind === 'no-workspace') {
     throw new RwError('NO_WORKSPACE', 'no remote workspace picked — call rw_pick_workspace(path) first')
   }
-  const sftp = await deps.pool.sftp(entry)
+  const sftp = await deps.pool.sftp(entry, currentRemoteIoOptions())
   return new RemoteFs(sftp, target.workspace)
 }
 
@@ -249,7 +254,7 @@ export async function resolveRemoteDir(deps: ToolsDeps, entry: HostEntry, path: 
   if (!path.startsWith('/') && path !== '~' && !path.startsWith('~/')) {
     throw new RwError('INVALID_INPUT', `workspace path must be absolute (or ~/…): ${JSON.stringify(path)}`)
   }
-  const sftp = await deps.pool.sftp(entry)
+  const sftp = await deps.pool.sftp(entry, currentRemoteIoOptions())
   const expanded = await expandRemoteHome(sftp, path)
   let real: string
   try {
@@ -282,6 +287,7 @@ export async function resolveWorkspaceDir(
   const entry = deps.hosts.find(alias)
   if (!entry) throw unknownAliasError(deps, alias)
   const real = await resolveRemoteDir(deps, entry, path)
+  assertRemoteIoActive()
   const placeholderDir = ensurePlaceholder(alias, entry, real, placeholderLocationsOf(deps))
   return { workspace: real, placeholderDir }
 }
@@ -541,8 +547,21 @@ export function makeTools(deps: ToolsDeps): unknown[] {
   // One watcher registry per plugin instance. It holds no timers and no remote
   // state, so plugin teardown simply drops it with the rest of this closure.
   const managers = new WatchManager()
+  const watcherTargets = new Map<string, { alias: string; root: string }>()
+  const budgetFor = (name: string, args: Record<string, unknown>): number => {
+    if (name === 'rw_exec') return typeof args.timeoutMs === 'number' ? args.timeoutMs : config.commandTimeoutMs
+    if (name === 'rw_exec_many') {
+      const calls = Array.isArray(args.calls) ? args.calls as { timeoutMs?: number }[] : []
+      const count = calls.length || (Array.isArray(args.hosts) ? args.hosts.length : 1)
+      const perCall = calls.length ? Math.max(...calls.map(call => call.timeoutMs ?? config.commandTimeoutMs)) : config.commandTimeoutMs
+      const concurrency = typeof args.concurrency === 'number' && args.concurrency > 0
+        ? Math.min(EXEC_MANY_MAX_CONCURRENCY, Math.floor(args.concurrency)) : EXEC_MANY_DEFAULT_CONCURRENCY
+      return perCall * Math.max(1, Math.ceil(count / concurrency))
+    }
+    return config.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS
+  }
 
-  return [
+  const definitions = [
     // ------------------------------------------------------------- rw_info
     defineTool({
       name: 'rw_info',
@@ -596,7 +615,8 @@ export function makeTools(deps: ToolsDeps): unknown[] {
         try {
           const entry = hosts.find(args.alias)
           if (!entry) throw unknownAliasError(deps, args.alias)
-          const latencyMs = await pool.testConnect(entry)
+          const latencyMs = await pool.testConnect(entry, currentRemoteIoOptions())
+          assertRemoteIoActive()
           // A workspace is only meaningful on the host it was picked on:
           // keep it when reconnecting the same alias, clear it when switching.
           // Only THIS session's record changes (a subagent writes its own copy).
@@ -858,7 +878,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
           const target = activeWorkspace(deps, exec)
           const cwd = target !== null && target.kind === 'ok' ? target.workspace : undefined
           const timeoutMs = args.timeoutMs ?? config.commandTimeoutMs
-          const res = await pool.exec(entry, args.command, { cwd, timeoutMs })
+          const res = await pool.exec(entry, args.command, { ...currentRemoteIoOptions(), cwd, timeoutMs })
           return { text: renderExecResult(args.command, cwd, res, timeoutMs) }
         } catch (err) {
           throw toToolError(err)
@@ -966,7 +986,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
             const timeoutMs = call.timeoutMs ?? config.commandTimeoutMs
             const base: ExecManyCall = { ...call, ...(cwd !== undefined ? { cwd } : {}) }
             try {
-              const res = await pool.exec(entry, call.command, cwd !== undefined ? { cwd, timeoutMs } : { timeoutMs })
+              const res = await pool.exec(entry, call.command, { ...currentRemoteIoOptions(), ...(cwd !== undefined ? { cwd } : {}), timeoutMs })
               return {
                 ...base,
                 ok: !res.timedOut && res.code === 0,
@@ -1044,9 +1064,11 @@ export function makeTools(deps: ToolsDeps): unknown[] {
             }
           }
           if (args.action === 'stop') {
+            watcherTargets.delete(name)
             return { text: managers.stop(name) ? `stopped watcher '${name}'` : `no watcher named '${name}'` }
           }
           const fs = await requireWorkspaceFs(deps, exec)
+          const entry = requireEntry(deps, exec)
           if (args.action === 'start') {
             const root = resolveInWorkspace(fs.root, args.path)
             const real = await assertRealpathInside(fs.sftp, fs.root, root)
@@ -1055,12 +1077,19 @@ export function makeTools(deps: ToolsDeps): unknown[] {
               ...(args.include !== undefined ? { include: args.include } : {}),
               ...(args.maxEntries !== undefined ? { maxEntries: args.maxEntries } : {}),
             })
+            watcherTargets.set(name, { alias: entry.alias, root: fs.root })
             return { text: renderWatchSnapshot('start', name, snapshot) }
           }
           if (!managers.list().some((watcher) => watcher.name === name)) {
             throw new RwError('INVALID_INPUT', `no watcher named ${JSON.stringify(name)} — start one first`)
           }
-          return { text: renderWatchSnapshot('poll', name, await managers.poll(name)) }
+          const owner = watcherTargets.get(name)
+          if (owner?.alias !== entry.alias || owner.root !== fs.root) {
+            throw new RwError('INVALID_INPUT', `watcher ${JSON.stringify(name)} belongs to another host/workspace — poll from its original workspace`)
+          }
+          // The original scan's lease has ended. Every poll uses this caller's
+          // fresh, cancellable SFTP facade rather than keeping a closed one.
+          return { text: renderWatchSnapshot('poll', name, await managers.poll(name, watchFsOf(fs.sftp))) }
         } catch (err) {
           throw toToolError(err)
         }
@@ -1144,6 +1173,7 @@ export function makeTools(deps: ToolsDeps): unknown[] {
           await fs.sftp.writeFile(staged, Buffer.from(args.patch, 'utf8'))
           const runPatch = async (dryRun: boolean): Promise<ExecResult> =>
             await deps.pool.exec(entry, `patch -p${strip}${dryRun ? ' --dry-run' : ''} -i ${shq(staged)}`, {
+              ...currentRemoteIoOptions(),
               cwd: fs.root,
               timeoutMs: config.commandTimeoutMs,
             })
@@ -1173,7 +1203,14 @@ export function makeTools(deps: ToolsDeps): unknown[] {
             }
           } finally {
             // The staged file is an implementation detail, never a workspace artifact.
-            await fs.sftp.unlink(staged).catch(() => undefined)
+            try {
+              await fs.sftp.unlink(staged)
+            } catch (error) {
+              const mapped = mapSftpError(error, staged)
+              if (mapped.code !== 'NO_SUCH_PATH') {
+                throw new RwError(mapped.code, 'patch execution may already have completed but staging cleanup failed; verify remote file state before retrying', { cause: mapped, outcome: 'unknown' })
+              }
+            }
           }
         } catch (err) {
           throw toToolError(err)
@@ -1204,4 +1241,19 @@ export function makeTools(deps: ToolsDeps): unknown[] {
       },
     }),
   ]
+  return definitions.map(definition => {
+    const callable = definition as unknown as { name: string; execute(args: Record<string, unknown>, exec?: ExecLike): Promise<unknown> }
+    return {
+      ...definition,
+      async execute(args: Record<string, unknown>, exec?: ExecLike) {
+        try {
+          return await runRemoteIo({ signal: exec?.signal, timeoutMs: budgetFor(callable.name, args) },
+            () => callable.execute(args, exec))
+        } catch (error) {
+          if (error instanceof RwError) throw toToolError(error)
+          throw error
+        }
+      },
+    }
+  })
 }

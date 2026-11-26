@@ -425,19 +425,15 @@ describe('exec', () => {
     pool.dispose()
   })
 
-  it('resolves (not rejects) with timedOut on command timeout', async () => {
+  it('rejects a command deadline with unknown outcome and closes only its stream', async () => {
     let stream: FakeStream | undefined
-    pushFake({
-      onStream: (s) => {
-        stream = s // never emits: the remote command hangs
-      },
-    })
+    const client = pushFake({ onStream: s => { stream = s } })
     const pool = makePool()
-    const r = await pool.exec(entry(), 'sleep 999', { timeoutMs: 25 })
-    expect(r.timedOut).toBe(true)
-    expect(r.signal).toBe('TIMEOUT')
-    expect(r.code).toBeNull()
+    const error = await expectRw(pool.exec(entry(), 'sleep 999', { timeoutMs: 25 }), 'OPERATION_TIMEOUT')
+    expect(error.outcome).toBe('unknown')
+    expect(error.message).toContain('not retried')
     expect(stream?.closed).toBe(true)
+    expect(client.ended).toBe(false)
     pool.dispose()
   })
 
@@ -452,14 +448,14 @@ describe('exec', () => {
     pool.dispose()
   })
 
-  it('rejects exec callback errors via mapConnectError after one redial', async () => {
+  it('surfaces an exec callback error without disconnecting a healthy shared client', async () => {
     class ExecFailClient extends FakeClient {
       override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
         queueMicrotask(() => cb(new Error('Timed out while opening channel')))
       }
     }
-    // A refused channel means "this connection is unusable", so the pool
-    // redials once before surfacing the error; both dials fail the same way.
+    // A callback failure is not evidence that the shared transport died. It
+    // must not cause a redial storm or disrupt unrelated RPCs.
     let dials = 0
     const pool = new SshPool({
       hostKeyPolicy: 'accept-new',
@@ -473,7 +469,8 @@ describe('exec', () => {
       },
     })
     await expectRw(pool.exec(entry(), 'x'), 'CONN_TIMEOUT')
-    expect(dials).toBe(2)
+    expect(dials).toBe(1)
+    expect(pool.connected()).toEqual(['h'])
     pool.dispose()
   })
 })
@@ -553,7 +550,7 @@ describe('sftp', () => {
     pool.dispose()
   })
 
-  it('rejects when the SFTP subsystem is unavailable, after one redial', async () => {
+  it('surfaces unavailable SFTP without redialing a healthy shared connection', async () => {
     let dials = 0
     const pool = new SshPool({
       hostKeyPolicy: 'accept-new',
@@ -568,7 +565,8 @@ describe('sftp', () => {
       },
     })
     await expectRw(pool.sftp(entry()), 'REMOTE_ERROR')
-    expect(dials).toBe(2)
+    expect(dials).toBe(1)
+    expect(pool.connected()).toEqual(['h'])
     pool.dispose()
   })
 })
@@ -593,11 +591,10 @@ describe('reconnect retry', () => {
     })
   }
 
-  /** The connection dies exactly as the channel is opened. */
+  /** ssh2's synchronous Not-connected guard fires before channel/command dispatch. */
   class DeadExecClient extends FakeClient {
-    override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
-      this.emit('close')
-      queueMicrotask(() => cb(new Error('Not connected')))
+    override exec(_cmd: string, _cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
+      throw new Error('Not connected')
     }
   }
 
@@ -633,25 +630,27 @@ describe('reconnect retry', () => {
 
   it('surfaces the exec error when the retry attempt also fails (at most one retry)', async () => {
     const pool = makeQueuedPool([new DeadExecClient(), new DeadExecClient()])
-    await expectRw(pool.exec(entry(), 'true'), 'REMOTE_ERROR')
+    const error = await expectRw(pool.exec(entry(), 'true'), 'NOT_CONNECTED')
+    expect(error.outcome).toBe('not-started')
     expect(factoryCalls).toBe(2) // no third dial
     expect(pool.connected()).toEqual([])
     pool.dispose()
   })
 
-  it('redials when the server refuses a channel on a still-live connection', async () => {
-    // The shape that broke real sessions: a proxy whose backend expired while
-    // TCP stayed healthy. The old rule ("only retry if the connection already
-    // dropped") reused the dead connection until the process restarted.
+  it('does not redial or close a healthy client when the server refuses a channel', async () => {
     class LiveExecFailClient extends FakeClient {
       override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
-        queueMicrotask(() => cb(new Error('(SSH) Channel open failure: ssh: rejected: connect failed (open failed)')))
+        queueMicrotask(() => cb(Object.assign(new Error('Channel open denied: quota'), { reason: 1 })))
       }
     }
-    const pool = makeQueuedPool([new LiveExecFailClient(), new FakeClient()])
-    const res = await pool.exec(entry(), 'x')
-    expect(res.code).toBe(0)
-    expect(factoryCalls).toBe(2) // refused channel → one redial, then success
+    const refused = new LiveExecFailClient()
+    const good = new FakeClient()
+    const pool = makeQueuedPool([refused, good])
+    const error = await expectRw(pool.exec(entry(), 'x'), 'REMOTE_ERROR')
+    expect(error.outcome).toBe('not-started')
+    expect(factoryCalls).toBe(1)
+    expect(refused.ended).toBe(false)
+    expect(good.commands).toEqual([])
     pool.dispose()
   })
 
@@ -667,7 +666,8 @@ describe('reconnect retry', () => {
       }
     }
     const pool = makeQueuedPool([new DyingStreamClient()])
-    await expectRw(pool.exec(entry(), 'x'), 'REMOTE_ERROR')
+    const error = await expectRw(pool.exec(entry(), 'x'), 'NOT_CONNECTED')
+    expect(error.outcome).toBe('unknown')
     expect(factoryCalls).toBe(1) // the command may have partially run — never retried
     pool.dispose()
   })
@@ -682,12 +682,12 @@ describe('reconnect retry', () => {
 
   it('surfaces the sftp open error when the retry attempt also fails (at most one retry)', async () => {
     const pool = makeQueuedPool([new DeadSftpClient(), new DeadSftpClient()])
-    await expectRw(pool.sftp(entry()), 'REMOTE_ERROR')
+    await expectRw(pool.sftp(entry()), 'NOT_CONNECTED')
     expect(factoryCalls).toBe(2)
     pool.dispose()
   })
 
-  it('re-acquires and retries an sftp op once when the connection dropped after acquisition', async () => {
+  it('does not replay through a facade whose transport died after acquisition', async () => {
     const stale = new FakeClient({
       onSftp: (cb) => {
         const raw = {
@@ -703,8 +703,11 @@ describe('reconnect retry', () => {
     await new Promise((r) => setImmediate(r))
     expect(pool.connected()).toEqual([])
 
-    const data = await sftp.readFile('/w/f')
-    expect(data.toString()).toBe('content')
+    const error = await expectRw(sftp.readFile('/w/f'), 'NOT_CONNECTED')
+    expect(error.outcome).toBe('not-started')
+    expect(factoryCalls).toBe(1)
+    const fresh = await pool.sftp(entry())
+    expect((await fresh.readFile('/w/f')).toString()).toBe('content')
     expect(factoryCalls).toBe(2)
     pool.dispose()
   })
@@ -744,32 +747,36 @@ describe('reconnect retry', () => {
     }
   }
 
-  it('bounds the exec channel-open wait and retries on a fresh connection when the open never answers', async () => {
+  it('bounds an unanswered exec open without risking command replay', async () => {
     const good = new FakeClient()
-    const pool = makeQueuedPool([new SilentExecClient(), good], { channelOpenTimeoutMs: 30 })
-    const r = await pool.exec(entry(), 'true')
-    expect(r.code).toBe(0)
-    expect(factoryCalls).toBe(2)
-    expect(good.commands).toEqual(['true'])
+    const silent = new SilentExecClient()
+    const pool = makeQueuedPool([silent, good], { channelOpenTimeoutMs: 30 })
+    const error = await expectRw(pool.exec(entry(), 'true'), 'OPERATION_TIMEOUT')
+    expect(error.outcome).toBe('unknown')
+    expect(factoryCalls).toBe(1)
+    expect(good.commands).toEqual([])
+    expect(silent.ended).toBe(true)
     pool.dispose()
   })
 
-  it('surfaces CONN_TIMEOUT when the exec retry attempt also times out (at most one retry)', async () => {
+  it('surfaces an exec open timeout after one attempt only', async () => {
     const pool = makeQueuedPool([new SilentExecClient(), new SilentExecClient()], { channelOpenTimeoutMs: 30 })
-    await expectRw(pool.exec(entry(), 'true'), 'CONN_TIMEOUT')
-    expect(factoryCalls).toBe(2) // no third dial
+    await expectRw(pool.exec(entry(), 'true'), 'OPERATION_TIMEOUT')
+    expect(factoryCalls).toBe(1)
     pool.dispose()
   })
 
-  it('bounds the sftp open wait and retries on a fresh connection when the open never answers', async () => {
-    const pool = makeQueuedPool([new SilentSftpClient(), new FakeClient(okSftpScript)], { channelOpenTimeoutMs: 30 })
-    const sftp = await pool.sftp(entry())
-    expect((await sftp.readFile('/w/f')).toString()).toBe('content')
-    expect(factoryCalls).toBe(2)
+  it('bounds unanswered SFTP open and retires the exact hidden-channel client', async () => {
+    const silent = new SilentSftpClient()
+    const pool = makeQueuedPool([silent, new FakeClient(okSftpScript)], { channelOpenTimeoutMs: 30 })
+    const error = await expectRw(pool.sftp(entry()), 'OPERATION_TIMEOUT')
+    expect(error.outcome).toBe('not-started')
+    expect(factoryCalls).toBe(1)
+    expect(silent.ended).toBe(true)
     pool.dispose()
   })
 
-  it('drops the pooled client on a post-ready error (not only on close), so the subsequent open failure retries', async () => {
+  it('retires a post-ready failed client without replaying a possibly dispatched command', async () => {
     class ErrorThenDeadExecClient extends FakeClient {
       override exec(_cmd: string, cb: (err: Error | undefined, stream?: ClientChannel) => void): void {
         this.emit('error', new Error('socket blew up')) // 'close' may lag behind or never arrive
@@ -778,10 +785,10 @@ describe('reconnect retry', () => {
     }
     const good = new FakeClient()
     const pool = makeQueuedPool([new ErrorThenDeadExecClient(), good])
-    const r = await pool.exec(entry(), 'true')
-    expect(r.code).toBe(0)
-    expect(factoryCalls).toBe(2)
-    expect(good.commands).toEqual(['true'])
+    const error = await expectRw(pool.exec(entry(), 'true'), 'REMOTE_ERROR')
+    expect(error.outcome).toBe('unknown')
+    expect(factoryCalls).toBe(1)
+    expect(good.commands).toEqual([])
     pool.dispose()
   })
 })

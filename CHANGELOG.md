@@ -3,6 +3,38 @@
 All notable changes to **dsh-rw**. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioning follows [SemVer](https://semver.org/).
 
+## 2.0.4 — 2026-11-26
+
+### Fixed — remote I/O cancellation, deadlines and Native output contracts
+
+- Remote file tools, mapped native calls and remote-picker routes now own one
+  deadline/signal scope across acquisition, operations and cleanup. SFTP
+  callbacks have watchdogs and close/error settlement; successful calls release
+  their owned subsystem instead of leaking it.
+- Dispatched SFTP operations and commands are never blindly replayed. Timeout
+  and cancellation reject with `OPERATION_TIMEOUT` / `OPERATION_ABORTED`; an
+  uncertain mutation is explicitly marked unknown and must be verified remotely.
+- Client retirement is generation-aware. A healthy refused subsystem does not
+  force a shared-client reconnect storm, and old events cannot clear a replacement.
+  An unexposed SSH exec may still require retiring its exact Client, affecting
+  that Client's other requests; replacements are not touched.
+- Native bash foreground/background results include the mapped `cwd` required
+  by the actual Native output schema, with actual remote context in model text.
+- Persistent-shell budgets include initialization and queue time; cancelled
+  queued commands do not execute later, and dead shells retire their cache.
+  Job polling has an independent cancellable lifetime, waits for carrier teardown,
+  and handles late known PID cleanup without inventing a confirmed remote exit.
+- Watch polls open fresh caller-owned I/O instead of retaining an expired facade;
+  timeout/cancellation is not swallowed as an ordinary missing subtree.
+- Added actual installed Native schema validation, cooperative caller/route
+  cancellation tests, protocol-close/no-callback/generation fault tests and
+  isolated real SSH loopback coverage. No user hosts or research jobs are tested.
+
+Validated with the complete regression suite, the installed Native output
+schema and isolated real SSH loopback fault tests. This does not claim every
+real-network failure is resolved. Whole-file SFTP reads still lack a
+transfer-byte ceiling; see the README limitations.
+
 ## 2.0.3 — 2026-11-25
 
 ### Fixed — host alias namespace ownership

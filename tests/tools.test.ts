@@ -447,7 +447,7 @@ describe('rw_exec_many', () => {
         { alias: 'dev', command: 'false' },
       ],
     })
-    expect(harness.pool.execCalls[0]?.opts).toEqual({ cwd: '/tmp', timeoutMs: 1234 })
+    expect(harness.pool.execCalls[0]?.opts).toMatchObject({ cwd: '/tmp', timeoutMs: 1234, signal: expect.any(AbortSignal), deadlineMs: expect.any(Number) })
     expect(harness.pool.execCalls[1]?.alias).toBe('dev')
     expect(text).toContain('1/2 succeeded')
     expect(text).toContain('--- [2] dev (exit 2) ---')

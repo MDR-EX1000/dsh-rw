@@ -1,6 +1,6 @@
+import type { RemoteIoOptions } from './io-context.js';
 import type { HostEntry } from './hosts.js';
 import type { ExecResult } from './ssh-pool.js';
-/** The slice of `ctx.jobs` this module drives (structural, so tests can fake it). */
 export interface JobsRegistryLike {
     start(spec: {
         kind: string;
@@ -9,7 +9,6 @@ export interface JobsRegistryLike {
         run(job: JobHandleLike): JobHooksLike;
     }): string;
 }
-/** Producer face handed to `run` by the registry. */
 export interface JobHandleLike {
     readonly id: string;
     append(text: string, options?: {
@@ -17,49 +16,31 @@ export interface JobHandleLike {
     }): void;
     updateProgress(line: string): void;
 }
-/** Terminal outcome the registry consumes. */
 export interface JobOutcomeLike {
     status: 'completed' | 'killed' | 'failed';
     detail?: string;
 }
-/** Control face returned by `run`. */
 export interface JobHooksLike {
     cancel(reason?: string): void;
     done: Promise<JobOutcomeLike>;
 }
-/** Everything the launcher needs from the remote side (injected for unit tests). */
 export interface RemoteJobDeps {
-    /** Run one remote command on the host. */
-    exec(entry: HostEntry, command: string, opts?: {
+    /** Providers must observe forwarded cancellation/deadlines and quiesce before
+     * settling. Unsupported injected providers are not made safe by abandoning
+     * their started Promise. Neither launch nor mutation may be replayed. */
+    exec(entry: HostEntry, command: string, opts?: RemoteIoOptions & {
         cwd?: string;
-        timeoutMs?: number;
     }): Promise<ExecResult>;
-    /** Read a remote file as UTF-8, or null when it does not exist yet. */
-    readFile(entry: HostEntry, path: string): Promise<string | null>;
-    /** Poll cadence for the job log (default 500 ms). */
+    readFile(entry: HostEntry, path: string, options?: RemoteIoOptions): Promise<string | null>;
     pollMs?: number;
-    /** Give up narrating after this long (default 12 h) so a wedged host cannot pin a poller. */
     maxLifetimeMs?: number;
-    /** Remote directory holding job logs (default /tmp). */
     logDir?: string;
 }
 export interface StartRemoteJobOptions {
     entry: HostEntry;
-    /** Shell command exactly as the model wrote it (already path-rewritten). */
     command: string;
-    /** Remote working directory, or undefined for the SSH default. */
     cwd?: string;
-    /** One-line model-facing label. */
     label: string;
-    /** Owning session id, so the registry fences access to that agent. */
     owner?: string;
 }
-/**
- * Start one command on the host as a registry job and return the job id.
- *
- * The starter is synchronous (the registry's contract), so the async launch and
- * the polling loop run in a floating task that narrates through `job.append`;
- * `done` settles exactly once, from the exit marker, from a cancellation, or
- * from the lifetime cap.
- */
 export declare function startRemoteJob(deps: RemoteJobDeps, jobs: JobsRegistryLike, opts: StartRemoteJobOptions): string;

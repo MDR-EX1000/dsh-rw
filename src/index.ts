@@ -20,6 +20,7 @@ import { createNativeRouting, makeShim } from './shim.js'
 import type { ShimConfig } from './shim.js'
 import { findPlaceholderByPath, placeholderLocationsOf, resolvePlaceholderDir } from './placeholder.js'
 import { SshPool } from './ssh-pool.js'
+import { DEFAULT_OPERATION_TIMEOUT_MS } from './io-context.js'
 import { PersistentShellManager } from './persistent-shell.js'
 import type { JobsRegistryLike } from './jobs.js'
 import { makeTools, statusText } from './tools.js'
@@ -49,6 +50,8 @@ export const Config = z.object({
   sshConfigExclude: z.array(z.string()).default([]),
   /** Per remote command timeout. */
   commandTimeoutMs: z.number().step(1).min(1000).default(30000),
+  /** Total remote file-operation budget, including acquisition and cleanup. */
+  operationTimeoutMs: z.number().step(1).min(1000).default(30000),
   /** SSH connection establishment timeout. */
   connectTimeoutMs: z.number().step(1).min(1000).default(15000),
   /** Channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried. */
@@ -93,6 +96,7 @@ export interface Config {
   sshConfigInclude?: readonly string[]
   sshConfigExclude?: readonly string[]
   commandTimeoutMs: number
+  operationTimeoutMs?: number
   connectTimeoutMs: number
   channelOpenTimeoutMs: number
   maxOutputChars: number
@@ -234,6 +238,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
       connectTimeoutMs: config.connectTimeoutMs,
       channelOpenTimeoutMs: config.channelOpenTimeoutMs,
       commandTimeoutMs: config.commandTimeoutMs,
+      operationTimeoutMs: config.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS,
       maxOutputChars: config.maxOutputChars,
     })
   const session = overrides.session ?? new SessionStore()
@@ -252,9 +257,9 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
   // One long-lived remote shell per (host, workspace) backs the persistent-bash
   // flavor; ids are the pool's own so channel opens behave like every other op.
   const shells = new PersistentShellManager({
-    open: (entry) => {
+    open: (entry, io) => {
       if (pool.openShell === undefined) throw new Error('this pool cannot open a persistent shell')
-      return pool.openShell(entry)
+      return pool.openShell(entry, undefined, io)
     },
     idleMs: config.persistentShellIdleMs ?? 600000,
   })
@@ -265,6 +270,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     session,
     config: {
       commandTimeoutMs: config.commandTimeoutMs,
+      operationTimeoutMs: config.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS,
       maxOutputChars: config.maxOutputChars,
       hostKeyPolicy: config.hostKeyPolicy,
     },
@@ -294,6 +300,7 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     shimBash: config.shimBash ?? true,
     shimBashApproval: config.shimBashApproval ?? 'ask',
     commandTimeoutMs: config.commandTimeoutMs,
+    operationTimeoutMs: config.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS,
     maxOutputChars: config.maxOutputChars,
     persistentShell: config.persistentShell ?? true,
     backgroundJobs: config.backgroundJobs ?? true,
@@ -318,7 +325,9 @@ export function apply(ctx: Context, config: Config, overrides: ApplyOverrides = 
     const heading = '## Remote workspace (dsh-rw)'
     const rwTools =
       'The rw_* tools (rw_list_dir / rw_read_file / rw_write_file / rw_mkdir / rw_move / rw_delete / rw_exec / ' +
-      'rw_apply_patch …) always address the remote host and are confined to the workspace root.'
+      'rw_apply_patch …) always address the remote host and are confined to the workspace root. ' +
+      'A timed-out, cancelled or disconnected write/edit/delete/patch/command can have executed already: ' +
+      'treat its outcome as unknown and verify remote state before retrying any mutation.'
     const nativeList = shimSettings.shimBash
       ? 'read/write/edit/str_replace_editor/glob/grep/bash'
       : 'read/write/edit/str_replace_editor/glob/grep'

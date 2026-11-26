@@ -40,6 +40,8 @@ import type { ShellManagerLike } from './persistent-shell.js'
 import { startRemoteJob } from './jobs.js'
 import type { JobsRegistryLike, RemoteJobDeps } from './jobs.js'
 import type { HostTableLike, PoolLike } from './tools.js'
+import { assertRemoteIoActive, currentRemoteIoOptions, detachedRemoteIo, runRemoteIo } from './io-context.js'
+import type { RemoteIoOptions } from './io-context.js'
 
 /** Canonical success value, derived from the public execution result contract. */
 type CanonicalToolValue = Extract<ToolExecutionResult, { isError: false }>['value']
@@ -51,6 +53,8 @@ export interface ShimConfig {
   shimBashApproval: 'ask' | 'native'
   commandTimeoutMs: number
   maxOutputChars: number
+  /** End-to-end file-operation deadline (default 30s), separate from command budgets. */
+  operationTimeoutMs?: number
   /** Run the persistent-bash flavor on a long-lived remote shell (default true). */
   persistentShell?: boolean
   /** Run native background bash calls as remote jobs (default true). */
@@ -536,31 +540,17 @@ function parsePositiveInteger(value: unknown, name: string): number | undefined 
   return value
 }
 
-/**
- * pool.exec has no signal channel, so abort races the call and — on winning —
- * drops the whole SSH connection: the only way to actually interrupt the
- * remote process through PoolLike. The pool reconnects lazily on next use.
- */
+/** The core owns cancellation, its stream, and full quiescence; never abandon or disconnect an alias here. */
 async function execRemote(
   deps: ShimDeps,
   target: ActiveTarget,
   command: string,
-  opts: { cwd?: string; timeoutMs?: number },
+  opts: RemoteIoOptions & { cwd?: string },
   signal: AbortSignal,
-): Promise<ExecResult | 'aborted'> {
-  if (signal.aborted) return 'aborted'
-  let onAbort: (() => void) | undefined
-  const aborted = new Promise<'aborted'>((resolveAbort) => {
-    onAbort = () => resolveAbort('aborted')
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
-  try {
-    const res = await Promise.race([deps.pool.exec(target.entry, command, opts), aborted])
-    if (res === 'aborted') deps.pool.disconnect(target.entry.alias)
-    return res
-  } finally {
-    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
-  }
+): Promise<ExecResult> {
+  assertRemoteIoActive()
+  const scoped = currentRemoteIoOptions()
+  return await deps.pool.exec(target.entry, command, { ...scoped, ...opts, signal: scoped?.signal ?? signal })
 }
 
 // --- remote file primitives (read whole + guarded write-back) ------------------
@@ -1066,7 +1056,6 @@ async function shimGlob(
       `if command -v rg >/dev/null 2>&1; then printf '${ENGINE_MARK}rg\\n'; ${rg}; ` +
       `else printf '${ENGINE_MARK}fallback\\n'; ${fallback}; fi`
     const res = await execRemote(deps, target, command, { cwd: root, timeoutMs: deps.config.commandTimeoutMs }, exec.signal)
-    if (res === 'aborted') return fail('command aborted (remote execution interrupted)')
     if (res.code !== 0 && res.code !== 1) {
       throw new Error(`remote glob failed (exit code ${res.code ?? 'null'}): ${(res.stderr || res.stdout).trim()}`)
     }
@@ -1196,7 +1185,6 @@ async function shimGrep(
       `if command -v rg >/dev/null 2>&1; then printf '${ENGINE_MARK}rg\\n'; ${rgArgs}; ` +
       `else printf '${ENGINE_MARK}fallback\\n'; ${grepArgs}; fi`
     const res = await execRemote(deps, target, command, { cwd: root, timeoutMs: deps.config.commandTimeoutMs }, exec.signal)
-    if (res === 'aborted') return fail('command aborted (remote execution interrupted)')
     if (res.code !== 0 && res.code !== 1) {
       throw new Error(`remote grep failed (exit code ${res.code ?? 'null'}): ${(res.stderr || res.stdout).trim()}`)
     }
@@ -1250,8 +1238,8 @@ function isPersistentBash(deps: ShimDeps, exec: ToolDispatchExecution): boolean 
 function remoteJobDeps(deps: ShimDeps): RemoteJobDeps {
   return {
     exec: async (entry, command, opts) => await deps.pool.exec(entry, command, opts),
-    readFile: async (entry, path) => {
-      const sftp = await deps.pool.sftp(entry)
+    readFile: async (entry, path, options?: RemoteIoOptions) => {
+      const sftp = await deps.pool.sftp(entry, options)
       try {
         return (await sftp.readFile(path)).toString('utf8')
       } catch (err) {
@@ -1260,6 +1248,8 @@ function remoteJobDeps(deps: ShimDeps): RemoteJobDeps {
         const mapped = mapSftpError(err, path)
         if (mapped instanceof RwError && mapped.code === 'NO_SUCH_PATH') return null
         throw mapped
+      } finally {
+        await sftp.close?.()
       }
     },
     ...(deps.jobPollMs !== undefined ? { pollMs: deps.jobPollMs } : {}),
@@ -1337,8 +1327,13 @@ async function shimBash(
     }
     return guarded(async () => {
       if (command.trim().length === 0) throw new Error('command must be a non-empty string')
+      assertRemoteIoActive()
       const owner = agentIdOf(exec)
-      const jobId = startRemoteJob(remoteJobDeps(deps), deps.jobs as JobsRegistryLike, {
+      const registry = deps.jobs as JobsRegistryLike
+      const detachedRegistry: JobsRegistryLike = {
+        start: (spec) => registry.start({ ...spec, run: (job) => detachedRemoteIo(() => spec.run(job)) }),
+      }
+      const jobId = startRemoteJob(remoteJobDeps(deps), detachedRegistry, {
         entry: target.entry,
         command: rewriteCommand(target, command),
         cwd,
@@ -1348,7 +1343,7 @@ async function shimBash(
       return {
         isError: false,
         // The native background result is exactly { kind, jobId, cwd }.
-        value: { kind: 'background', jobId, cwd },
+        value: { kind: 'background', jobId, cwd: toLocalPath(target, cwd) },
         content: [
           {
             type: 'text',
@@ -1373,7 +1368,7 @@ async function shimBash(
     const persistent = isPersistentBash(deps, exec)
     const shells = deps.shells
     const usePersistent = persistent && shells !== undefined && deps.config.persistentShell !== false
-    let res: ExecResult | 'aborted'
+    let res: ExecResult
     try {
       res =
         usePersistent && shells !== undefined
@@ -1383,10 +1378,11 @@ async function shimBash(
             })
           : await execRemote(deps, target, rewritten, { cwd, timeoutMs }, exec.signal)
     } catch (err) {
-      if (exec.signal.aborted) return fail('command aborted (remote execution interrupted)')
+      if (exec.signal.aborted && !(err instanceof RwError)) {
+        return fail('command aborted; remote outcome may be unknown', { name: 'AbortError', code: 'ABORTED' })
+      }
       throw err
     }
-    if (res === 'aborted') return fail('command aborted (remote execution interrupted)')
     const note = usePersistent
       ? 'persistent shell: stdout and stderr are merged into one ordered stream'
       : persistent
@@ -1399,6 +1395,9 @@ async function shimBash(
       isError: false,
       value: {
         kind: 'foreground',
+        // Native presentation resolves paths from a local cwd. Preserve the
+        // logical placeholder spelling while text identifies actual execution.
+        cwd: toLocalPath(target, cwd),
         exitCode: res.code,
         signal: res.signal,
         timedOut: res.timedOut,
@@ -1407,12 +1406,44 @@ async function shimBash(
         stdout: { text: res.stdout, truncated: res.stdout.endsWith(TRUNC_SUFFIX) },
         stderr: { text: res.stderr, truncated: res.stderr.endsWith(TRUNC_SUFFIX) },
       },
-      content: [{ type: 'text', text: renderBashResult(res, timeoutMs, note) }],
+      content: [{ type: 'text', text: `[dsh-rw: ${target.entry.alias}; remote cwd: ${cwd}]\n${renderBashResult(res, timeoutMs, note)}` }],
     }
   })
 }
 
 // --- the middlewares --------------------------------------------------------------
+
+/** Do not admit a remote scope for calls a helper would conservatively pass through. */
+function isRemoteMappedCall(deps: ShimDeps, target: ActiveTarget, exec: ToolDispatchExecution, args: Record<string, unknown>): boolean {
+  const mappedFile = (key: string): boolean => {
+    const path = strArg(args, key)
+    return path !== undefined && toRemotePath(target, path) !== null
+  }
+  switch (exec.name) {
+    case 'read': return mappedFile('file_path')
+    case 'write': return strArg(args, 'content') !== undefined && mappedFile('file_path')
+    case 'edit': return strArg(args, 'old_string') !== undefined && strArg(args, 'new_string') !== undefined && mappedFile('file_path')
+    case 'str_replace_editor': {
+      const command = strArg(args, 'command')
+      return command !== undefined && ['view', 'create', 'str_replace', 'insert'].includes(command) && mappedFile('path')
+    }
+    case 'glob': return strArg(args, 'pattern') !== undefined && searchDir(target, exec, args) !== null
+    case 'grep': return strArg(args, 'pattern') !== undefined &&
+      (args.include === undefined || strArg(args, 'include') !== undefined) && searchDir(target, exec, args) !== null
+    case 'bash': {
+      if (!deps.config.shimBash || !sessionInsidePlaceholder(target, exec) || strArg(args, 'command') === undefined) return false
+      if (args.workdir !== undefined && typeof args.workdir !== 'string') return false
+      return args.workdir === undefined || mappedFile('workdir')
+    }
+    default: return false
+  }
+}
+
+function remoteCallTimeout(deps: ShimDeps, exec: ToolDispatchExecution, args: Record<string, unknown>): number {
+  if (exec.name !== 'bash') return deps.config.operationTimeoutMs ?? 30_000
+  return typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
+    ? Math.floor(args.timeoutMs) : deps.config.commandTimeoutMs
+}
 
 export function makeShim(deps: ShimDeps): Shim {
   /** One console line per distinct (alias, workspace, local cwd) mismatch — never per call. */
@@ -1553,25 +1584,29 @@ export function makeShim(deps: ShimDeps): Shim {
       return next()
     }
     const { target, args } = resolved
-    recordRouting(exec, { target, reason: resolved.reason })
-    switch (exec.name) {
-      case 'read':
-        return (await shimRead(deps, target, args)) ?? next()
-      case 'write':
-        return (await shimWrite(deps, target, args)) ?? next()
-      case 'edit':
-        return (await shimEdit(deps, target, args)) ?? next()
-      case 'str_replace_editor':
-        return (await shimStrReplaceEditor(deps, target, args)) ?? next()
-      case 'glob':
-        return (await shimGlob(deps, target, exec, args)) ?? next()
-      case 'grep':
-        return (await shimGrep(deps, target, exec, args)) ?? next()
-      case 'bash':
-        return (await shimBash(deps, target, exec, args)) ?? next()
-      default:
-        return next()
+    if (!isRemoteMappedCall(deps, target, exec, args)) {
+      recordRouting(exec, null)
+      return next()
     }
+    recordRouting(exec, { target, reason: resolved.reason })
+    return await guarded(async () => {
+      const result = await runRemoteIo(
+        { signal: exec.signal, timeoutMs: remoteCallTimeout(deps, exec, args) },
+        async () => {
+          switch (exec.name) {
+            case 'read': return await shimRead(deps, target, args)
+            case 'write': return await shimWrite(deps, target, args)
+            case 'edit': return await shimEdit(deps, target, args)
+            case 'str_replace_editor': return await shimStrReplaceEditor(deps, target, args)
+            case 'glob': return await shimGlob(deps, target, exec, args)
+            case 'grep': return await shimGrep(deps, target, exec, args)
+            case 'bash': return await shimBash(deps, target, exec, args)
+            default: return null
+          }
+        },
+      )
+      return result ?? fail('remote shim input was not dispatchable')
+    })
   }
 
   const onPreExecute = async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {

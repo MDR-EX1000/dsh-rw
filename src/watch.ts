@@ -6,6 +6,9 @@
 // instead of RemoteFs/ssh2 so the diff logic can be unit-tested without a
 // network or a real filesystem.
 
+import { RwError } from './errors.js'
+import { assertRemoteIoActive } from './io-context.js'
+
 /** Minimal directory listing the watcher needs (SFTP readdir). */
 export interface WatchFs {
   /** Recursive-free: list ONE directory. Returns entries with type and mtime in ms. */
@@ -169,14 +172,16 @@ export class Watcher {
   /** First snapshot; establishes the baseline. Returns entries counted (changes always empty). */
   async start(): Promise<WatchSnapshotResult> {
     const scan = await this.scan()
+    assertRemoteIoActive()
     this.baseline = scan.entries
     this.baselineTruncated = scan.truncated
     return { changes: [], truncated: scan.truncated, entries: scan.entries.size }
   }
 
   /** Re-scan and return the diff against the previous snapshot (also updates the baseline). */
-  async poll(): Promise<WatchSnapshotResult> {
-    const scan = await this.scan()
+  async poll(fs?: WatchFs): Promise<WatchSnapshotResult> {
+    const scan = await this.scan(fs)
+    assertRemoteIoActive()
     const previous = this.baseline
     // "Either scan" matters: a baseline cut short by a limit may be missing
     // paths, so the next diff cannot be complete even if this scan was not.
@@ -200,18 +205,20 @@ export class Watcher {
    * denied or a directory vanishing mid-walk is normal on a remote host and
    * must not kill the watcher.
    */
-  private async scan(): Promise<ScanResult> {
+  private async scan(fs: WatchFs = this.fs): Promise<ScanResult> {
     const entries = new Map<string, SnapshotEntry>()
     let truncated = false
 
     // `depth` is the depth of the directory being listed (root = 0); entries
     // found there sit at depth + 1, which is the depth used by maxDepth.
     const visit = async (dir: string, relDir: string, depth: number): Promise<boolean> => {
+      assertRemoteIoActive()
       let listing: Awaited<ReturnType<WatchFs['readdir']>>
       try {
-        listing = await this.fs.readdir(dir)
+        listing = await fs.readdir(dir)
       } catch (err) {
-        if (depth === 0) throw err
+        if (depth === 0 || err instanceof RwError && ['OPERATION_TIMEOUT', 'OPERATION_ABORTED', 'NOT_CONNECTED', 'SFTP_UNAVAILABLE'].includes(err.code)) throw err
+        assertRemoteIoActive()
         return true
       }
       // Sorting every listing makes both the snapshot and the first N entries
@@ -304,10 +311,10 @@ export class WatchManager {
   }
 
   /** Rescan one named watcher; an unknown name is a programming error, not a user-facing condition. */
-  async poll(name: string): Promise<WatchSnapshotResult> {
+  async poll(name: string, fs?: WatchFs): Promise<WatchSnapshotResult> {
     const watcher = this.watchers.get(name)
     if (watcher === undefined) throw new Error(`unknown watcher: ${name}`)
-    return watcher.poll()
+    return watcher.poll(fs)
   }
 
   /** Drop a named watcher; true when it existed. */

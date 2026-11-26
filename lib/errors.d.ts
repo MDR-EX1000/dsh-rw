@@ -1,10 +1,18 @@
-export type RwErrorCode = 'CONN_REFUSED' | 'CONN_TIMEOUT' | 'AUTH_FAILED' | 'HOSTKEY_UNKNOWN' | 'HOSTKEY_CHANGED' | 'HOSTKEY_VERIFY_FAILED' | 'NO_SUCH_PATH' | 'NOT_A_DIRECTORY' | 'PERMISSION_DENIED' | 'OUTSIDE_WORKSPACE' | 'SYMLINK_ESCAPE' | 'SFTP_UNAVAILABLE' | 'NOT_CONNECTED' | 'NO_WORKSPACE' | 'INVALID_INPUT' | 'RW_EDIT_CONFLICT' | 'RW_WRITE_CONFLICT'
+export type RwErrorCode = 'CONN_REFUSED' | 'CONN_TIMEOUT'
+/** The complete remote-operation budget, including business I/O, elapsed. */
+ | 'OPERATION_TIMEOUT'
+/** Caller cancellation or an ended operation scope forbids further remote work. */
+ | 'OPERATION_ABORTED' | 'AUTH_FAILED' | 'HOSTKEY_UNKNOWN' | 'HOSTKEY_CHANGED' | 'HOSTKEY_VERIFY_FAILED' | 'NO_SUCH_PATH' | 'NOT_A_DIRECTORY' | 'PERMISSION_DENIED' | 'OUTSIDE_WORKSPACE' | 'SYMLINK_ESCAPE' | 'SFTP_UNAVAILABLE' | 'NOT_CONNECTED' | 'NO_WORKSPACE' | 'INVALID_INPUT' | 'RW_EDIT_CONFLICT' | 'RW_WRITE_CONFLICT'
 /** The local placeholder root is not a private directory of the current user (symlink, foreign owner, …). */
  | 'UNSAFE_PLACEHOLDER_ROOT' | 'REMOTE_ERROR';
+export type RemoteOperationOutcome = 'not-started' | 'unknown';
 export declare class RwError extends Error {
     readonly code: RwErrorCode;
+    /** No result is not evidence that a dispatched mutation did not execute. */
+    readonly outcome?: RemoteOperationOutcome;
     constructor(code: RwErrorCode, message: string, options?: {
         cause?: unknown;
+        outcome?: RemoteOperationOutcome;
     });
 }
 /**

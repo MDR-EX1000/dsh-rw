@@ -120,7 +120,10 @@ describe('remote background jobs', () => {
     await new Promise((resolve) => setTimeout(resolve, 10))
     jobs.hooks!.cancel('user asked')
     const outcome = await jobs.hooks!.done
-    expect(outcome).toEqual({ status: 'killed', detail: 'user asked' })
+    expect(outcome.status).toBe('killed')
+    expect(outcome.detail).toContain('user asked')
+    expect(outcome.detail).toContain('TERM acknowledged')
+    expect(outcome.detail).toContain('process exit is not confirmed')
     expect(execCalls.some((c) => c.command.includes('kill -TERM 4242'))).toBe(true)
   })
 

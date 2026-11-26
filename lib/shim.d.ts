@@ -10,6 +10,8 @@ export interface ShimConfig {
     shimBashApproval: 'ask' | 'native';
     commandTimeoutMs: number;
     maxOutputChars: number;
+    /** End-to-end file-operation deadline (default 30s), separate from command budgets. */
+    operationTimeoutMs?: number;
     /** Run the persistent-bash flavor on a long-lived remote shell (default true). */
     persistentShell?: boolean;
     /** Run native background bash calls as remote jobs (default true). */

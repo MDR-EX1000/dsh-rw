@@ -24,7 +24,8 @@ Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run 
 - **Real workspace confinement** — every `rw_*` file path is confined to the picked workspace root: `../`, absolute paths outside the root, and symlink escapes (`SYMLINK_ESCAPE` via remote `realpath`) are rejected with structured errors.
 - **SSH host key verification** — verifies against `~/.ssh/known_hosts` by default (`accept-new`: first-seen keys are recorded), with `strict` and an explicit `off` policy. A changed host key is refused, never silently accepted.
 - **Structured errors** — connection refused / auth failed / timeout / no such path / permission denied / outside workspace / host key problems are distinct error codes, so the agent can react correctly.
-- **Self-healing connections** — the ssh2 pool keepalives (15s × 3) detect dropped connections, and channel/subsystem opens are bounded (`channelOpenTimeoutMs`, default 10s) so a silently dead connection (half-open TCP) can't hang an operation. An operation that lands on a dead connection is transparently retried once on a fresh redial — and a **refused channel** counts as dead (proxy frontends keep TCP healthy while their backend expires), so a stale pooled connection heals itself instead of poisoning every later call.
+- **Bounded, cancellable remote I/O** — SFTP acquisition, file operations and cleanup share `operationTimeoutMs` (default 30s) and the caller's cancellation signal. Completed tool calls release their own SFTP subsystem; a closed channel or a missing callback rejects pending waits instead of pinning an Agent indefinitely. Local native calls remain outside these remote scopes.
+- **Generation-aware pooled connections** — keepalives detect transport loss, while channel opens have their own cap. Old connection events cannot clear a replacement's ready state, and a healthy connection is not torn down merely because an SFTP subsystem was refused. A dispatched operation or command is **never blindly replayed**: timeout, cancellation or a lost reply can mean it already executed, so verify remote state before retrying writes.
 - **Placeholder, not a copy** — the local directory DSH registers is an empty placeholder (`.dsh-rw-meta.json` records the `user@host:path` origin). It never holds remote file contents, so there is nothing to sync and no conflicts.
 - **One sidebar node per host (2.0)** — placeholders live under a private root outside your home directory (`placeholderRoot`, default `/Users/Shared/dsh-rw-<user>` on macOS) and **mirror the remote tree**: `<root>/<alias>/data` is remote `/data`, `<root>/<alias>/srv/app` is remote `/srv/app`. Each host has a **main directory** — set per host in the picker, else `defaultMainDir` (`/`; empty = none). The picker opens a host there, and the workspace picked there is registered titled with the bare alias, so in DSH's Workspace Tree the host's node *is* its main workspace and the workspaces below it nest inside it; any other workspace is titled with its canonical remote **basename** (or the name you give) and follows the registered path hierarchy. For example, `/srv/my-app` appears as `my-app` below its closest registered ancestor when **Workspace Tree** is selected. Display names never move placeholder directories. A workspace still carrying the old automatic `alias · path` title is renamed to the new default when picked again; a title you chose is kept unless you explicitly enter a replacement. Remote `/` is registered and made remote-backed when selected as the main workspace, not merely as a side effect of picking a child directory. Because local layout equals remote layout, a local path maps to the same remote path whichever placeholder it is reached through. Collisions are errors, never renamed: a path owned by another workspace, two aliases that sanitize to one directory name, or a case-only clash on a case-insensitive disk. Placeholders created by 1.x (`~/.dsh/remote-workspaces/…`) keep working; add the workspace again from the picker to get the per-host grouping.
 - **Host namespace ownership (2.0.3)** — two aliases that map to the same local host directory cannot share it, even for different remote project paths. A private `.dsh-rw-host.json` reserves the alias namespace but does not make remote `/` a workspace. Existing mirror trees are checked for mixed aliases before routing; ambiguous or unsafe ownership fails loudly. Resolve a conflict by choosing distinct SSH aliases or a separate `placeholderRoot`; no paths or session histories are automatically moved.
@@ -153,9 +154,10 @@ Plugin config keys (defaults shown):
 | --- | --- | --- | --- |
 | `hostKeyPolicy` | `'accept-new'` | cordis only | `'accept-new'` learns first-seen keys into known_hosts; `'strict'` refuses unknown; `'off'` disables verification (explicitly) |
 | `knownHostsPath` | `~/.ssh/known_hosts` | cordis only | known_hosts file used for verification |
-| `commandTimeoutMs` | `30000` | cordis only | per remote command timeout |
+| `commandTimeoutMs` | `30000` | cordis only | total remote command budget across connection, open and execution; timeout/cancellation rejects with `OPERATION_*` and dispatched outcome may be unknown |
+| `operationTimeoutMs` | `30000` | cordis only | total file-operation/picker budget across SFTP acquisition, business operations and cleanup; cancellation is forwarded to the owned channel |
 | `connectTimeoutMs` | `15000` | cordis only | SSH handshake timeout |
-| `channelOpenTimeoutMs` | `10000` | cordis only | channel/subsystem open timeout: bounds the wait on a silently dead connection before it is dropped and retried once on a fresh connection |
+| `channelOpenTimeoutMs` | `10000` | cordis only | open-phase cap, tightened by the caller's total deadline; a refused healthy subsystem surfaces without disconnecting unrelated channels |
 | `maxOutputChars` | `200000` | cordis only | cap on collected stdout/stderr per call |
 | `shim` | `true` | cordis + settings layer | shim mode: intercept the native read/write/edit/str_replace_editor/glob/grep/bash tools and run them against the active remote workspace (set `false` to opt out and use only `rw_*`) |
 | `shimBash` | `true` | cordis + settings layer | with shim on, also intercept `bash` (only when the agent session cwd is the placeholder workspace) |
@@ -197,7 +199,8 @@ Complementary, not a replacement. `dsh-ssh` is an ops toolbox (web terminal, por
 
 - No ProxyJump / jump-host chains (single-hop only).
 - `rw_exec` is one-shot, no interactive PTY.
-- File reads are text-oriented (line paging) with a 2 MB cap; large binary transfers are out of scope.
+- File reads are text-oriented (line paging) with a model-visible cap; large binary transfers are out of scope. High-level SFTP reads still buffer the whole file: the operation deadline is not a transfer-byte/memory ceiling, so avoid oversized or endless device streams.
+- Cancelling an open SSH exec before its channel handle is available may retire the exact shared Client and fail its other in-flight calls. Replacement generations are not touched; affected dispatched mutations report outcome unknown and are not replayed.
 - The DSH file tree shows the empty placeholder directory, not remote files — remote browsing happens through the picker or the agent.
 - On Linux/Windows the default `placeholderRoot` (`~/.dsh/rw-workspaces`) is inside the home directory; set `placeholderRoot` elsewhere if your home directory is registered as a workspace.
 - On Windows, remote paths whose segments Windows cannot store (`<>:"\|?*`, trailing dot/space, `CON`/`NUL`/`COM1`…) cannot get a placeholder.
@@ -213,7 +216,7 @@ Complementary, not a replacement. `dsh-ssh` is an ops toolbox (web terminal, por
 ```bash
 pnpm install
 pnpm build        # tsc (host) + esbuild wrapper (client)
-pnpm test         # vitest — all SSH/SFTP mocked
+pnpm test         # unit/fault tests + isolated loopback SSH; no user hosts
 pnpm typecheck
 ```
 

@@ -18,6 +18,7 @@ import { normalizeRemote, expandRemoteHome } from './guard.js'
 import type { HostEntry } from './hosts.js'
 import { resolveRemoteDir, resolveWorkspaceDir } from './tools.js'
 import type { ToolsDeps } from './tools.js'
+import { assertRemoteIoActive, currentRemoteIoOptions, DEFAULT_OPERATION_TIMEOUT_MS, runRemoteIo } from './io-context.js'
 
 /** Re-exported so index.ts builds routes without importing dsh-host-webserver. */
 export type Route = WebRoute
@@ -120,19 +121,32 @@ export function isLoopbackRequest(request: IncomingMessage): boolean {
 
 /** One JSON response. */
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
+  if (res.destroyed || res.writableEnded) return
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
   res.end(JSON.stringify(body))
 }
 
 /** Read a JSON request body (undefined when too large or unparseable). */
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | undefined> {
+  assertRemoteIoActive()
+  const signal = currentRemoteIoOptions()?.signal
+  const onAbort = () => { if (typeof req.destroy === 'function') req.destroy() }
+  if (signal !== undefined && typeof req.destroy === 'function') signal.addEventListener('abort', onAbort, { once: true })
   const chunks: Buffer[] = []
   let size = 0
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer
-    size += buffer.length
-    if (size > MAX_JSON_BODY_BYTES) return undefined
-    chunks.push(buffer)
+  try {
+    for await (const chunk of req) {
+      const buffer = chunk as Buffer
+      size += buffer.length
+      if (size > MAX_JSON_BODY_BYTES) return undefined
+      chunks.push(buffer)
+    }
+    assertRemoteIoActive()
+  } catch (error) {
+    if (signal?.aborted) assertRemoteIoActive()
+    throw error
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
   }
   try {
     const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
@@ -151,6 +165,10 @@ function queryParam(url: URL, name: string): string | undefined {
 /** RwError code → HTTP status for error responses. */
 function statusFor(code: RwErrorCode): number {
   switch (code) {
+    case 'OPERATION_TIMEOUT':
+      return 504
+    case 'OPERATION_ABORTED':
+      return 499
     case 'INVALID_INPUT':
     case 'NOT_A_DIRECTORY':
       return 400
@@ -172,7 +190,7 @@ function statusFor(code: RwErrorCode): number {
 /** Normalized JSON error response: `{ error, code }` at the mapped status. */
 function writeError(res: ServerResponse, err: unknown): void {
   const e = toRwError(err)
-  writeJson(res, statusFor(e.code), { error: e.message, code: e.code })
+  writeJson(res, statusFor(e.code), { error: e.message, code: e.code, ...(e.outcome !== undefined ? { outcome: e.outcome } : {}) })
 }
 
 // --- routes ------------------------------------------------------------------
@@ -194,7 +212,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
     return true
   }
 
-  return [
+  const routes: Route[] = [
     // ------------------------------------------------- GET /api/dsh-rw/status
     {
       kind: 'exact',
@@ -381,7 +399,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           temp = true
         }
         try {
-          const latencyMs = await pool.testConnect(entry)
+          const latencyMs = await pool.testConnect(entry, currentRemoteIoOptions())
           writeJson(res, 200, { ok: true, latencyMs })
         } catch (err) {
           // A failed probe is a result, not an HTTP error: the UI renders it.
@@ -418,7 +436,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
         // Picker browsing is deliberately NOT workspace-confined: no workspace
         // exists yet at this stage. It still requires a connectable alias.
         try {
-          const sftp = await pool.sftp(entry)
+          const sftp = await pool.sftp(entry, currentRemoteIoOptions())
           // SFTP does no tilde expansion; resolve ~ against the session home.
           const dir = await expandRemoteHome(sftp, path)
           let isDir: boolean
@@ -586,6 +604,7 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           // Same resolution as a workspace pick: ~ expansion, realpath, must
           // be a directory. The canonical path is what gets stored.
           const main = body.path === null ? null : await resolveRemoteDir(deps, entry, body.path as string)
+          assertRemoteIoActive()
           hosts.setMainDir(alias, main)
           writeJson(res, 200, { ok: true, host: hosts.summarize(entry) })
         } catch (err) {
@@ -636,7 +655,9 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
           const entry = hosts.find(alias)
           try {
             main = entry === undefined ? undefined : await resolveRemoteDir(deps, entry, main)
-          } catch {
+          } catch (error) {
+            if (error instanceof RwError && ['OPERATION_ABORTED', 'OPERATION_TIMEOUT'].includes(error.code)) throw error
+            assertRemoteIoActive('unknown')
             main = undefined
           }
         }
@@ -648,14 +669,18 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
         try {
           const registry = deps.workspaceRegistry?.()
           if (registry !== undefined && registry !== null && typeof registry.create === 'function') {
+            assertRemoteIoActive('unknown')
             const created = (await registry.create(placeholderDir, title)) as RegisteredWorkspaceLike | null | undefined
+            assertRemoteIoActive('unknown')
             if (created !== null && typeof created === 'object' && typeof created.title === 'string') {
               if (
                 typeof created.setTitle === 'function' &&
                 created.title !== title &&
                 (name !== undefined || created.title === legacyAutoTitle)
               ) {
+                assertRemoteIoActive('unknown')
                 await created.setTitle(title)
+                assertRemoteIoActive('unknown')
               } else {
                 // create() does not rename an existing record. Return the title
                 // actually kept by DSH, not the unused automatic suggestion.
@@ -665,12 +690,15 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
             registered = true
           }
         } catch (err) {
+          if (err instanceof RwError && ['OPERATION_ABORTED', 'OPERATION_TIMEOUT'].includes(err.code)) throw err
+          assertRemoteIoActive('unknown')
           console.warn(
             `[dsh-rw] could not register ${placeholderDir} as a DSH workspace: ${err instanceof Error ? err.message : String(err)}`,
           )
         }
         // No session record is written here: the picker is not a session. It
         // only remembers which host it used last.
+        assertRemoteIoActive('unknown')
         session.setLastAlias(alias)
         writeJson(res, 200, { ok: true, workspace, placeholderDir, title, registered })
       },
@@ -703,4 +731,29 @@ export function makeRoutes(deps: RoutesDeps): Route[] {
       },
     },
   ]
+  const networkRoutes = new Set(['/api/dsh-rw/test', '/api/dsh-rw/ls', '/api/dsh-rw/hosts/main', '/api/dsh-rw/workspace'])
+  return routes.map(route => {
+    if (!networkRoutes.has(route.path)) return route
+    const handler = route.handler
+    return {
+      ...route,
+      async handler(req: IncomingMessage, res: ServerResponse) {
+        const controller = new AbortController()
+        const onAbort = () => controller.abort(new RwError('OPERATION_ABORTED', 'remote picker request cancelled'))
+        const onClose = () => { if (!res.writableEnded) onAbort() }
+        if (typeof req.on === 'function') req.on('aborted', onAbort)
+        if (typeof res.on === 'function') res.on('close', onClose)
+        try {
+          if (req.aborted) onAbort()
+          await runRemoteIo({ signal: controller.signal, timeoutMs: deps.config.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS },
+            async () => { await handler(req, res) })
+        } catch (error) {
+          if (!res.headersSent && !res.destroyed) writeError(res, error)
+        } finally {
+          if (typeof req.off === 'function') req.off('aborted', onAbort)
+          if (typeof res.off === 'function') res.off('close', onClose)
+        }
+      },
+    }
+  })
 }
